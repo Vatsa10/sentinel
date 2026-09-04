@@ -170,6 +170,66 @@ $("#btnWallStop").onclick = () => {
   $("#wall").innerHTML = "";
 };
 
+/* ------------------------------------------------------- descriptions --- */
+/* A vision-language description is the only account of a vehicle an officer
+   can read, search and testify to on this grid, where no plate is recoverable.
+   It is always rendered as a description of the crop, never as an identity. */
+function attrHtml(at) {
+  if (!at) return "";
+  const bits = [];
+  if (at.body_type && at.body_type !== "unknown") bits.push(at.body_type.replace(/_/g, " "));
+  if (at.colour) bits.unshift(at.colour);
+  const tags = [];
+  if (at.tinted_windows === true) tags.push("tinted");
+  if (at.wheels && at.wheels !== "unknown") tags.push(at.wheels + " wheels");
+  if (at.roof_rack === true) tags.push("roof rack");
+  (at.markings || []).forEach(m => tags.push("marking: " + m));
+  (at.damage || []).forEach(d => tags.push(d));
+  return `<div class="vdesc" title="${esc(at.raw_caption || "")}">
+    <b>${esc(at.description || bits.join(" ") || "—")}</b>
+    ${tags.length ? `<span class="faint"> · ${esc(tags.join(" · "))}</span>` : ""}
+    <span class="faint mono" style="font-size:10px"> · ${esc(at.model || "model")}
+      conf ${at.confidence ?? 0}</span>
+    <div class="faint" style="font-size:10px">Describes the crop; not an identification.</div>
+  </div>`;
+}
+
+function describeBtn(detectionId, has) {
+  if (detectionId == null) return "";
+  return `<button class="mini" data-describe="${esc(detectionId)}">${
+    has ? "Re-describe" : "Describe"}</button>`;
+}
+
+async function describeDetection(btn) {
+  const id = btn.dataset.describe;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "describing…";
+  try {
+    const r = await api(`/api/detections/${encodeURIComponent(id)}/describe`, { method: "POST" });
+    if (r.attributes) {
+      const holder = btn.closest("[data-desc-holder]") || btn.parentElement;
+      const existing = holder.querySelector(".vdesc");
+      if (existing) existing.remove();
+      btn.insertAdjacentHTML("beforebegin", attrHtml(r.attributes));
+      btn.textContent = "Re-describe";
+    } else {
+      toast("No description could be produced: " + esc(r.detail || "unavailable"));
+      btn.textContent = label;
+    }
+  } catch (e) {
+    toast("Describe failed: " + esc(e));
+    btn.textContent = label;
+  }
+  btn.disabled = false;
+}
+
+/* Delegated, because rows and alert cards are both re-rendered wholesale. */
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-describe]");
+  if (btn) describeDetection(btn);
+});
+
 /* ---------------------------------------------------------- detections --- */
 async function loadDetections() {
   const q = new URLSearchParams({ limit: "200" });
@@ -192,7 +252,8 @@ async function loadDetections() {
     <td class="mono faint">${x.scene_time
       ? esc(x.scene_time.replace("T", " ").slice(0, 19))
       : '<span title="no clock recovered from the overlay">—</span>'}</td>
-    <td>${x.evidence ? `<img src="${esc(x.evidence)}" style="height:34px;border-radius:4px">` : ""}</td></tr>`).join("");
+    <td data-desc-holder>${x.evidence ? `<img src="${esc(x.evidence)}" style="height:34px;border-radius:4px">` : ""}
+      ${attrHtml(x.attributes)}${describeBtn(x.id, !!x.attributes)}</td></tr>`).join("");
 }
 $("#dSearch").onclick = loadDetections;
 $("#dCsv").onclick = () => {
@@ -312,7 +373,10 @@ function alertHtml(a) {
       ${a.case_ref ? `<span class="faint mono"> · ${esc(a.case_ref)}</span>` : ""}
     </div>
     <div class="why">${reasons}</div>
-    ${a.evidence ? `<img src="${esc(a.evidence)}">` : ""}
+    <div data-desc-holder>
+      ${a.evidence ? `<img src="${esc(a.evidence)}">` : ""}
+      ${attrHtml(a.attributes)}${describeBtn(a.detection_id, !!a.attributes)}
+    </div>
   </div>`;
 }
 async function loadAlerts() {
@@ -377,6 +441,20 @@ function connectWs() {
   ws.onmessage = (e) => {
     const a = JSON.parse(e.data);
     if (a.type === "ping") return;
+    if (a.kind === "attributes") {
+      // The description is extracted after the alert has already been sent, so
+      // it arrives separately and is folded into the card that is already up.
+      if (a.detection_id != null) {
+        const btn = document.querySelector(`[data-describe="${a.detection_id}"]`);
+        if (btn) btn.insertAdjacentHTML("beforebegin", attrHtml(a));
+      } else if (a.zone_event_id != null) {
+        // A zone event describes a whole frame, so it has no detection row to
+        // key a description to; the card it belongs to is addressed directly.
+        $$(`[data-zone-event="${a.zone_event_id}"]`)
+          .forEach(card => card.insertAdjacentHTML("beforeend", attrHtml(a)));
+      }
+      return;
+    }
     const feed = $("#alertFeed");
     if (feed.querySelector(".empty")) feed.innerHTML = "";
     if (a.kind === "zone") {
@@ -524,7 +602,7 @@ $("#rAppearance").onclick = async () => {
 let ZPOINTS = [];                      // normalised [x, y] pairs, in click order
 
 function zoneEventHtml(e) {
-  return `<div class="zev">
+  return `<div class="zev" data-zone-event="${esc(e.id ?? "")}">
     <div class="row" style="margin:0 0 5px 0;gap:8px">
       <span class="tag sev-${esc(e.severity || "medium")}">${esc(e.severity || "")}</span>
       <span class="tag t-vehicle">${esc(e.rule)}</span>

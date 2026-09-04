@@ -101,6 +101,12 @@ _COLOUR_VOCAB = {
     "brown": "brown", "beige": "brown", "tan": "brown",
 }
 
+#: Phrases in which a colour word is not the vehicle's colour. Florence-2
+#: routinely opens with "a black and white photograph of a street", and a
+#: parser that read "black" out of that would put a black vehicle in front of
+#: an operator on the strength of the image being monochrome.
+_COLOUR_MASK = ("black and white", "white and black", "black-and-white")
+
 _TINT_PHRASES = ("tinted", "tint", "blacked out window", "blacked-out window",
                  "smoked glass", "dark windows", "darkened windows")
 _ALLOY_PHRASES = ("alloy", "alloys", "chrome wheel", "chrome rim",
@@ -181,6 +187,13 @@ def _find_phrase(text: str, phrases) -> bool | None:
             if not _negated(text, m.start()):
                 return True
     return False if seen else None
+
+
+def _mask(text: str, phrases) -> str:
+    """Blank out phrases, keeping length so positions elsewhere still hold."""
+    for phrase in phrases:
+        text = re.sub(re.escape(phrase), " " * len(phrase), text)
+    return text
 
 
 def _match_vocabulary(text: str, vocab: dict) -> str | None:
@@ -271,7 +284,7 @@ def parse_caption(caption: str, model: str = "") -> VehicleAttributes:
         return attrs
 
     attrs.body_type = _match_vocabulary(text, _BODY_VOCAB) or "unknown"
-    attrs.colour = _match_vocabulary(text, _COLOUR_VOCAB)
+    attrs.colour = _match_vocabulary(_mask(text, _COLOUR_MASK), _COLOUR_VOCAB)
     attrs.tinted_windows = _find_phrase(text, _TINT_PHRASES)
 
     if _find_phrase(text, _ALLOY_PHRASES) is True:
@@ -545,6 +558,16 @@ def _self_check() -> None:
     # vocabulary, or the field promises a value nothing can ever produce.
     reachable = set(_BODY_VOCAB.values())
     assert reachable == set(BODY_TYPES), reachable ^ set(BODY_TYPES)
+
+    # Florence-2 opens a great many night captions with "a black and white
+    # photograph of...". That is the image, not the vehicle.
+    mono = parse_caption("The image is a black and white photograph of a "
+                         "street at night with a sedan on it.")
+    assert mono.colour is None, mono
+    assert mono.body_type == "sedan", mono
+    # ...but a real black vehicle in the same caption is still read.
+    both = parse_caption("a black and white photograph showing a red truck")
+    assert both.colour == "red", both
 
     # A real Florence-2 caption from cam13, verbatim.
     real = parse_caption(
