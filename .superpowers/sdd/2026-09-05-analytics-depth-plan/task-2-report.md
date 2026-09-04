@@ -67,3 +67,60 @@ and detection objects, as `route.py` does.
 None blocking. The detector loads every plate-bearing detection per request; at
 the current dataset size that is trivial, but at deployment scale the endpoint
 would want a time window or a per-plate index.
+
+---
+
+# Fix round 1/5
+
+Two findings addressed; nothing else changed.
+
+## Important — cross-group rows broke the consecutive-pair chain
+
+`find_clones` grouped by plate alone, sorted, then applied the time-group guard
+per adjacent pair. A cross-session sighting sorting between two same-session ones
+broke the chain and the real clone was silently lost. Reproduced exactly as the
+reviewer reported: `[cam04 @ t0, cam10 @ t0+1s, cam14 @ t0+2s]` yielded 0 findings.
+
+Fixed by partitioning on `(normalised plate, time_group)` **before** sorting, so
+pairing only ever happens within one recording session. Sightings whose camera
+has no known time group are dropped at partition time — they are not compared to
+anything, including each other. The per-pair guard is gone rather than left as a
+redundant half-guard; the invariant now lives in one place, in the partition key.
+
+The `ponytail:` comment no longer claims nothing is missed. It states what the
+partitioning actually guarantees: every comparable adjacent pair within a session
+is examined, and non-consecutive pairs are deliberately not compared because an
+intervening plausible sighting is the stronger explanation.
+
+## Minor — a zero elapsed time outranked a flagrant violation
+
+Elapsed 0 took `violation = 1.0` and scored 0.95, above a 7,050 km/h pair's 0.934.
+Since scene time is OCR of an overlay clock at second resolution, a true sub-second
+gap is routinely stamped as 0s, so the least determinate findings were ranking
+highest. Introduced `ZERO_ELAPSED_VIOLATION = 0.9`, held below the strongest
+measured violations, and the `reason` now says the gap is below the overlay clock's
+resolution so the speed could not be computed — only bounded below by `distance x
+3600` km/h.
+
+## Covering tests added to `_self_check`
+
+- Interleaving: the exact three-sighting case above now asserts one finding whose
+  two sightings are `cam04` and `cam14`.
+- Same-second pair: asserts `implied_kmh is None`, that "resolution" appears in the
+  reason, and that its confidence is strictly below the 1-second (7,050 km/h) pair's.
+
+## Commands run
+
+```
+$ .venv/Scripts/python.exe -m netra.analytics.cloned_plate
+cloned_plate self-check passed
+$ .venv/Scripts/python.exe -m netra.api.assistant
+assistant self-check passed
+$ .venv/Scripts/python.exe -m netra.analytics.route
+route self-check passed
+```
+
+## Concerns
+
+None. The partition change strictly widens what is detected without weakening the
+session constraint — it moves the constraint earlier, where it cannot be bypassed.
