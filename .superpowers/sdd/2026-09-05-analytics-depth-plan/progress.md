@@ -7,25 +7,25 @@ Cost if wrong: no branch isolation; mitigated by one commit per task.
 
 ## Pre-flight conflict scan
 
-| Pair / task | Shared surface | Produces vs consumes | Finding |
-|---|---|---|---|
-| 1 & 6 | inference.py plate path | 1 produces consensus plate_text; 6 consumes indexed detections | Clean — 6 ordered after 1 |
-| 1 & 3 | inference.py per-camera state dicts | 1 adds voter dict; 3 adds dark-frame + re-anchor state | Both touch `reset_camera_state`; ordered 1 then 3, task 3 brief notes the voter exists |
-| 2 & 6 | matching.spacetime_plausible, geo.time_group | both consume; neither mutates | Clean |
-| 3a & 6 | tracking.py MAX_TRACKS vs indexing volume | 3a caps tracks; 6 replays a full loop | Cap is per-camera live state, not stored detections — no conflict |
-| 3b & 8b | counted_this_loop vs console counters | 3b produces; 8b consumes | Clean — 8 ordered last |
-| 4b & 1 | pipeline watchlist prefilter vs consensus plate | 1 changes plate_text before matching | Clean — prefilter operates on whatever text arrives |
-| 4a & 2 | retention deletes evidence; clones cite detections | 4a must not delete alert-referenced evidence | Constraint already stated in task 4a |
-| 5 & 8c | baselines endpoint vs console panel | 5 produces; 8c consumes | Clean — ordered |
-| 7 & assistant intents | retrieval.resolve before intent routing | 7 modifies existing routing | Risk: could regress existing intents; task 7 brief mandates all existing intents keep working and self-check covers it |
-| Task 1 self-consistency | voter vs inference wiring | consistent | Clean |
-| Task 2 self-consistency | same-camera guard vs time-group guard | both stated | Clean |
-| Task 3 self-consistency | 4 sub-items each with self-check | consistent | Clean |
-| Task 4 self-consistency | 3 sub-items, config additions stated | consistent | Clean |
-| Task 5 self-consistency | MIN_SAMPLES vs stdev floor both stated | consistent | Clean |
-| Task 6 self-consistency | network-free self-check vs network indexing | explicitly separated | Clean |
-| Task 7 self-consistency | BM25 vs trigram fallback both specified | consistent | Clean |
-| Task 8 self-consistency | needs snapshot endpoint, which it creates | stated in 8a | Clean |
+| Pair / task             | Shared surface                                     | Produces vs consumes                                           | Finding                                                                                                                |
+| ----------------------- | -------------------------------------------------- | -------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| 1 & 6                   | inference.py plate path                            | 1 produces consensus plate_text; 6 consumes indexed detections | Clean — 6 ordered after 1                                                                                             |
+| 1 & 3                   | inference.py per-camera state dicts                | 1 adds voter dict; 3 adds dark-frame + re-anchor state         | Both touch`reset_camera_state`; ordered 1 then 3, task 3 brief notes the voter exists                                |
+| 2 & 6                   | matching.spacetime_plausible, geo.time_group       | both consume; neither mutates                                  | Clean                                                                                                                  |
+| 3a & 6                  | tracking.py MAX_TRACKS vs indexing volume          | 3a caps tracks; 6 replays a full loop                          | Cap is per-camera live state, not stored detections — no conflict                                                     |
+| 3b & 8b                 | counted_this_loop vs console counters              | 3b produces; 8b consumes                                       | Clean — 8 ordered last                                                                                                |
+| 4b & 1                  | pipeline watchlist prefilter vs consensus plate    | 1 changes plate_text before matching                           | Clean — prefilter operates on whatever text arrives                                                                   |
+| 4a & 2                  | retention deletes evidence; clones cite detections | 4a must not delete alert-referenced evidence                   | Constraint already stated in task 4a                                                                                   |
+| 5 & 8c                  | baselines endpoint vs console panel                | 5 produces; 8c consumes                                        | Clean — ordered                                                                                                       |
+| 7 & assistant intents   | retrieval.resolve before intent routing            | 7 modifies existing routing                                    | Risk: could regress existing intents; task 7 brief mandates all existing intents keep working and self-check covers it |
+| Task 1 self-consistency | voter vs inference wiring                          | consistent                                                     | Clean                                                                                                                  |
+| Task 2 self-consistency | same-camera guard vs time-group guard              | both stated                                                    | Clean                                                                                                                  |
+| Task 3 self-consistency | 4 sub-items each with self-check                   | consistent                                                     | Clean                                                                                                                  |
+| Task 4 self-consistency | 3 sub-items, config additions stated               | consistent                                                     | Clean                                                                                                                  |
+| Task 5 self-consistency | MIN_SAMPLES vs stdev floor both stated             | consistent                                                     | Clean                                                                                                                  |
+| Task 6 self-consistency | network-free self-check vs network indexing        | explicitly separated                                           | Clean                                                                                                                  |
+| Task 7 self-consistency | BM25 vs trigram fallback both specified            | consistent                                                     | Clean                                                                                                                  |
+| Task 8 self-consistency | needs snapshot endpoint, which it creates          | stated in 8a                                                   | Clean                                                                                                                  |
 
 Ruling: no conflict requires a plan change before execution. The one risk
 (task 7 regressing assistant intents) is covered by that task's self-check
@@ -100,3 +100,78 @@ Task 4: minor (deferred): known throughput ceiling — correct prefilter costs
   or sharding, never a lossier window.
 Task 4: minor (deferred): candidates() documents "Order is stable" while
   iterating a set, so ordering varies with PYTHONHASHSEED. Pre-existing.
+Task 5: review spec OK, carried-forward differencing fix verified correct
+  (per-bucket totals, counts_by_class <= total invariant holds, loop reset and
+  tracker restart both non-negative). Quality: Changes needed.
+Task 5: fix round 1 dispatched — Critical (the `quiet` branch short-circuits
+  the z-score and reports "road may be blocked" on readings its own evidence
+  places inside the normal band; fires on most quiet cameras every few
+  minutes) plus Important (5 legacy cumulative traffic_stats rows in the live
+  database inflate cam15's hour-18 mean 4x and stdev 23x, so a genuine
+  ten-fold spike reads as normal — on exactly the demo cameras and hour).
+Task 5: minor (deferred): class breakdown lost on the tracker-restart branch
+  (total takes the whole cumulative, class deltas all <= 0 and filtered out).
+Task 5: minor (deferred): anomalies endpoint judges the most recent bucket per
+  camera with no freshness filter, so a stale bucket is labelled current.
+Task 5: minor (deferred): the observed reading is included in the history its
+  own baseline is learned from; negligible at n>=5.
+Task 5: minor (deferred): _apply_added_columns reuses one cached Inspector
+  across the loop; harmless for two independent columns, would misbehave if a
+  future column depended on seeing a prior ALTER.
+Task 5: fix round 1/5 (2 addressed, 0 open; commits 52f518e..5a360a0).
+  Re-review swept observed 0..100 and confirmed bands are monotonic with no
+  gap; the useful busy-road quiet case still fires at z=-18.
+Task 5: complete (commits e3a54a8..5a360a0, review clean)
+Task 5: minor (deferred): the legacy-row discriminator depends on the
+  migration's DEFAULT 0; a future repopulation from another source leaving
+  that column zero would silently drop real rows. Documented in the docstring.
+Task 7: review spec OK, architectural rule upheld (no answer text is built
+  from index contents; every fact comes from a SessionLocal read, and _search
+  drops matches whose row cannot be read rather than describing them).
+  Honesty verified in live answer strings. All 10 existing intents regression-
+  checked, none broken. Quality: Approved with 1 Important.
+Task 7: fix round 1 dispatched — Important (intent words carry maximum idf into
+  the coverage denominator and sink the mention, so "is cam11 down" does not
+  scope even though the resolution note instructs the operator to name the id
+  directly; "dolatpara" alone resolves cleanly).
+Task 7: minor (folded into fix round 1): _resolution_note uses the index-cached
+  label rather than the freshly read row; resolve() swallows all exceptions
+  with no log line.
+Task 7: fix round 1/5 (1 Important + 2 minors addressed, 0 open;
+  commits 016f82f..d76e632). Re-review confirmed the safety properties held:
+  unrelated and generic strings still resolve to nothing, and all ten existing
+  intents still answer estate-wide without wrongly scoping to one camera.
+Task 7: complete (commits 5a360a0..d76e632, review clean)
+Task 7: minor (deferred): watchlist ids are bare integers, so in principle a
+  query that is essentially one digit could exact-match a watchlist row. Did
+  not manifest in testing; both confidence floors must pass first.
+Task 6: review spec OK; all three correctness properties independently
+  verified (scene-time-only; no cross-group leak under adversarial
+  interleaving cam04-cam08-cam14-cam09-...; caps bite, 6,000 detections mined
+  in 0.16s, 20,000 truncated to 4,000). Quality: Changes needed, 4 Important.
+Task 6: fix round 1 dispatched — Important 1 (unbounded chain length: 20,000
+  synthetic detections produced a single 1,500-hop journey spanning 12.5h of
+  recorded time at confidence 0.95, which would weld distinct vehicles into
+  one maximum-confidence claim on real footage); Important 2 (a zero mining
+  result re-mines plus DELETE+commit on every request, live now because
+  mining currently returns nothing); Important 3 (min_similarity/min_hops/
+  limit silently ignored when the store is non-empty); Important 4 (the
+  exclusion report is computed then discarded, so the docstring's honesty
+  claim has no caller-visible surface).
+Task 6: minor (folded into fix round 1): estimate_loop_length returns
+  join-to-loop-point presented as the loop length; a stale comment at
+  loop_index.py:399; index_camera does not fail fast on an unstarted engine.
+Task 6: note: console does not yet render journeys; Task 8 covers that.
+Task 6: fix round 1/5 (4 Important + 3 minors addressed; 2 NEW Important
+  found in the fix diff, commits 32076d3..04e5517). Chain cap verified:
+  12-hop chain now 0.502 vs two-hop 0.95, truncation flagged, all of
+  properties 6-9 re-verified without regression.
+Task 6: fix round 2 dispatched — NEW Important A (SQLAlchemy JSON columns
+  store Python None as JSON 'null', so embedding.is_(None) matches nothing;
+  15,710 of 32,785 live detections affected; the new honesty surface
+  publishes comparable=714/excluded=0 when the truth is 634/80, and the CLI
+  contradicts itself a line apart). NEW Important B (a refresh with narrow
+  parameters deletes and replaces the whole group, so one caller's
+  min_hops=9 left every other reader's default view at 0).
+  Plus three honesty consequences and a repo-wide grep for the same JSON-null
+  pattern on other JSON columns.
