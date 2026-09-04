@@ -18,6 +18,7 @@ from netra.analytics.inference import InferenceEngine
 from netra.analytics.matching import score_match
 from netra.core.db import SessionLocal
 from netra.core.models import Alert, Camera, Detection, WatchlistEntry
+from netra.core.notify import NOTIFIER
 from netra.ingest.stream import IngestSupervisor
 
 log = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ class Pipeline:
         log.info("starting pipeline over %d cameras", len(ids))
         self.engine.load()
         self.engine.start()
+        NOTIFIER.start()
         self.supervisor.start(ids)
         self.running = True
         self.started_at = datetime.now(timezone.utc)
@@ -71,6 +73,7 @@ class Pipeline:
     def _handle_discontinuity(self, camera_id: str) -> None:
         """The recording looped. Any cross-frame state for this camera is void."""
         log.info("%s discontinuity - resetting per-camera state", camera_id)
+        self.engine.reset_camera_state(camera_id)
 
     def _handle_detection(self, det) -> None:
         """Persist a detection, then test it against the watchlist."""
@@ -96,6 +99,8 @@ class Pipeline:
             plate_conf=det.plate_conf,
             plate_chars=det.plate_chars,
             plate_bbox=det.plate_bbox,
+            scene_time=det.scene_time,
+            embedding=det.embedding,
             evidence_path=evidence_path,
         )
 
@@ -170,6 +175,7 @@ class Pipeline:
         log.warning("ALERT %s on %s (%s, score %.2f)",
                     entry["plate"], det.camera_id, result.match_type, result.score)
         self._broadcast(payload)
+        NOTIFIER.submit(payload)
 
     # -- push to consoles ----------------------------------------------------
     def subscribe(self) -> queue.Queue:

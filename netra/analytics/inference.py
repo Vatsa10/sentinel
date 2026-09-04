@@ -42,6 +42,9 @@ class VehicleDetection:
     plate_conf: float | None = None
     plate_chars: int | None = None
     plate_bbox: list[int] | None = None
+    #: real time the scene occurred, from the camera's burned-in overlay
+    scene_time: object | None = None
+    embedding: list | None = field(default=None, repr=False)
     evidence: object | None = field(default=None, repr=False)
 
 
@@ -98,9 +101,13 @@ class InferenceEngine:
         self._vehicle_model = None
         self._plate_model = None
         self._ocr = None
+        self._reid = None
+        #: camera_id -> ClockAnchor, tying each stream to real scene time
+        self._clocks: dict = {}
 
         self.stats = {"submitted": 0, "dropped": 0, "processed": 0,
-                      "vehicles": 0, "plates": 0, "infer_ms": 0.0}
+                      "vehicles": 0, "plates": 0, "embedded": 0,
+                      "clocks_anchored": 0, "infer_ms": 0.0}
 
     # -- model loading -------------------------------------------------------
     def load(self) -> None:
@@ -123,6 +130,16 @@ class InferenceEngine:
             log.info("OCR ready")
         except Exception as exc:
             log.warning("OCR unavailable (%s) - plates will not be read", exc)
+
+        # Appearance embeddings are what allow a vehicle to be followed across
+        # cameras on this grid, where plates are not recoverable.
+        try:
+            from netra.analytics.reid import ReIdEncoder
+            self._reid = ReIdEncoder()
+            self._reid.load()
+        except Exception as exc:
+            log.warning("re-identification unavailable (%s)", exc)
+            self._reid = None
 
     # -- frame intake --------------------------------------------------------
     def submit(self, frame) -> None:
@@ -159,6 +176,30 @@ class InferenceEngine:
                 log.exception("inference failed for %s", frame.camera_id)
 
     # -- the actual work -----------------------------------------------------
+    def reset_camera_state(self, camera_id: str) -> None:
+        """Discard per-camera state after a loop cut.
+
+        The recording restarted, so the previous scene-time anchor no longer
+        describes this stream and must be read again.
+        """
+        self._clocks.pop(camera_id, None)
+
+    def _anchor_clock(self, frame) -> None:
+        """Read the burned-in timestamp once per connection, then extrapolate."""
+        if self._ocr is None or frame.camera_id in self._clocks:
+            return
+        from netra.analytics.scene_clock import read_scene_time
+        try:
+            anchor = read_scene_time(self._ocr, frame.image, frame.pts_ms,
+                                     frame.camera_id)
+        except Exception:
+            log.debug("scene clock read failed for %s", frame.camera_id,
+                      exc_info=True)
+            return
+        if anchor:
+            self._clocks[frame.camera_id] = anchor
+            self.stats["clocks_anchored"] = len(self._clocks)
+
     def _process(self, frame) -> None:
         t0 = time.time()
         img = frame.image
@@ -166,6 +207,10 @@ class InferenceEngine:
 
         if capability == "degraded":
             return  # corrupt or unusable feed; health monitoring only
+
+        self._anchor_clock(frame)
+        anchor = self._clocks.get(frame.camera_id)
+        scene_time = anchor.at(frame.pts_ms) if anchor else None
 
         classes = None if capability == "person" else list(config.VEHICLE_CLASSES)
         if capability == "person":
@@ -201,10 +246,21 @@ class InferenceEngine:
                 wall_time=frame.wall_time, vehicle_class=name,
                 confidence=conf, bbox=[x1, y1, x2, y2],
                 colour=estimate_colour(crop) if cls_id != 0 else None,
+                scene_time=scene_time,
                 evidence=crop)
             detections.append(det)
 
         self.stats["vehicles"] += len(detections)
+
+        # Embed every vehicle in one batch - far cheaper than one call each.
+        if self._reid is not None and self._reid.ready and detections:
+            try:
+                vectors = self._reid.encode([d.evidence for d in detections])
+                for det, vec in zip(detections, vectors):
+                    det.embedding = vec.tolist()
+                self.stats["embedded"] = self.stats.get("embedded", 0) + len(detections)
+            except Exception:
+                log.exception("embedding failed")
 
         # Tier 2 only where plate geometry can actually support a read.
         if capability == "anpr" and detections:

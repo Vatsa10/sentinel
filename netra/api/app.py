@@ -424,3 +424,119 @@ def seed_watchlist():
         db.commit()
     _audit("watchlist.seed", detail={"added": added})
     return {"added": added}
+
+
+# ------------------------------------------------- cross-camera appearance --
+@app.get("/api/vehicles/{detection_id}/similar")
+def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
+                     min_similarity: float = 0.80):
+    """Find the same vehicle on other cameras by appearance.
+
+    This is the answer to "trace this vehicle" when no plate is readable, which
+    on this grid is the normal case. Results are ranked candidates carrying
+    their similarity score, ordered in time, and filtered for space-time
+    plausibility - not assertions of identity.
+    """
+    from netra.analytics.reid import similarity
+    from netra.core.geo import haversine_km, time_group
+    from netra.analytics.matching import spacetime_plausible
+
+    with SessionLocal() as db:
+        query = db.get(Detection, detection_id)
+        if query is None:
+            raise HTTPException(404, "detection not found")
+        if not query.embedding:
+            raise HTTPException(
+                400, "this detection has no appearance embedding")
+
+        qcam = db.get(Camera, query.camera_id)
+        others = (db.query(Detection).options(joinedload(Detection.camera))
+                  .filter(Detection.id != detection_id,
+                          Detection.embedding.isnot(None)).all())
+
+        scored = []
+        for det in others:
+            sim = similarity(query.embedding, det.embedding)
+            if sim < min_similarity:
+                continue
+            cam = det.camera
+            km = 0.0
+            if qcam and cam and None not in (qcam.lat, qcam.lon, cam.lat, cam.lon):
+                km = haversine_km(qcam.lat, qcam.lon, cam.lat, cam.lon)
+            secs = abs((det.wall_time - query.wall_time).total_seconds())
+
+            # Same-camera sightings need no travel check; different cameras do.
+            if det.camera_id != query.camera_id and secs > 0:
+                ok, why = spacetime_plausible(km, secs)
+            else:
+                ok, why = True, "same camera"
+
+            scored.append({
+                "detection_id": det.id,
+                "camera_id": det.camera_id,
+                "camera_name": cam.name if cam else None,
+                "lat": cam.lat if cam else None,
+                "lon": cam.lon if cam else None,
+                "at": det.wall_time.isoformat(),
+                "vehicle_class": det.vehicle_class,
+                "colour": det.colour,
+                "plate_text": det.plate_text,
+                "evidence": det.evidence_path,
+                "similarity": round(sim, 4),
+                "distance_km": round(km, 2),
+                "elapsed_s": round(secs, 1),
+                "plausible": ok,
+                "plausibility": why,
+                "same_time_group": time_group(det.camera_id) == time_group(query.camera_id),
+            })
+
+        scored.sort(key=lambda x: x["similarity"], reverse=True)
+        matches = scored[:limit]
+
+        origin = {
+            "detection_id": query.id, "camera_id": query.camera_id,
+            "camera_name": qcam.name if qcam else None,
+            "lat": qcam.lat if qcam else None, "lon": qcam.lon if qcam else None,
+            "at": query.wall_time.isoformat(),
+            "vehicle_class": query.vehicle_class, "colour": query.colour,
+            "evidence": query.evidence_path,
+        }
+
+    _audit("vehicle.similar", target=str(detection_id),
+           detail={"matches": len(matches)})
+    return {
+        "query": origin,
+        "matches": matches,
+        "plausible_matches": [m for m in matches if m["plausible"]],
+        "method": "appearance re-identification (ResNet-18 512-d, cosine)",
+        "note": ("Ranked candidates for operator confirmation, not identification. "
+                 "Appearance evidence alone does not establish that two sightings "
+                 "are the same vehicle."),
+    }
+
+
+@app.get("/api/vehicles/{detection_id}/track")
+def appearance_track(detection_id: int, min_similarity: float = 0.82):
+    """Build a movement path for a vehicle using appearance alone.
+
+    Same output shape as /api/route so the console renders either identically,
+    whether the vehicle was followed by plate or by appearance.
+    """
+    data = similar_vehicles(detection_id, limit=100, min_similarity=min_similarity)
+    hops = [data["query"]] + [m for m in data["matches"]
+                              if m["plausible"] and m["same_time_group"]]
+    hops.sort(key=lambda h: h["at"])
+
+    from netra.core.geo import haversine_km
+    total_km = 0.0
+    for prev, cur in zip(hops, hops[1:]):
+        if None in (prev.get("lat"), prev.get("lon"), cur.get("lat"), cur.get("lon")):
+            continue
+        leg = haversine_km(prev["lat"], prev["lon"], cur["lat"], cur["lon"])
+        cur["leg_km"] = round(leg, 2)
+        total_km += leg
+
+    return {"query": f"detection #{detection_id}", "hops": hops,
+            "hop_count": len(hops), "total_km": round(total_km, 2),
+            "rejected": [m for m in data["matches"] if not m["plausible"]],
+            "method": data["method"], "note": data["note"]}

@@ -68,11 +68,16 @@ class CameraWorker(threading.Thread):
     """Reads one camera forever, emitting sampled frames to a sink."""
 
     def __init__(self, camera_id: str, sink: Callable[[Frame], None],
-                 on_discontinuity: Callable[[str], None] | None = None):
+                 on_discontinuity: Callable[[str], None] | None = None,
+                 source_spec=None):
         super().__init__(daemon=True, name=f"ingest-{camera_id}")
         self.camera_id = camera_id
         self.sink = sink
         self.on_discontinuity = on_discontinuity
+        # Which adapter reaches this camera. Defaults to RTSP on the grid;
+        # a file or HLS spec is accepted unchanged.
+        from netra.ingest.sources import spec_for_camera
+        self.source_spec = source_spec or spec_for_camera(camera_id)
         self.state = CameraState(camera_id)
         self._stop = threading.Event()
 
@@ -91,27 +96,28 @@ class CameraWorker(threading.Thread):
 
     # -- main loop -----------------------------------------------------------
     def run(self) -> None:
+        from netra.ingest.sources import build
+
         backoff = config.RECONNECT_BASE_S
         while not self._stop.is_set():
-            cap = None
+            source = None
             try:
-                cap = cv2.VideoCapture(config.rtsp_url(self.camera_id), cv2.CAP_FFMPEG)
-                if not cap.isOpened():
-                    raise ConnectionError("capture did not open")
+                source = build(self.source_spec)
+                source.open()
 
                 self.state.connected = True
                 self.state.last_error = None
                 backoff = config.RECONNECT_BASE_S  # reset only on a real connection
-                log.info("%s connected", self.camera_id)
-                self._read_until_failure(cap)
+                log.info("%s connected (%s)", self.camera_id, self.source_spec.kind)
+                self._read_until_failure(source)
 
             except Exception as exc:
                 self.state.last_error = str(exc)
                 log.warning("%s stream error: %s", self.camera_id, exc)
             finally:
                 self.state.connected = False
-                if cap is not None:
-                    cap.release()
+                if source is not None:
+                    source.release()
 
             if self._stop.is_set():
                 break
@@ -120,7 +126,7 @@ class CameraWorker(threading.Thread):
             self._stop.wait(backoff)
             backoff = min(backoff * 2, config.RECONNECT_MAX_S)
 
-    def _read_until_failure(self, cap) -> None:
+    def _read_until_failure(self, source) -> None:
         st = self.state
         # PTS of the last frame we actually forwarded, so sampling is measured
         # in stream time rather than wall time.
@@ -128,14 +134,13 @@ class CameraWorker(threading.Thread):
         st.last_pts_ms = 0.0
 
         while not self._stop.is_set():
-            ok, frame = cap.read()
+            ok, frame, pts = source.read()
             if not ok:
                 # End of stream or a decoder giving up: reconnect. A momentary
                 # gap does not reach here - read() blocks through those.
                 raise ConnectionError("read failed")
 
             now = time.time()
-            pts = float(cap.get(cv2.CAP_PROP_POS_MSEC) or 0.0)
             st.frames_seen += 1
             st.last_frame_wall = now
 
@@ -188,11 +193,13 @@ class IngestSupervisor:
         self.on_discontinuity = on_discontinuity
         self.workers: dict[str, CameraWorker] = {}
 
-    def start(self, camera_ids: list[str]) -> None:
+    def start(self, camera_ids: list[str], source_specs: dict | None = None) -> None:
+        source_specs = source_specs or {}
         for cid in camera_ids:
             if cid in self.workers:
                 continue
-            w = CameraWorker(cid, self.sink, self.on_discontinuity)
+            w = CameraWorker(cid, self.sink, self.on_discontinuity,
+                             source_spec=source_specs.get(cid))
             self.workers[cid] = w
             w.start()
             # Stagger connections: 30 simultaneous RTSP handshakes is a burst

@@ -43,16 +43,21 @@ python run.py                                    # console on http://localhost:8
 Then in the console: **Start pipeline**, load the sample watchlist from the
 Watchlist tab, and detections and alerts begin appearing.
 
-### PyTorch
+### GPU
 
-The GPU this was built on is an RTX 5050 (Blackwell, `sm_120`), which requires
-a CUDA 12.8 build. The default PyPI wheel will install but fail at runtime:
+All inference runs on the GPU. Measured on an RTX 5050 (8 GB, Blackwell):
+**~6 ms per 1080p frame, ~52 frames/second**, which is roughly 1.7x the load
+of scanning all 30 cameras at the tier-1 rate.
+
+Blackwell is `sm_120` and needs a CUDA 12.8 build. The default PyPI wheel
+installs but fails at runtime, so PyTorch must come from the cu128 index:
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
-Set `NETRA_DEVICE=cpu` to run without a GPU. It works, but slowly.
+Verify with `python run.py --check`, which prints the detected device.
+`NETRA_DEVICE=cpu` exists only as a fallback for machines without a GPU.
 
 ### Configuration
 
