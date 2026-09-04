@@ -216,3 +216,34 @@ class TrafficStat(Base):
     counts_by_class: Mapped[dict] = mapped_column(JSON, default=dict)
     directions: Mapped[dict] = mapped_column(JSON, default=dict)
     mean_dwell_s: Mapped[float] = mapped_column(Float, default=0.0)
+
+
+class MinedJourney(Base):
+    """A cross-camera journey mined from an indexed loop.
+
+    Stored so the console can show journeys without re-running the mining,
+    which is an O(n²) appearance comparison over an entire indexed recording
+    and far too slow to sit inside a console refresh. Every row keeps the
+    evidence behind it — the per-hop similarity, distance and implied speed —
+    because a journey is an appearance-based candidate, never an
+    identification, and the operator confirming it needs the arithmetic.
+    """
+    __tablename__ = "mined_journeys"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    #: only cameras sharing a recorded clock can be chained, so a journey
+    #: belongs to exactly one recording session
+    time_group: Mapped[str] = mapped_column(String(64), index=True)
+    hop_count: Mapped[int] = mapped_column(Integer, default=0)
+    cameras: Mapped[list] = mapped_column(JSON, default=list)
+    total_km: Mapped[float] = mapped_column(Float, default=0.0)
+    elapsed_s: Mapped[float] = mapped_column(Float, default=0.0)
+    mean_similarity: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    #: scene time, not wall time: these bound the journey on the recorded clock
+    first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    hops: Mapped[list] = mapped_column(JSON, default=list)
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                 default=_utcnow, index=True)

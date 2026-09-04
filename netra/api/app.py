@@ -902,6 +902,55 @@ def cloned_plates(min_confidence: float = Query(0.6, ge=0.0, le=0.99),
     }
 
 
+@app.get("/api/analytics/journeys")
+def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
+                   min_similarity: float = Query(0.84, ge=0.5, le=0.99),
+                   min_hops: int = Query(2, ge=2, le=10),
+                   refresh: bool = False,
+                   limit: int = Query(50, ge=1, le=200),
+                   _p=Depends(require("read"))):
+    """Vehicles that genuinely appear on more than one camera of one recording.
+
+    The grid replays fixed recordings, and the cameras of a time group share
+    the clock burnt into their frames, so a chain built on scene time is a real
+    journey through the Government's own footage rather than a demonstration.
+
+    Served from the mined store; `refresh` re-runs the mining, which is an
+    appearance comparison across the whole index and is not cheap.
+    """
+    from netra.analytics.loop_index import (find_journeys, persist_journeys,
+                                            stored_journeys)
+    from netra.core.geo import TIME_GROUPS
+
+    if group not in TIME_GROUPS:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown time group; known groups are "
+                                   f"{', '.join(sorted(TIME_GROUPS))}")
+
+    rows = [] if refresh else stored_journeys(group, limit=limit)
+    mined = False
+    if not rows:
+        journeys = find_journeys(group, min_similarity=min_similarity,
+                                 min_hops=min_hops, limit=limit)
+        persist_journeys(group, journeys)
+        rows = [j.to_dict() for j in journeys]
+        mined = True
+
+    _audit("analytics.journeys", target=group,
+           detail={"journeys": len(rows), "mined": mined})
+    return {
+        "group": group,
+        "cameras": TIME_GROUPS[group],
+        "journeys": rows,
+        "count": len(rows),
+        "mined_now": mined,
+        "note": ("Appearance-based candidate journeys for operator "
+                 "confirmation, not identifications. Chained on the clock "
+                 "recorded in the video, never on capture time, and never "
+                 "across recording sessions."),
+    }
+
+
 @app.get("/api/report", response_class=HTMLResponse)
 def output_report(hours: int = Query(24, ge=1, le=720)):
     """Operational output report, printable to PDF from the browser.
