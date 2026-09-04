@@ -661,11 +661,7 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
                   .filter(Detection.id != detection_id,
                           has_embedding()).all())
 
-        # The third signal. Only ever consulted for candidates appearance has
-        # already selected, and only where both sides carry a description, so
-        # it can corroborate a match but never create one.
-        attr_rows = _attributes_for([detection_id] + [d.id for d in others], db)
-        query_attrs = attr_rows.get(detection_id)
+        query_attrs = _attributes_for([detection_id], db).get(detection_id)
 
         scored = []
         for det in others:
@@ -684,15 +680,6 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
             else:
                 ok, why = True, "same camera"
 
-            # Presented separately from `similarity`, which stays the raw
-            # cosine: an operator must be able to see what appearance alone
-            # said and what the description did to it.
-            presented, adjustment = sim, None
-            agreement = attribute_agreement(query_attrs, attr_rows.get(det.id))
-            if agreement:
-                presented = max(0.0, min(1.0, sim + agreement["delta"]))
-                adjustment = agreement
-
             scored.append({
                 "detection_id": det.id,
                 "camera_id": det.camera_id,
@@ -705,9 +692,9 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
                 "plate_text": det.plate_text,
                 "evidence": det.evidence_path,
                 "similarity": round(sim, 4),
-                "presented_similarity": round(presented, 4),
-                "attributes": attr_rows.get(det.id),
-                "attribute_adjustment": adjustment,
+                "presented_similarity": round(sim, 4),
+                "attributes": None,
+                "attribute_adjustment": None,
                 "distance_km": round(km, 2),
                 "elapsed_s": round(secs, 1),
                 "plausible": ok,
@@ -725,6 +712,23 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
         # one of them is flagged. The console needs this to avoid rendering a
         # coin-toss as an identification.
         matches = flag_ambiguity(scored[:limit])
+
+        # The third signal, applied last and only to the candidates appearance
+        # has already chosen: it can qualify a match but never create one, and
+        # looking attributes up only for the returned page keeps this to one
+        # bounded query rather than one over every embedded detection.
+        attr_rows = _attributes_for([m["detection_id"] for m in matches], db)
+        for m in matches:
+            m["attributes"] = attr_rows.get(m["detection_id"])
+            agreement = attribute_agreement(query_attrs, m["attributes"])
+            if not agreement:
+                continue
+            # Presented separately from `similarity`, which stays the raw
+            # cosine: an operator must be able to see what appearance alone
+            # said and what the description did to it.
+            m["attribute_adjustment"] = agreement
+            m["presented_similarity"] = round(
+                max(0.0, min(1.0, m["similarity"] + agreement["delta"])), 4)
 
         origin = {
             "detection_id": query.id, "camera_id": query.camera_id,
