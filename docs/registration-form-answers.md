@@ -1,0 +1,63 @@
+# NETRA — Registration Form Answers
+**Gujarat Police Innovation Challenge 2026 · Sentinel CCTV Hackathon**
+
+- **Project name:** NETRA — Networked Evidence, Tracking & Recognition for Analytics
+- **Primary Solution Model:** Model 2 — Unified Viewing and Selective Analytics
+- **Model 1 Confirmation:** Confirmed — centralised CCTV registry and GIS foundation included as mandatory foundation
+
+---
+
+## Field 1 — Proposed Solution
+
+NETRA is a vendor-neutral unified viewing and analytics platform built on Model 2, with Model 1 as its mandatory foundation layer.
+
+The Model 1 layer is a centralised CCTV registry on PostgreSQL/PostGIS holding standardised metadata for every camera — location, owning department, camera type, protocol, connectivity health, storage and retention details — onboarded through bulk CSV import, manual entry, or REST API. A Leaflet-based GIS console renders every camera as a live map layer with department, type and health filters, and generates coverage gap-analysis reports.
+
+On this foundation, the Model 2 layer connects directly to heterogeneous departmental cameras and VMS platforms through a pluggable source-adapter framework supporting RTSP, ONVIF Profile S, HLS and vendor SDKs, with no change to existing departmental infrastructure and no centralised recording of full video. Each adapter normalises its source into a common stream descriptor, so onboarding a new vendor means adding one adapter, not redesigning the platform.
+
+A GPU-accelerated analytics pipeline samples frames from each onboarded stream and performs Automatic Number Plate Recognition, vehicle detection and vehicle attribute extraction. Every detection is written as a structured event — plate text, confidence, camera ID, geo-coordinates, timestamp, cropped evidence image — into an indexed event store. A rules engine continuously cross-references this event stream against a watchlist database of stolen vehicles, blacklisted vehicles, wanted persons and suspect entities, and raises a prioritised real-time alert on the operator console the moment a match occurs, with the evidence frame and map pin attached. The watchlist schema is modelled on VAHAN, eGujCop and CCTNS record structures so production integration is a connector change, not a redesign.
+
+Because every detection carries camera geometry from the registry, NETRA reconstructs cross-camera vehicle movement: given a registration number, it returns the complete timestamped route the vehicle traversed across the integrated network, drawn on the GIS map with per-sighting evidence frames.
+
+The architecture is open, modular and standards-based throughout — containerised microservices, documented REST APIs, an event bus for analytics fan-out, and role-based access control with full audit logging — allowing cameras, VMS platforms, analytics models and storage tiers to be replaced or upgraded independently, and allowing horizontal scale-out toward approximately 80,000 cameras through regional edge-inference nodes that transmit metadata rather than video.
+
+---
+
+## Field 2 — Key Features
+
+- Centralised CCTV registry with bulk, manual and API-based camera onboarding
+- Interactive GIS map with department, camera-type, protocol and health layers
+- Camera health monitoring and coverage gap-analysis reporting
+- Pluggable source-adapter framework for RTSP, ONVIF, HLS and vendor SDKs
+- Unified multi-camera video wall with configurable operator grid views
+- GPU-accelerated ANPR with plate detection, OCR and confidence scoring
+- Vehicle detection, classification and attribute extraction
+- Structured event store with searchable, timestamped, geo-tagged detections
+- Watchlist database for stolen vehicles, blacklisted vehicles and suspect entities
+- Continuous automated cross-referencing of live detections against watchlist records
+- Prioritised real-time alerting with evidence frame, camera location and map pin
+- Cross-camera vehicle route reconstruction from a registration number
+- Timestamped movement history with per-sighting evidence images
+- Full-text and filtered search across all detection events
+- Role-based access control, department-scoped visibility and audit trails
+- Documented REST APIs for downstream integration with VAHAN, eGujCop and CCTNS
+- Edge-inference deployment mode transmitting metadata instead of full video
+- Containerised, horizontally scalable microservice architecture
+
+---
+
+## Field 3 — Expected Impact
+
+Reduces vehicle-of-interest tracing from a manual, multi-day process across disconnected departmental control rooms to an automated query answered in seconds, with a complete timestamped route and evidence images.
+
+Converts approximately 80,000 statewide cameras from passive recording assets into an active detection network, alerting officers on a watchlist match in near real time rather than after post-incident footage review.
+
+Eliminates the need for operators to run multiple separate vendor viewer applications, consolidating monitoring into a single interface and cutting operator context-switching and response latency.
+
+Preserves the State's existing investment: departments retain their cameras, VMS platforms and storage, so integration cost is limited to the adapter and analytics layer rather than infrastructure replacement.
+
+Cuts backbone bandwidth requirements substantially by processing video at regional edge nodes and transmitting only structured metadata to the central platform, making statewide coverage viable over existing network capacity.
+
+Creates the State's first authoritative camera inventory with GIS coverage mapping, giving planners evidence-based visibility of monitoring gaps, ageing infrastructure and future deployment priorities.
+
+Provides a vendor-neutral, standards-based foundation that avoids lock-in and allows new departments, camera vendors and analytics models to be onboarded without redesign.

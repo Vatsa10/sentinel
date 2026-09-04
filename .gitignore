@@ -1,0 +1,14 @@
+.venv/
+wheels/
+data/
+*.log
+__pycache__/
+*.pyc
+
+# Credentials and local state
+.env
+data/
+!data/.gitkeep
+
+# Model weights (downloaded on first run)
+*.pt
