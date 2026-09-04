@@ -32,6 +32,7 @@ complexity.
 """
 from __future__ import annotations
 
+import logging
 import math
 import re
 import time
@@ -91,6 +92,8 @@ MIN_TRIGRAM_CONTAINMENT = 0.7
 MIN_TRIGRAM_QUERY_LEN = 4
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+log = logging.getLogger(__name__)
 
 
 def tokenise(text: str) -> list[str]:
@@ -210,16 +213,28 @@ class EntityIndex:
 
     # -- resolution ---------------------------------------------------------
 
-    def resolve(self, query: str, kind: str | None = None,
-                limit: int = 5) -> list[EntityMatch]:
+    def resolve(self, query: str, kind: str | None = None, limit: int = 5,
+                ignore: frozenset[str] | set[str] | None = None
+                ) -> list[EntityMatch]:
         """Entities the query plausibly names, best first, or an empty list.
 
         Returning nothing is a valid and frequent answer. A top hit that
         explains little of the query is not a resolution, it is the corpus's
         least bad row, and handing it back would let the assistant answer about
         an entity the operator never mentioned.
+
+        `ignore` is the caller's own intent vocabulary - the words that told it
+        *what* was being asked rather than *of what*. Unmatched, those words
+        are information the query supplied that no entity accounts for, so they
+        drive coverage down and sink the mention beside them: "is cam11 down"
+        would resolve nothing while "cam11" resolves cleanly. An ignored word
+        is dropped only when the corpus has never seen it, so a camera actually
+        called "Highway Junction" is never made unfindable by a word that also
+        happens to be an intent keyword.
         """
         q = _content_tokens(query)
+        if ignore:
+            q = [t for t in q if t not in ignore or t in self.df]
         if not q or not self.docs:
             return []
         pool = [d for d in self.docs if kind is None or d.kind == kind]
@@ -232,18 +247,25 @@ class EntityIndex:
         want = {t: self._idf(t) for t in set(q)}
         total_idf = sum(want.values()) or 1.0
 
-        hits: list[EntityMatch] = []
+        qset = set(q)
+        hits: list[tuple[int, EntityMatch]] = []
         for doc in pool:
             matched = sum(w for t, w in want.items() if t in doc.tf)
             if matched < MIN_EVIDENCE or matched / total_idf < MIN_COVERAGE:
                 continue
-            hits.append(EntityMatch(doc.kind, doc.id, doc.label,
-                                    self.score(q, doc), "bm25"))
+            # An operator who types an entity's own id means that entity, not
+            # a document that merely mentions it - a zone rule names the camera
+            # it sits on, and being short, outscores that camera on the
+            # camera's own id. Identity beats term statistics.
+            own = set(tokenise(doc.id))
+            named = 1 if own and own <= qset else 0
+            hits.append((named, EntityMatch(doc.kind, doc.id, doc.label,
+                                            self.score(q, doc), "bm25")))
         if hits:
-            hits.sort(key=lambda m: (-m.score, m.id))
-            return hits[:limit]
+            hits.sort(key=lambda h: (-h[0], -h[1].score, h[1].id))
+            return [m for _, m in hits[:limit]]
 
-        return self._trigram_fallback(query, pool, limit)
+        return self._trigram_fallback(" ".join(q), pool, limit)
 
     def _trigram_fallback(self, query: str, pool: list[_Doc],
                           limit: int) -> list[EntityMatch]:
@@ -337,14 +359,21 @@ def get_index(force: bool = False) -> EntityIndex:
     return idx  # type: ignore[return-value]
 
 
-def resolve(query: str, kind: str | None = None,
-            limit: int = 5) -> list[EntityMatch]:
+def resolve(query: str, kind: str | None = None, limit: int = 5,
+            ignore: frozenset[str] | set[str] | None = None
+            ) -> list[EntityMatch]:
     """Resolve a fuzzy mention against live platform entities."""
     try:
-        return get_index().resolve(query, kind=kind, limit=limit)
-    except Exception:
+        return get_index().resolve(query, kind=kind, limit=limit,
+                                   ignore=ignore)
+    except Exception as exc:
         # Resolution is an assist, never a fact. If the registry cannot be
-        # read the assistant must still answer from SQL rather than fail.
+        # read the assistant must still answer from SQL rather than fail - but
+        # a schema or connection fault that silently costs every operator
+        # their fuzzy lookups has to be findable in the log, not inferred from
+        # the feature quietly never working.
+        log.warning("entity resolution unavailable, answering unscoped: %r",
+                    exc)
         return []
 
 
@@ -434,6 +463,33 @@ def _self_check() -> None:
     # can never displace a genuine lexical hit.
     m = idx.resolve("surat ring road")
     assert m and m[0].via == "bm25" and m[0].id == "GJ-SUR-009", m
+
+    # Intent vocabulary must not sink the mention beside it. "down", "health"
+    # and "coverage" appear in no camera name, so unfiltered they carry maximum
+    # idf into the denominator and defeat a perfectly clear reference.
+    intent = frozenset({"down", "health", "coverage", "faulty", "status",
+                        "detections", "how", "many", "is", "in", "for"})
+    m = idx.resolve("is GJ-JUN-004 down", ignore=intent)
+    assert m and m[0].id == "GJ-JUN-004", m
+    m = idx.resolve("camera health for junagadh bypass", ignore=intent)
+    assert m and m[0].id == "GJ-JUN-004", m
+    m = idx.resolve("coverage in rajkot", ignore=intent)
+    assert m and m[0].id == "GJ-RAJ-002", m
+    m = idx.resolve("how many detections on junagad", ignore=intent)
+    assert m and m[0].id == "GJ-JUN-004" and m[0].via == "trigram", m
+
+    # ...and dropping intent words must not open a route to a spurious match.
+    for junk in ("the weather tomorrow", "banana", "xyzzy", "please",
+                 "the camera", "a zone", "show me", "how many detections",
+                 "is it down", "status"):
+        assert idx.resolve(junk, ignore=intent) == [], (
+            junk, idx.resolve(junk, ignore=intent))
+
+    # An ignored word the corpus does know is still matchable, so a camera is
+    # never made unfindable by a word that is also an intent keyword.
+    assert "rajkot" not in intent
+    m = idx.resolve("north ring road", ignore=frozenset({"north"}))
+    assert m and m[0].id in ("GJ-RAJ-002", "GJ-SUR-009"), m
 
     # Normalisation is what makes the character fallback work at all.
     assert normalise("Junagadh-Bypass ANPR") == "junagadhbypassanpr"

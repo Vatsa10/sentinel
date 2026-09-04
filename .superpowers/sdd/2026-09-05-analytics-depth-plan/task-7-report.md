@@ -89,3 +89,108 @@ intent unchanged.
 - Scoping handles one entity per question. "Compare cam06 and cam08" resolves
   ambiguously and falls through to the estate-wide answer — the safe direction
   to fail, but comparative questions are the ceiling.
+
+---
+
+# Fix round 1/5 — intent vocabulary defeated resolution
+
+## The fault
+
+`resolve()` received the whole question. Intent words the corpus has never
+seen — "down", "health", "coverage", "status" — entered the coverage
+denominator at maximum idf and sank the mention standing beside them, so
+`"is cam11 down"` resolved nothing while `"cam11"` resolved cleanly. The
+resolution note tells the operator to *"Name the id directly"*; following that
+instruction did not work.
+
+## The fix
+
+**`resolve(..., ignore=)`** — the caller passes its own intent vocabulary and
+those tokens are dropped from the query. A token is dropped **only when the
+corpus has never seen it** (`t not in self.df`), so a camera genuinely called
+"Highway Junction" is never made unfindable by a word that also happens to be
+an intent keyword. Both floors are otherwise untouched, so the words that
+remain must still clear `MIN_COVERAGE` and `MIN_EVIDENCE`.
+
+**`INTENT_VOCAB` in `assistant.py`** is derived from `INTENTS` itself rather
+than written out, so a keyword added to an intent cannot be forgotten here.
+
+**Exact-id priority.** `"GJ-JUN-004"` matched the zone rule sitting on that
+camera ahead of the camera, because the zone's text names the camera id and,
+being shorter, wins on length normalisation. A document whose *own id* is
+fully named by the query now sorts ahead of one that merely mentions it:
+identity beats term statistics.
+
+**Bare mentions now route.** A question with no intent keyword at all
+(`"cam11"`, `"majewadi"`) previously fell through to the decline. Resolution is
+now tried *last* in `ask()` — after every intent, so it can never divert a
+question an intent already claimed — and still declines when nothing resolves.
+
+Both Minor items fixed: `_resolution_note(m, label)` is now given the name just
+read from the database, so a camera renamed within the TTL is not named by its
+stale index label beside fresh facts; and `resolve()` logs
+`log.warning("entity resolution unavailable, answering unscoped: %r", exc)`
+instead of swallowing the fault silently.
+
+## Covering assertions (all database-free)
+
+`retrieval._self_check()`, on the synthetic corpus:
+
+```
+resolve("is GJ-JUN-004 down", ignore=intent)               -> GJ-JUN-004
+resolve("camera health for junagadh bypass", ignore=intent)-> GJ-JUN-004
+resolve("coverage in rajkot", ignore=intent)               -> GJ-RAJ-002
+resolve("how many detections on junagad", ignore=intent)   -> GJ-JUN-004 via trigram
+resolve(x, ignore=intent) == [] for "the weather tomorrow", "banana",
+    "xyzzy", "please", "the camera", "a zone", "show me",
+    "how many detections", "is it down", "status"
+resolve("north ring road", ignore={"north"})               -> still resolves
+    (an ignored word the corpus knows stays matchable)
+```
+
+`assistant._self_check()`, using `retrieval.build_index(retrieval._SYNTHETIC)`
+and the real `INTENT_VOCAB`:
+
+```
+{"down","health","coverage","faulty","status"} <= INTENT_VOCAB
+"GJ-JUN-004" / "is GJ-JUN-004 down" / "camera health GJ-JUN-004"
+    / "what is the status of GJ-JUN-004"        -> all GJ-JUN-004
+"is the junagadh bypass camera down"            -> GJ-JUN-004
+"camera health for rajkot ring road"            -> GJ-RAJ-002
+"coverage in surat"                             -> GJ-SUR-009
+[] for "the weather tomorrow", "banana", "xyzzy", "please", "the camera",
+   "a zone", "show me", "which cameras are down?", "how many detections",
+   "is the pipeline running"
+```
+
+## Commands run
+
+```
+.venv/Scripts/python.exe -m netra.api.retrieval   -> retrieval self-check passed
+.venv/Scripts/python.exe -m netra.api.assistant   -> assistant self-check passed
+.venv/Scripts/python.exe -c "from netra.api.app import app; print('app ok')"  -> app ok
+git status --porcelain data/                      -> (empty)
+```
+
+The four reported failures, live, after `init_db()`:
+
+```
+is cam11 down               -> I took that to mean camera cam11 (11 dolatpara-junagadh) - closest
+                               name match, inferred from your wording and not confirmed. ...
+is the dolatpara camera down-> cam11, same note
+camera health for majewadi  -> cam08 (08 majewadi-gate-junagadh), same note
+coverage in bilimora        -> resolves cam27/cam28/cam29 at an identical 3.78, so SCOPE_MARGIN
+                               declares it ambiguous and the estate-wide coverage answer runs.
+                               Working as designed: three Bilimora cameras must not be reduced
+                               to whichever one sorted first.
+cam11                       -> now answered (1 match) instead of declined
+```
+
+Every pre-existing intent re-exercised live against the database and unchanged:
+camera health, alerts, watchlist, detections, pipeline status, cloned plates
+(both phrasings), plate trace (both phrasings), unusual/baseline, coverage,
+map, help, empty question, and the weather question still declining.
+
+`ask("anything unusual?")` now answers correctly — the
+`traffic_stats.cumulative_total` error reported previously was stale local
+data, and `init_db()` resolves it. That concern is withdrawn.

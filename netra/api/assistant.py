@@ -291,17 +291,22 @@ def _unusual(_q: str) -> dict:
 # Everything below still reads its facts from SQL. Resolution only chooses
 # which id the SQL runs against; it never contributes a number.
 
-def _resolution_note(m: retrieval.EntityMatch) -> str:
+def _resolution_note(m: retrieval.EntityMatch, label: str | None = None) -> str:
     """The sentence that keeps a scoped answer honest.
 
     A narrowed answer is only trustworthy if the operator can see what it was
     narrowed to. It is never phrased as a certainty: the match is a guess about
     intent, and the wording has to invite correction.
+
+    `label` is the name just read from the database. The index is TTL-cached,
+    so its label can be up to a minute stale, and naming an entity by an old
+    name beside freshly read facts is exactly the kind of quiet inconsistency
+    that costs an operator their trust in the whole answer.
     """
     how = ("closest spelling in the registry" if m.via == "trigram"
            else "closest name match")
-    return (f"I took that to mean {m.kind} {m.id} ({m.label}) - {how}, "
-            f"inferred from your wording and not confirmed. Name the id "
+    return (f"I took that to mean {m.kind} {m.id} ({label or m.label}) - "
+            f"{how}, inferred from your wording and not confirmed. Name the id "
             f"directly if you meant a different one.")
 
 
@@ -408,7 +413,7 @@ def _search(q: str) -> dict:
     """
     query = re.sub(r"^\s*(search|look\s*(up|for)|lookup)\b(\s+for)?[:\s]*",
                    "", q or "", flags=re.I).strip() or (q or "")
-    matches = retrieval.resolve(query, limit=5)
+    matches = retrieval.resolve(query, limit=5, ignore=INTENT_VOCAB)
     if not matches:
         return _answer(
             f"Nothing in the camera registry, the zone rules or the watchlist "
@@ -468,8 +473,10 @@ def _scoped(question: str, handler):
     """
     if handler not in _SCOPABLE:
         return None
-    matches = (retrieval.resolve(question, kind="camera", limit=2) or
-               retrieval.resolve(question, kind="zone", limit=2))
+    matches = (retrieval.resolve(question, kind="camera", limit=2,
+                                 ignore=INTENT_VOCAB) or
+               retrieval.resolve(question, kind="zone", limit=2,
+                                 ignore=INTENT_VOCAB))
     if not matches:
         return None
     if len(matches) > 1 and matches[1].score >= SCOPE_MARGIN * matches[0].score:
@@ -479,7 +486,8 @@ def _scoped(question: str, handler):
     if got is None:
         return None
     text, data = got
-    return _answer(f"{_resolution_note(m)} {text}",
+    fresh = data.get("name") or data.get("plate")
+    return _answer(f"{_resolution_note(m, fresh)} {text}",
                    {"resolved": m.as_dict(), "facts": data},
                    [_entity_action(m)])
 
@@ -528,6 +536,17 @@ INTENTS = [
     (("help", "what can you", "commands", "hello", "hi"), _help),
 ]
 
+#: Every word that appears in an intent's keywords. These are the words that
+#: told the router *what* is being asked; they say nothing about *of what*, and
+#: an entity resolver that counts them as unexplained information will sink the
+#: mention standing next to them - "is cam11 down" would resolve nothing while
+#: "cam11" resolves cleanly. Derived from INTENTS rather than written out, so a
+#: keyword added to an intent cannot be forgotten here. The resolver drops one
+#: only when the corpus has never seen it, so a real camera name is safe.
+INTENT_VOCAB = frozenset(
+    w for keywords, _ in INTENTS for k in keywords
+    for w in retrieval.tokenise(k))
+
 # LLM_HINT: to support free-form phrasing, classify the question to one of the
 # intent names above with a model and dispatch here. The handlers must remain
 # the only source of facts - the model chooses the query, never the answer.
@@ -568,6 +587,13 @@ def ask(question: str) -> dict:
         if scoped is not None:
             return scoped
         return handler(question)
+
+    # No intent keyword at all, but an operator who types a bare "cam11" or
+    # "majewadi" has named something precisely. Resolution is tried last, so
+    # it can never divert a question an intent already claimed, and it still
+    # declines when nothing resolves.
+    if retrieval.resolve(question, limit=1, ignore=INTENT_VOCAB):
+        return _search(question)
 
     return _answer(
         "I could not match that to anything I can answer from platform data. "
@@ -639,6 +665,34 @@ def _self_check() -> None:
         retrieval.EntityMatch("camera", "cam06", "Timbavadi gate", 3.1))
     assert "cam06" in note and "Timbavadi gate" in note, note
     assert "inferred" in note and "not confirmed" in note, note
+
+    # The words an intent routes on must never be counted against the mention
+    # standing beside them. Checked on a synthetic corpus, so no database.
+    assert {"down", "health", "coverage", "faulty", "status"} <= INTENT_VOCAB
+    idx = retrieval.build_index(retrieval._SYNTHETIC)
+
+    def _res(q):
+        return idx.resolve(q, ignore=INTENT_VOCAB)
+
+    # A bare id, and an id buried in intent words, are the least ambiguous
+    # things an operator can type and must be the most reliable path.
+    for q in ("GJ-JUN-004", "is GJ-JUN-004 down", "camera health GJ-JUN-004",
+              "what is the status of GJ-JUN-004"):
+        m = _res(q)
+        assert m and m[0].id == "GJ-JUN-004", (q, m)
+
+    # A place name mixed with intent words resolves just as well.
+    for q, want in (("is the junagadh bypass camera down", "GJ-JUN-004"),
+                    ("camera health for rajkot ring road", "GJ-RAJ-002"),
+                    ("coverage in surat", "GJ-SUR-009")):
+        m = _res(q)
+        assert m and m[0].id == want, (q, m)
+
+    # ...and none of that opens a route to a spurious scope.
+    for q in ("the weather tomorrow", "banana", "xyzzy", "please",
+              "the camera", "a zone", "show me", "which cameras are down?",
+              "how many detections", "is the pipeline running"):
+        assert _res(q) == [], (q, _res(q))
 
     # Unknown questions must decline rather than invent an answer.
     r = ask("what is the weather in Ahmedabad tomorrow")
