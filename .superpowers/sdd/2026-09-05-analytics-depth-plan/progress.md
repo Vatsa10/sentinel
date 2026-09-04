@@ -189,3 +189,23 @@ Task 6: Ruling: I ran the real indexing pass and it anchored the scene clock
   for the whole task, so it enters the fix loop as round 3 rather than being
   parked. Cost if wrong: the live path's measured 71%-frame-loss protection
   must not regress, so the fix must preserve it provably.
+Task 6: fix round 3/5 — the clock policy split works: index went from 0 to
+  10,331 clocked detections, live path provably unchanged, pinned in both
+  directions. Auto-committer captured the work as 659cf78 (content verified
+  correct and complete, self-checks pass).
+Task 6: Ruling: two problems surfaced from the real data. First, a single OCR
+  misread anchors a whole stream (spans show 2025-06-14, 2026-06-24,
+  2028-06-13 where the recordings cluster in June 2026), which mis-times every
+  detection on that camera and feeds route, clone and journey reasoning. That
+  enters fix round 4 as corroborated anchoring. Second, only cam04 and cam13
+  share a clock-readable window and it is ~4 minutes wide, so the sandbox may
+  simply not contain a demonstrable cross-camera journey. I have instructed the
+  implementer to measure and report that honestly rather than engineer around
+  it. Cost if wrong: we ship "no journey found, here is why" instead of a
+  discovered journey - which is consistent with everything else we claim about
+  this grid.
+Task 6: Ruling: rounds 4-5 normally take a fresh implementer on a higher tier.
+  Resuming the same agent instead - it is already on the most capable model
+  and holds the indexing context, and the loop is not stuck (each round has
+  fixed real defects and surfaced new ones from real data). Cost if wrong:
+  loses the fresh-eyes benefit the escalation is meant to buy.

@@ -49,6 +49,12 @@ CLOCK_REANCHOR_AFTER_S = 900.0
 INDEX_CLOCK_ATTEMPT_LIMIT = 30
 INDEX_CLOCK_RETRY_MS = 20000.0
 
+#: How far a second overlay reading may fall from the first one projected
+#: forward by PTS and still corroborate it. Overlays read to the second and
+#: PTS is milliseconds, so a genuine pair agrees to within rounding; anything
+#: wider is a different reading of a different number.
+CLOCK_CORROBORATION_TOLERANCE_S = 2.5
+
 #: How the engine spends its scene-clock budget.
 #:   opportunistic  live: skip the read whenever frames are backing up, because
 #:                  detection is the primary duty. Measured: without this,
@@ -200,6 +206,9 @@ class InferenceEngine:
         #: stream time of the last overlay attempt per camera, used only by the
         #: exhaustive policy to space its attempts across the recording
         self._clock_last_try: dict = {}
+        #: a first overlay reading, held unanchored until a second one
+        #: corroborates it. See _anchor_clock.
+        self._clock_pending: dict = {}
         #: live behaviour is the default and is unchanged; only an offline
         #: indexing pass sets this to CLOCK_EXHAUSTIVE
         self.clock_policy: str = CLOCK_OPPORTUNISTIC
@@ -303,6 +312,7 @@ class InferenceEngine:
         self._clocks.pop(camera_id, None)
         self._clock_attempts.pop(camera_id, None)
         self._clock_last_try.pop(camera_id, None)
+        self._clock_pending.pop(camera_id, None)
         self.trackers.reset(camera_id)
         self._plate_voters.pop(camera_id, None)
         self._dark_streak.pop(camera_id, None)
@@ -365,12 +375,45 @@ class InferenceEngine:
             return
 
         if anchor:
-            self._clocks[cam] = anchor
-            # The budget is per anchoring window, not per connection, so a
-            # camera that anchors successfully may re-anchor again when this
-            # reading in turn goes stale.
+            # One reading is not evidence. A single misread digit anchors the
+            # whole stream and mis-times every sighting on it for the rest of
+            # the pass - measured on this grid as spans dated 2025-06-14,
+            # 2026-06-24 and 2028-06-13, each from one bad read that passed
+            # every syntactic check. So a reading is held until a second,
+            # independent reading agrees with it once projected forward by the
+            # PTS between them. A contradicting reading is discarded rather
+            # than averaged: the average of a right answer and a wrong one is
+            # simply a third wrong answer.
+            #
+            # The attempt budget is not spent by a *successful* read, because
+            # its purpose is to stop retrying cameras with no legible overlay,
+            # not to stop a legible one corroborating itself.
             self._clock_attempts[cam] = 0
+            pending = self._clock_pending.get(cam)
+            if pending is None:
+                self._clock_pending[cam] = anchor
+                log.debug("%s overlay read %s; awaiting corroboration",
+                          cam, anchor.scene_time.isoformat())
+                return
+            drift = abs((anchor.scene_time
+                         - pending.at(anchor.pts_ms)).total_seconds())
+            if drift > CLOCK_CORROBORATION_TOLERANCE_S:
+                log.info("%s overlay readings disagree by %.1fs (%s then %s); "
+                         "both discarded", cam, drift,
+                         pending.scene_time.isoformat(),
+                         anchor.scene_time.isoformat())
+                # Keep the newer reading as the one to be corroborated: the
+                # older is now known to be unreliable, the newer merely
+                # unconfirmed.
+                self._clock_pending[cam] = anchor
+                return
+            self._clock_pending.pop(cam, None)
+            self._clocks[cam] = anchor
             self.stats["clocks_anchored"] = len(self._clocks)
+            log.info("%s scene clock corroborated to %s (two readings %.1fs "
+                     "apart agreeing to %.1fs)", cam,
+                     anchor.scene_time.isoformat(),
+                     (anchor.pts_ms - pending.pts_ms) / 1000.0, drift)
         elif self._clock_attempts[cam] >= limit:
             # A failed re-anchor leaves the existing anchor alone: an anchor
             # carrying some drift still times sightings far better than none.
@@ -698,6 +741,56 @@ def _self_check() -> None:
     engine._note_luma("CAM3", black, found=True)
     engine._note_luma("CAM3", black, found=False)
     assert engine._dark_streak["CAM3"] == 1 and "CAM3" not in engine._dark_cameras
+
+    # Scene-clock corroboration. One reading never anchors: a single misread
+    # digit would mis-time every sighting on the camera for the rest of the
+    # pass, which is how this grid produced streams dated 2028. No model and no
+    # GPU: the OCR object and the overlay reader are stubs.
+    from datetime import datetime, timedelta, timezone
+
+    from netra.analytics import scene_clock as _sc
+    from netra.analytics.scene_clock import ClockAnchor
+
+    class _Frame:
+        def __init__(self, cam, pts):
+            self.camera_id, self.image, self.pts_ms = cam, black, pts
+
+    base = datetime(2026, 6, 14, 2, 32, 18, tzinfo=timezone.utc)
+    clock = InferenceEngine(on_detection=lambda d: None)
+    clock._ocr = object()
+    readings: dict = {}
+    real_reader = _sc.read_scene_time
+    _sc.read_scene_time = lambda ocr, img, pts, cam: ClockAnchor(
+        cam, readings[cam].pop(0), pts, 0.8) if readings.get(cam) else None
+    try:
+        # Two readings that agree once projected forward by PTS: anchored.
+        readings["AGREE"] = [base, base + timedelta(seconds=30)]
+        clock._anchor_clock(_Frame("AGREE", 0.0))
+        assert "AGREE" not in clock._clocks, "one reading must not anchor"
+        assert "AGREE" in clock._clock_pending
+        clock._anchor_clock(_Frame("AGREE", 30000.0))
+        assert clock._clocks["AGREE"].scene_time == base + timedelta(seconds=30)
+
+        # Two readings that contradict: neither anchors, and the later one is
+        # held as the next thing to be corroborated rather than trusted.
+        readings["DISAGREE"] = [base, base + timedelta(minutes=5)]
+        clock._anchor_clock(_Frame("DISAGREE", 0.0))
+        clock._anchor_clock(_Frame("DISAGREE", 30000.0))
+        assert "DISAGREE" not in clock._clocks, clock._clocks
+        assert clock._clock_pending["DISAGREE"].scene_time == base + timedelta(minutes=5)
+
+        # A camera that yields exactly one reading stays unanchored: no scene
+        # time is better than a wrong one.
+        readings["ONCE"] = [base]
+        clock._anchor_clock(_Frame("ONCE", 0.0))
+        clock._anchor_clock(_Frame("ONCE", 30000.0))
+        assert "ONCE" not in clock._clocks, clock._clocks
+
+        # A loop cut voids the pending reading along with everything else.
+        clock.reset_camera_state("AGREE")
+        assert "AGREE" not in clock._clock_pending and "AGREE" not in clock._clocks
+    finally:
+        _sc.read_scene_time = real_reader
 
     print("inference self-check passed")
 

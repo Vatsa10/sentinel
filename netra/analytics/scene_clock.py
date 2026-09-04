@@ -53,8 +53,16 @@ _DIGIT_LAYOUTS = {
 # A parsed date must be a real recording date, not merely a valid datetime.
 # Without this, an OCR misread like "0921-05-16" is accepted and silently
 # corrupts every downstream correlation - observed on cam04 at confidence 0.02.
-MIN_PLAUSIBLE_YEAR = 2015
-MAX_PLAUSIBLE_YEAR = 2035
+#
+# The window is deliberately narrow. Every recording in this sandbox is dated
+# June 2026, and a wide window catches only the absurd misreads while passing
+# the dangerous ones: a single wrong digit turning 2026 into 2025 or 2028 sailed
+# through a 2015-2035 window and mis-dated whole streams. One year either side
+# tolerates footage re-recorded a season later while rejecting a year that
+# differs by a digit. It cannot catch a misread day or hour - only corroboration
+# between two readings can, and InferenceEngine._anchor_clock requires it.
+MIN_PLAUSIBLE_YEAR = 2025
+MAX_PLAUSIBLE_YEAR = 2027
 
 #: OCR readings below this confidence are discarded. No scene time is better
 #: than a wrong one: an incorrect anchor mis-times every sighting on a camera.
@@ -238,6 +246,11 @@ def _self_check() -> None:
     assert not is_plausible(parse_overlay("16-05-0921 20:11:34"))
     assert is_plausible(parse_overlay("13-06-2026 23:22:47"))
     assert not is_plausible(None)
+    # Single-digit year misreads observed on the live grid. These passed the
+    # old 2015-2035 window and mis-dated entire streams.
+    assert not is_plausible(parse_overlay("13-06-2028 21:23:31"))
+    assert not is_plausible(parse_overlay("14-06-2015 02:29:47"))
+    assert is_plausible(parse_overlay("14-06-2025 02:29:47")) is True
 
     # PTS carries the clock forward from the anchor.
     anchor = ClockAnchor("cam04", datetime(2026, 6, 13, 23, 22, 47,
