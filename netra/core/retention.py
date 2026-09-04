@@ -113,12 +113,18 @@ def prune_evidence(max_bytes: int | None = None, max_age_days: int | None = None
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).timestamp()
     remaining: list[tuple[float, int, Path]] = []
+    # A protected file can be reached by both rules in one call - expired
+    # *and* over budget - and it must be reported once, not twice. This figure
+    # is audited into storage.prune, so a doubled count is a doubled claim.
+    counted_protected: set[str] = set()
 
     def _remove(item, reason: str) -> None:
-        mtime, size, path = item
+        _mtime, size, path = item
         if path.name in keep:
-            report["retained_protected"] += 1
-            report["retained_protected_bytes"] += size
+            if path.name not in counted_protected:
+                counted_protected.add(path.name)
+                report["retained_protected"] += 1
+                report["retained_protected_bytes"] += size
             remaining.append(item)
             return
         if not dry_run:
@@ -370,6 +376,17 @@ def _check_body(evidence, sf) -> None:
         assert "recent0.jpg" in left, left       # newest survived
         assert r["deleted_over_budget"] == 3, r
         assert r["retained_protected"] == 2, r
+
+        # Both rules in one call. A protected file is expired *and* over
+        # budget, so it passes through the removal path twice; it must still
+        # be reported once. Nothing was covering this, which is how a doubled
+        # count reached an audit record.
+        r = prune_evidence(max_bytes=0, max_age_days=0, evidence_dir=evidence,
+                           session_factory=sf, dry_run=True)
+        assert r["retained_protected"] == 2, r
+        assert r["retained_protected_bytes"] == 2000, r
+        assert r["deleted_expired"] == r["scanned"] - 2, r
+        assert r["deleted_over_budget"] == 0, r   # age already took them all
 
         # A dry run must report the same intent without touching the disk.
         before = sorted(p.name for p in evidence.iterdir())
