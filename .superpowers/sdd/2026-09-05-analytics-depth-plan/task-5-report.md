@@ -132,3 +132,91 @@ and an unknown camera is declined rather than guessed at.
 - Baselines are relearned on each request from up to 5000 rows rather than
   cached. That is cheap at the current data volume and it is bounded, but it is
   a repeated scan and would want a cache before the history grows large.
+
+---
+
+# Fix round 1
+
+## Critical — the `quiet` branch bypassed the z-score
+
+`assess` short-circuited to `quiet` whenever `observed == 0 and mean >= 1.0`,
+ahead of any band comparison. One vehicle per bucket is not a busy road, and on
+a genuinely quiet camera — history `(0, 2, 1, 0, 3, 1, 0, 2)`, mean 1.12, sd
+1.13 — an observed zero has z = -1.0, which the module's own bands call normal.
+It asserted a possible blockage anyway, and with 60-second buckets would have
+done so on most quiet cameras every few minutes. That was the one place in the
+module that told a control room something was abnormal on evidence saying the
+reading was ordinary.
+
+`quiet` is now gated on `observed == 0 and z <= Z_LOW`, making it a more
+strongly worded `low` rather than an override of the bands, and its sentence
+now carries the z-score like every other verdict. A reading inside the normal
+band can no longer be reported as abnormal by any branch.
+
+Measured after the fix, on exactly the reviewer's history:
+
+```
+mean 1.12 sd 1.13 -> normal z=-1.0
+0 vehicles is within the usual range: the norm for x at hour 02:00 UTC is 1.1
+(sd 1.1, 8 samples).
+```
+
+Covering assertions (`_self_check`, using that history verbatim):
+
+```python
+quiet_road = learn([row("cam05", 2, n)
+                    for n in (0, 2, 1, 0, 3, 1, 0, 2)])[("cam05", 2)]
+calm = assess(quiet_road, 0)
+assert calm.status == "normal", calm
+assert not calm.anomalous, calm
+assert abs(calm.z_score) <= abs(Z_LOW), calm
+assert assess(quiet_road, 10).status in ("elevated", "high")
+```
+
+The busy-road case is unaffected and still asserted: zero against cam01's
+hour-9 norm of 41.8 (sd 2.9) is z = -14 and still reads `quiet`.
+
+## Important — legacy cumulative rows are now excluded in code
+
+The five pre-fix rows in `data/netra.db` carry cumulative totals, nothing prunes
+`traffic_stats`, and `learn()` has no time window, so they would have survived
+the demo. On cam15 at hour 18 one such row moved the mean from 3.40 to 14.0 and
+the standard deviation from 1.14 to 25.98, and a ten-fold spike then read
+`normal`.
+
+New `_is_legacy_cumulative(row, total)`, applied inside `learn()`, skips a row
+where `cumulative_total == 0 and total > 0`. The migration that added
+`cumulative_total` defaults it to 0, while any row written since carries the
+real cumulative, which is always at least as large as that bucket's own delta —
+so the two are cleanly separable without touching the database. A genuine empty
+bucket has `total = 0` and is deliberately kept, since a normally quiet road is
+exactly what the baseline needs to learn. A source carrying no
+`cumulative_total` field at all (a synthetic dict) is trusted as given.
+
+Chosen over a one-time cleanup in the migration because it destroys no
+observation and needs no write to the operator's evidence database.
+
+Covering assertions:
+
+```python
+with_legacy = learn(modern + [legacy])[("cam06", 18)]
+assert with_legacy.samples == 5, with_legacy      # the legacy row is excluded
+assert with_legacy.mean < 4, with_legacy
+assert assess(with_legacy, 30).status == "high"   # the hidden spike is seen
+
+with_empty = learn(modern + [genuine_empty])[("cam06", 18)]
+assert with_empty.samples == 6, with_empty        # a real empty bucket is kept
+assert with_empty.mean < with_legacy.mean, with_empty
+```
+
+## Commands run
+
+```
+.venv/Scripts/python.exe -m netra.analytics.baseline  -> baseline self-check passed
+.venv/Scripts/python.exe -m netra.api.assistant       -> assistant self-check passed
+.venv/Scripts/python.exe -c "from netra.api.app import app; print('app ok')" -> app ok
+git status --porcelain data/                          -> (empty)
+```
+
+`data/netra.db` was not modified. Its five legacy rows remain on disk and are
+excluded at learn time.
