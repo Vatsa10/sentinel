@@ -598,3 +598,15 @@ def start_own_feed(camera_id: str, loop: bool = True):
     PIPELINE.start([camera_id], {camera_id: spec})
     _audit("pipeline.start_own_feed", target=camera_id)
     return PIPELINE.status()
+
+
+# ------------------------------------------------------------- assistant --
+@app.post("/api/assistant")
+async def assistant(request: Request):
+    """Answer an operational question from live platform state."""
+    from netra.api.assistant import ask
+    body = await request.json()
+    question = (body.get("question") or "").strip()
+    result = ask(question)
+    _audit("assistant.ask", target=question[:120])
+    return result

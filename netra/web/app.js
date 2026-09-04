@@ -388,3 +388,110 @@ function connectWs() {
     if ($("#v-overview").classList.contains("active")) loadRecent();
   }, 4000);
 })();
+
+/* ----------------------------------------------------------- assistant --- */
+const ASST_SUGGESTIONS = [
+  "Which cameras are down?",
+  "How many detections so far?",
+  "Show me the alerts",
+  "What is on the watchlist?",
+  "Where has GJ01AB1234 been seen?",
+  "Coverage by location",
+];
+
+function asstBubble(role, text, actions) {
+  const cls = role === "user" ? "border-color:var(--accent);background:rgba(255,107,0,.06)" : "";
+  const btns = (actions || []).map(a =>
+    `<button style="margin:6px 6px 0 0" onclick="asstAction(${esc(JSON.stringify(JSON.stringify(a)))})">${esc(a.label)}</button>`
+  ).join("");
+  return `<div class="finding" style="${cls}">
+    <b style="color:${role === "user" ? "var(--accent)" : "#7fb0ff"}">${role === "user" ? "You" : "NETRA"}</b><br>
+    ${esc(text)}${btns ? `<div>${btns}</div>` : ""}</div>`;
+}
+
+window.asstAction = (raw) => {
+  const a = JSON.parse(raw);
+  if (a.query && !a.view) { $("#asstQ").value = a.query; asstAsk(); return; }
+  if (a.view) {
+    const tab = $$("nav a").find(x => x.dataset.view === a.view);
+    if (tab) tab.click();
+    if (a.view === "route" && a.query) {
+      $("#rPlate").value = a.query;
+      setTimeout(() => $("#rGo").click(), 300);
+    }
+  }
+};
+
+async function asstAsk() {
+  const q = $("#asstQ").value.trim();
+  if (!q) return;
+  const log = $("#asstLog");
+  log.insertAdjacentHTML("beforeend", asstBubble("user", q));
+  $("#asstQ").value = "";
+  log.scrollTop = log.scrollHeight;
+
+  try {
+    const r = await api("/api/assistant", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: q }),
+    });
+    log.insertAdjacentHTML("beforeend", asstBubble("netra", r.answer, r.actions));
+  } catch (e) {
+    log.insertAdjacentHTML("beforeend", asstBubble("netra", "Request failed: " + e));
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
+$("#asstGo").onclick = asstAsk;
+$("#asstQ").addEventListener("keydown", e => { if (e.key === "Enter") asstAsk(); });
+$("#asstChips").innerHTML = ASST_SUGGESTIONS.map(s =>
+  `<button onclick="document.getElementById('asstQ').value=${esc(JSON.stringify(s))};asstAsk()">${esc(s)}</button>`
+).join("");
+
+/* ------------------------------------------- trace a vehicle by looks ---- */
+$("#rAppearance").onclick = async () => {
+  const id = parseInt($("#rDet").value, 10);
+  if (!id) { toast("Enter a detection id (from the Detections screen)."); return; }
+  initRouteMap();
+
+  const r = await api(`/api/vehicles/${id}/track`);
+  if (r.detail) { toast(esc(r.detail)); return; }
+
+  if (ROUTE_LAYER) { ROUTE_MAP.removeLayer(ROUTE_LAYER); ROUTE_LAYER = null; }
+  const pts = r.hops.filter(h => h.lat).map(h => [h.lat, h.lon]);
+  if (pts.length) {
+    ROUTE_LAYER = L.layerGroup().addTo(ROUTE_MAP);
+    L.polyline(pts, { color: "#a855f7", weight: 3, dashArray: "6 5", opacity: .9 }).addTo(ROUTE_LAYER);
+    r.hops.forEach((h, i) => {
+      if (!h.lat) return;
+      L.marker([h.lat, h.lon]).addTo(ROUTE_LAYER)
+        .bindPopup(`<b>${i + 1}. ${esc(h.camera_name || h.camera_id)}</b><br>${esc(h.at)}
+          ${h.similarity ? `<br>similarity ${h.similarity}` : ""}`);
+    });
+    ROUTE_MAP.fitBounds(L.latLngBounds(pts).pad(.25));
+  }
+
+  $("#routeList").innerHTML = `
+    <div class="finding" style="border-color:#a855f7;background:rgba(168,85,247,.07)">
+      <b>Appearance-based trace.</b> ${esc(r.note)}</div>
+    <div style="margin-bottom:10px;font-size:12.5px" class="dim">
+      <b style="color:#e6edf5">${r.hop_count} sightings</b> · ${r.total_km} km ·
+      ${esc(r.method)}</div>` +
+    r.hops.map((h, i) => `<div class="hop">
+      <div class="num" style="background:#a855f7;color:#fff">${i + 1}</div>
+      <div style="flex:1">
+        <div><b>${esc(h.camera_name || h.camera_id)}</b>
+          <span class="faint mono">${esc(h.camera_id)}</span></div>
+        <div class="mono dim" style="font-size:11.5px">${esc(h.at)}</div>
+        <div style="font-size:11.5px;margin-top:3px">
+          ${esc(h.colour || "")} ${esc(h.vehicle_class || "")}
+          ${h.similarity ? `· <b style="color:#c99bff">similarity ${h.similarity}</b>` : "· query vehicle"}
+          ${h.leg_km != null ? `· ${h.leg_km} km from previous` : ""}</div>
+        ${h.evidence || h.evidence_path ? `<img src="${esc(h.evidence || h.evidence_path)}">` : ""}
+      </div></div>`).join("");
+
+  $("#routeRejected").innerHTML = r.rejected.length
+    ? r.rejected.map(x => `<div class="finding" style="border-color:var(--bad);background:rgba(239,68,68,.06)">
+        <b class="mono">${esc(x.camera_id)}</b> — ${esc(x.plausibility || "excluded")}</div>`).join("")
+    : `<div class="faint" style="font-size:12px">None excluded.</div>`;
+};

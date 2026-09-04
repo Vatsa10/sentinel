@@ -131,6 +131,7 @@ input.mono{font-family:var(--mono);letter-spacing:1px;text-transform:uppercase}
   <a data-view="watchlist">Watchlist</a>
   <a data-view="alerts">Alerts</a>
   <a data-view="registry">Registry &amp; Gaps</a>
+  <a data-view="assistant">Assistant</a>
 </nav>
 
 <main>
@@ -202,8 +203,12 @@ input.mono{font-family:var(--mono);letter-spacing:1px;text-transform:uppercase}
   <section class="view" id="v-route">
     <div class="row">
       <input id="rPlate" class="mono" placeholder="GJ01AB1234" style="width:200px">
-      <button id="rGo" class="primary">Trace vehicle</button>
-      <span class="faint" style="font-size:12px">Returns every sighting in order, with distance and elapsed time per leg.</span>
+      <button id="rGo" class="primary">Trace by plate</button>
+      <span style="width:14px"></span>
+      <input id="rDet" placeholder="detection id" style="width:120px">
+      <button id="rAppearance">Trace by appearance</button>
+      <span class="faint" style="font-size:12px">Appearance tracing follows a vehicle across cameras when no plate is
+        readable &mdash; the normal case on this grid. Results are ranked candidates for confirmation, not identification.</span>
     </div>
     <div class="two">
       <div class="panel"><h3>Route on map</h3><div id="routeMap" style="height:430px"></div></div>
@@ -245,6 +250,25 @@ input.mono{font-family:var(--mono);letter-spacing:1px;text-transform:uppercase}
     <div class="row"><button id="aRefresh">Refresh</button>
       <span class="faint" style="font-size:12px">Every alert records which signals fired and at what confidence, so the decision can be reviewed.</span></div>
     <div id="alertList"><div class="empty">No alerts raised.</div></div>
+  </section>
+
+  <!-- ASSISTANT -->
+  <section class="view" id="v-assistant">
+    <div class="panel" style="max-width:900px;margin:0 auto">
+      <h3>Control-room assistant</h3>
+      <div class="body">
+        <div id="asstLog" style="max-height:calc(100vh - 330px);overflow:auto;margin-bottom:12px">
+          <div class="finding">Ask about camera health, detections, alerts, the watchlist,
+            pipeline status, coverage, or a specific registration number.
+            Every answer is produced from live platform data.</div>
+        </div>
+        <div class="row" style="margin-bottom:8px">
+          <input id="asstQ" placeholder="e.g. which cameras are down?" style="flex:1;min-width:260px">
+          <button id="asstGo" class="primary">Ask</button>
+        </div>
+        <div class="row" id="asstChips" style="margin:0"></div>
+      </div>
+    </div>
   </section>
 
   <!-- REGISTRY -->
