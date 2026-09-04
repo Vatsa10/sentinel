@@ -6,6 +6,7 @@ import csv
 import io
 import json
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
@@ -166,47 +167,80 @@ SNAPSHOT_TTL_S = 30.0
 SNAPSHOT_TIMEOUT_S = 25.0
 _snapshots: dict[str, tuple[float, bytes]] = {}
 
+#: One lock per camera, so concurrent callers for the same camera wait on the
+#: grab already running instead of each starting their own. Without it the
+#: cache only protects the warm path: five clicks on "Load still frame" before
+#: the first returns would be five ffmpeg processes holding five threadpool
+#: threads for seventeen seconds apiece, which is how a snapshot request ends
+#: up starving /api/pipeline/status. The registry of locks needs its own lock
+#: because it is filled lazily from several request threads.
+_snapshot_locks: dict[str, threading.Lock] = {}
+_snapshot_locks_guard = threading.Lock()
 
-@app.get("/api/cameras/{camera_id}/snapshot")
-def camera_snapshot(camera_id: str, refresh: bool = False):
-    """One still frame from a camera, for placing zone rules on.
 
-    Points are stored normalised, so the still only has to show the operator
-    the scene; it does not have to match the resolution the pipeline decodes.
-    """
+def _snapshot_lock(camera_id: str) -> threading.Lock:
+    with _snapshot_locks_guard:
+        return _snapshot_locks.setdefault(camera_id, threading.Lock())
+
+
+def _cached_snapshot(camera_id: str) -> bytes | None:
+    import time as _time
+    hit = _snapshots.get(camera_id)
+    if hit and (_time.time() - hit[0]) < SNAPSHOT_TTL_S:
+        return hit[1]
+    return None
+
+
+def _grab_snapshot(camera_id: str) -> bytes:
+    """One JPEG off the camera, bounded in time. Caller holds the camera lock."""
     import os
     import subprocess
     import tempfile
     import time as _time
 
+    fd, path = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    try:
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-rtsp_transport", "tcp",
+             "-i", config.rtsp_url(camera_id), "-frames:v", "1",
+             "-q:v", "4", path, "-y"],
+            capture_output=True, timeout=SNAPSHOT_TIMEOUT_S)
+        data = open(path, "rb").read() if os.path.exists(path) else b""
+    except Exception as exc:                          # timeout, no ffmpeg, ...
+        log.warning("snapshot failed for %s: %s", camera_id, exc)
+        data = b""
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+    if len(data) < 1000:
+        raise HTTPException(
+            503, f"could not grab a frame from {camera_id} within "
+                 f"{SNAPSHOT_TIMEOUT_S:.0f}s")
+    _snapshots[camera_id] = (_time.time(), data)
+    return data
+
+
+@app.get("/api/cameras/{camera_id}/snapshot")
+def camera_snapshot(camera_id: str, refresh: bool = False,
+                    _p=Depends(require("read"))):
+    """One still frame from a camera, for placing zone rules on.
+
+    Points are stored normalised, so the still only has to show the operator
+    the scene; it does not have to match the resolution the pipeline decodes.
+    """
     with SessionLocal() as db:
         if not db.get(Camera, camera_id):
             raise HTTPException(404, "camera not found")
 
-    cached = _snapshots.get(camera_id)
-    if cached and not refresh and (_time.time() - cached[0]) < SNAPSHOT_TTL_S:
-        data = cached[1]
-    else:
-        fd, path = tempfile.mkstemp(suffix=".jpg")
-        os.close(fd)
-        try:
-            subprocess.run(
-                ["ffmpeg", "-v", "error", "-rtsp_transport", "tcp",
-                 "-i", config.rtsp_url(camera_id), "-frames:v", "1",
-                 "-q:v", "4", path, "-y"],
-                capture_output=True, timeout=SNAPSHOT_TIMEOUT_S)
-            data = open(path, "rb").read() if os.path.exists(path) else b""
-        except Exception as exc:                      # timeout, no ffmpeg, ...
-            log.warning("snapshot failed for %s: %s", camera_id, exc)
-            data = b""
-        finally:
-            if os.path.exists(path):
-                os.unlink(path)
-        if len(data) < 1000:
-            raise HTTPException(
-                503, f"could not grab a frame from {camera_id} within "
-                     f"{SNAPSHOT_TIMEOUT_S:.0f}s")
-        _snapshots[camera_id] = (_time.time(), data)
+    data = None if refresh else _cached_snapshot(camera_id)
+    if data is None:
+        with _snapshot_lock(camera_id):
+            # Re-checked inside the lock: whoever we queued behind has just
+            # filled the cache, and using their frame is the whole point of
+            # having queued.
+            data = _cached_snapshot(camera_id) or _grab_snapshot(camera_id)
 
     return Response(content=data, media_type="image/jpeg",
                     headers={"Cache-Control": "no-store"})

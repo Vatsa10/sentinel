@@ -254,3 +254,8 @@ Task 8: fix round 1 dispatched — Important 1 (no in-flight de-duplication on
 Task 8: minor (deferred): snapshot cache never age-evicts (~10 MB steady state
   at 30 cameras); UI cannot force refresh=true within the TTL; Traffic tab is
   refresh-on-demand, not auto-polled.
+Auto-committer note: 77c2519 "feat: add vision-language model..." is a FALSE
+  message. It contains no VLM code — only the ledger, the Task 8 review
+  package, the Task 9 brief, and 17 lines of Task 6's in-flight round-4
+  inference.py. The message was invented from the brief's filename. cd29d31
+  is ledger-only. Neither is a task commit. Self-checks re-run after the sweep.

@@ -631,7 +631,7 @@ async function loadZones() {
         ${(z.classes || []).length ? esc((z.classes || []).join(", ")) : "any class"}
         ${z.rule === "loitering" ? `· dwell ${esc(z.dwell_s)}s` : ""}</div>
     </div>
-    <button onclick="delZone(${z.id})">Delete</button></div>`).join("")
+    <button onclick="delZone(${esc(z.id)})">Delete</button></div>`).join("")
     : `<div class="empty">No rules configured.</div>`;
 
   const events = await api("/api/zones/events?limit=50");

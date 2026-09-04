@@ -141,3 +141,79 @@ Trusted the endpoint in each case:
 - The zone editor places points only. There is no vertex drag, no undo of a
   single point (only Clear), and no rendering of existing rules over the
   still — deliberately, per the brief.
+
+---
+
+## Fix round 1
+
+Three findings from review, all in the snapshot endpoint or the zone list.
+
+### Important 1 — in-flight de-duplication on the cold grab
+
+The cache only protected the warm path. Concurrent callers for one camera each
+started their own ffmpeg, so five impatient clicks on "Load still frame" were
+five RTSP connections holding five threadpool threads for the length of a cold
+grab — the starvation the cache exists to prevent, moved onto the cold path.
+
+Added a per-camera `threading.Lock` (`_snapshot_locks`, built lazily under its
+own guard lock) and split the endpoint into `_cached_snapshot()` and
+`_grab_snapshot()`. A caller that misses the cache takes the camera's lock and
+re-checks the cache inside it, so everyone queued behind the running grab is
+served that grab's frame rather than starting another.
+
+**Verified by counting processes, not by inference.** Four concurrent requests
+for a cold cam04 from four `threading.Thread`s over `urllib`, with a monitor
+thread polling `tasklist /FI "IMAGENAME eq ffmpeg.exe"` every 0.4 s throughout
+and collecting distinct PIDs:
+
+```
+request (0, 200, 374104, 8.51)
+request (1, 200, 374104, 8.51)
+request (2, 200, 374104, 8.51)
+request (3, 200, 374104, 8.51)
+distinct ffmpeg PIDs observed during the burst: 1 ['27948']
+```
+
+**Exactly one ffmpeg process ran.** All four requests returned 200 with byte-
+identical bodies and completed in the same instant — three of them waited on
+the one grab.
+
+### Important 2 — the snapshot GET was the only expensive unauthenticated endpoint
+
+`GET /api/cameras/{id}/snapshot` now carries `_p=Depends(require("read"))`, the
+same permission `/api/analytics/baselines`, `/api/analytics/anomalies` and
+`/api/storage` use. In open mode (no API keys configured) this is a no-op, so
+the demonstration is unaffected.
+
+### Minor — `esc()` on the zone delete id
+
+`netra/web/app.js`: `delZone(${z.id})` is now `delZone(${esc(z.id)})`, for
+uniformity with the rest of the file.
+
+### Commands run
+
+```
+node --check netra/web/app.js                                  -> clean
+.venv/Scripts/python.exe -c "from netra.api.app import app; ..."-> app ok
+```
+
+Server restarted, then:
+
+| Check | Result |
+| --- | --- |
+| `GET /api/cameras/cam04/snapshot` (cold) | 200, `image/jpeg`, 393 179 bytes, 12.1 s |
+| `GET /api/cameras/cam04/snapshot` (cached) | 200, 38 ms |
+| `GET /api/cameras/nope/snapshot` | 404 |
+| 4× concurrent cold cam04 | 4× 200, identical bodies, **1** ffmpeg process |
+
+Server left running on :8080.
+
+### Concern raised by the fix
+
+`require("read")` is correct for the endpoint, but the zone editor loads the
+still through an `<img src=…>`, which cannot send an `X-API-Key` header. Once
+access control is enabled the snapshot image will 401 in the browser while
+every other console call still works. Closing that needs either a
+short-lived signed URL or cookie-based session auth for the console — a
+platform-wide decision, not a snapshot one, so it is flagged rather than
+patched here.
