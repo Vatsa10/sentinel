@@ -17,7 +17,8 @@ from netra import config
 from netra.analytics.inference import InferenceEngine
 from netra.analytics.matching import score_match
 from netra.core.db import SessionLocal
-from netra.core.models import Alert, Camera, Detection, WatchlistEntry
+from netra.core.models import (Alert, Camera, Detection, TrafficStat,
+                               WatchlistEntry, ZoneEventRow, ZoneRule)
 from netra.core.notify import NOTIFIER
 from netra.ingest.stream import IngestSupervisor
 
@@ -50,7 +51,16 @@ class Pipeline:
         self._write_queue: queue.Queue = queue.Queue(maxsize=4000)
         self._stop_writer = threading.Event()
         self._writer: threading.Thread | None = None
-        self.stats = {"written": 0, "write_dropped": 0}
+        self.stats = {"written": 0, "write_dropped": 0, "zone_events": 0,
+                      "traffic_buckets": 0}
+
+        # Zone rules are evaluated inside the inference engine, where the
+        # tracks live; the pipeline supplies the engine and receives events.
+        from netra.analytics.zones import ZoneEngine
+        self.zone_engine = ZoneEngine()
+        self.engine.zone_engine = self.zone_engine
+        self.engine.on_zone_event = self._handle_zone_event
+        self._last_traffic_flush = 0.0
 
     # -- lifecycle -----------------------------------------------------------
     def start(self, camera_ids: list[str] | None = None,
@@ -66,6 +76,7 @@ class Pipeline:
             ids = camera_ids or [c.id for c in cams
                                  if c.capability != "degraded"]
 
+        self._load_zone_rules()
         log.info("starting pipeline over %d cameras", len(ids))
         self.engine.load()
         self.engine.start()
@@ -87,6 +98,27 @@ class Pipeline:
             self._writer.join(timeout=15)
         self.running = False
 
+    def _load_zone_rules(self) -> None:
+        """Load zone rules from the database into the evaluation engine."""
+        from netra.analytics.zones import Zone
+        with SessionLocal() as db:
+            rules = db.query(ZoneRule).filter(ZoneRule.active.is_(True)).all()
+            by_camera: dict[str, list] = {}
+            for r in rules:
+                by_camera.setdefault(r.camera_id, []).append(Zone(
+                    zone_id=f"{r.camera_id}:{r.id}", camera_id=r.camera_id,
+                    name=r.name, rule=r.rule, points=r.points,
+                    classes=r.classes or [], severity=r.severity,
+                    dwell_s=r.dwell_s, active=r.active))
+        for camera_id, zones in by_camera.items():
+            self.zone_engine.set_zones(camera_id, zones)
+        if by_camera:
+            log.info("loaded zone rules for %d cameras", len(by_camera))
+
+    def reload_zone_rules(self) -> None:
+        """Called when rules change so a running pipeline picks them up."""
+        self._load_zone_rules()
+
     # -- callbacks -----------------------------------------------------------
     def _handle_vehicles_present(self, camera_id: str) -> None:
         """Escalate a camera to tier-2 sampling while traffic is present."""
@@ -96,6 +128,75 @@ class Pipeline:
         """The recording looped. Any cross-frame state for this camera is void."""
         log.info("%s discontinuity - resetting per-camera state", camera_id)
         self.engine.reset_camera_state(camera_id)
+
+    def _handle_zone_event(self, event, frame) -> None:
+        """Persist a zone trigger and push it to consoles as an alert.
+
+        Zone rules are how a camera earns its keep when plate recognition is
+        impossible, which on this grid is most of them.
+        """
+        evidence_path = None
+        try:
+            fname = (f"zone_{event.camera_id}_{int(frame.wall_time * 1000)}"
+                     f"_{event.track_id}.jpg")
+            cv2.imwrite(str(config.EVIDENCE / fname), frame.image)
+            evidence_path = f"/evidence/{fname}"
+        except Exception:
+            log.exception("could not write zone evidence frame")
+
+        rule_id = int(event.zone.zone_id.split(":")[-1])
+        with SessionLocal() as db:
+            row = ZoneEventRow(
+                zone_rule_id=rule_id, camera_id=event.camera_id,
+                rule=event.rule, track_id=event.track_id,
+                object_class=event.vehicle_class, direction=event.direction,
+                detail=event.detail, severity=event.zone.severity,
+                evidence_path=evidence_path)
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            payload = {
+                "kind": "zone",
+                "id": row.id,
+                "camera_id": event.camera_id,
+                "zone": event.zone.name,
+                "rule": event.rule,
+                "severity": event.zone.severity,
+                "object_class": event.vehicle_class,
+                "direction": event.direction,
+                "detail": event.detail,
+                "evidence": evidence_path,
+                "at": row.at.isoformat(),
+            }
+
+        self.stats["zone_events"] += 1
+        log.warning("ZONE %s on %s: %s", event.rule, event.camera_id, event.detail)
+        self._broadcast(payload)
+        NOTIFIER.submit({**payload, "plate_watchlist": event.zone.name,
+                         "plate_observed": event.detail,
+                         "match_type": event.rule, "score": 1.0,
+                         "reasons": {"zone": {"score": 1.0,
+                                              "detail": event.detail}}})
+
+    def flush_traffic_stats(self, bucket_seconds: int = 60) -> int:
+        """Snapshot per-camera traffic counters into a time bucket."""
+        now = datetime.now(timezone.utc)
+        written = 0
+        with SessionLocal() as db:
+            for stats in self.engine.trackers.stats():
+                if not stats["total_counted"]:
+                    continue
+                db.add(TrafficStat(
+                    camera_id=stats["camera_id"], bucket_start=now,
+                    bucket_seconds=bucket_seconds,
+                    total=stats["total_counted"],
+                    counts_by_class=stats["counts_by_class"],
+                    directions=stats["directions"],
+                    mean_dwell_s=stats["mean_dwell_s"]))
+                written += 1
+            db.commit()
+        self.stats["traffic_buckets"] += written
+        return written
 
     def _handle_detection(self, det) -> None:
         """Hand a detection to the writer. Must not touch disk or the database.
@@ -162,6 +263,7 @@ class Pipeline:
                 plate_chars=det.plate_chars,
                 plate_bbox=det.plate_bbox,
                 scene_time=det.scene_time,
+                track_id=det.track_id,
                 embedding=det.embedding,
                 evidence_path=evidence_path,
             ))
@@ -272,6 +374,8 @@ class Pipeline:
             "queue_depth": self.engine.queue.qsize(),
             "write_queue_depth": self._write_queue.qsize(),
             "scheduling": self.supervisor.scheduling(),
+            "traffic": self.engine.trackers.stats(),
+            "zone_events": self.stats["zone_events"],
             "persistence": self.stats,
             "cameras": self.supervisor.health(),
         }

@@ -65,6 +65,8 @@ class VehicleDetection:
     plate_bbox: list[int] | None = None
     #: real time the scene occurred, from the camera's burned-in overlay
     scene_time: object | None = None
+    #: assigned by the per-camera tracker; identifies one vehicle journey
+    track_id: int | None = None
     embedding: list | None = field(default=None, repr=False)
     evidence: object | None = field(default=None, repr=False)
 
@@ -127,6 +129,14 @@ class InferenceEngine:
         self._clocks: dict = {}
         #: how many overlay reads have been attempted per camera
         self._clock_attempts: dict = {}
+        #: per-camera trackers; tracking is what counting, direction, dwell
+        #: and zone rules are all built on
+        from netra.analytics.tracking import TrackerRegistry
+        self.trackers = TrackerRegistry()
+        #: set by the pipeline so zone rules can be evaluated here, where the
+        #: tracks live
+        self.zone_engine = None
+        self.on_zone_event = None
 
         self.stats = {"submitted": 0, "dropped": 0, "processed": 0,
                       "vehicles": 0, "plates": 0, "embedded": 0,
@@ -207,6 +217,9 @@ class InferenceEngine:
         """
         self._clocks.pop(camera_id, None)
         self._clock_attempts.pop(camera_id, None)
+        self.trackers.reset(camera_id)
+        if self.zone_engine is not None:
+            self.zone_engine.reset_camera(camera_id)
 
     def _anchor_clock(self, frame) -> None:
         """Read the burned-in timestamp once per connection, then extrapolate.
@@ -295,6 +308,7 @@ class InferenceEngine:
                 confidence=conf, bbox=[x1, y1, x2, y2],
                 colour=estimate_colour(crop) if cls_id != 0 else None,
                 scene_time=scene_time,
+                track_id=None,
                 evidence=crop)
             detections.append(det)
 
@@ -332,6 +346,22 @@ class InferenceEngine:
             candidates.sort(key=lambda d: -(d.bbox[3] - d.bbox[1]))
             for det in candidates[:PLATE_MAX_PER_FRAME]:
                 self._read_plate(img, det)
+
+        # Tracking turns independent detections into vehicle journeys, which
+        # is what counting, direction, dwell and zone rules all require.
+        tracker = self.trackers.get(frame.camera_id)
+        tracker.update(detections, frame.pts_ms)
+
+        if self.zone_engine is not None:
+            try:
+                h, w = img.shape[:2]
+                events = self.zone_engine.evaluate(
+                    frame.camera_id, list(tracker.tracks.values()), (w, h))
+                if events and self.on_zone_event:
+                    for event in events:
+                        self.on_zone_event(event, frame)
+            except Exception:
+                log.exception("zone evaluation failed for %s", frame.camera_id)
 
         if detections and self.on_vehicles_present:
             self.on_vehicles_present(frame.camera_id)

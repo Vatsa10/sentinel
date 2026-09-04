@@ -149,3 +149,61 @@ class AuditLog(Base):
     target: Mapped[str | None] = mapped_column(String(256))
     detail: Mapped[dict | None] = mapped_column(JSON)
     at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
+
+
+class ZoneRule(Base):
+    """A spatial rule on one camera: intrusion, line crossing, or loitering.
+
+    Coordinates are normalised 0-1 so a rule survives the camera being
+    re-encoded at a different resolution, which matters on a grid carrying five
+    different resolutions.
+    """
+    __tablename__ = "zone_rules"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    camera_id: Mapped[str] = mapped_column(ForeignKey("cameras.id"), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    rule: Mapped[str] = mapped_column(String(16))       # intrusion|crossing|loitering
+    points: Mapped[list] = mapped_column(JSON)          # [[x, y], ...] normalised
+    classes: Mapped[list | None] = mapped_column(JSON)  # empty/None means any
+    severity: Mapped[str] = mapped_column(String(16), default="medium")
+    dwell_s: Mapped[float] = mapped_column(Float, default=30.0)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class ZoneEventRow(Base):
+    """One triggered zone rule."""
+    __tablename__ = "zone_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    zone_rule_id: Mapped[int] = mapped_column(ForeignKey("zone_rules.id"), index=True)
+    camera_id: Mapped[str] = mapped_column(ForeignKey("cameras.id"), index=True)
+    rule: Mapped[str] = mapped_column(String(16))
+    track_id: Mapped[int | None] = mapped_column(Integer)
+    object_class: Mapped[str | None] = mapped_column(String(16))
+    direction: Mapped[str | None] = mapped_column(String(8))
+    detail: Mapped[str] = mapped_column(Text)
+    severity: Mapped[str] = mapped_column(String(16), default="medium")
+    evidence_path: Mapped[str | None] = mapped_column(String(256))
+    acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
+    at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                         default=_utcnow, index=True)
+
+
+class TrafficStat(Base):
+    """Per-camera traffic counts over a time bucket.
+
+    Detections answer "what was seen"; these answer "how much traffic passed",
+    which is the question a planner or a control room actually asks.
+    """
+    __tablename__ = "traffic_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    camera_id: Mapped[str] = mapped_column(ForeignKey("cameras.id"), index=True)
+    bucket_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    bucket_seconds: Mapped[int] = mapped_column(Integer, default=60)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    counts_by_class: Mapped[dict] = mapped_column(JSON, default=dict)
+    directions: Mapped[dict] = mapped_column(JSON, default=dict)
+    mean_dwell_s: Mapped[float] = mapped_column(Float, default=0.0)

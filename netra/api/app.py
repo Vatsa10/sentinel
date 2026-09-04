@@ -642,3 +642,127 @@ async def assistant(request: Request):
     result = ask(question)
     _audit("assistant.ask", target=question[:120])
     return result
+
+
+# ------------------------------------------------------------------ zones --
+@app.get("/api/zones")
+def list_zones(camera_id: str | None = None):
+    """Spatial rules configured on cameras."""
+    from netra.core.models import ZoneRule
+    with SessionLocal() as db:
+        q = db.query(ZoneRule)
+        if camera_id:
+            q = q.filter(ZoneRule.camera_id == camera_id)
+        return [{
+            "id": z.id, "camera_id": z.camera_id, "name": z.name,
+            "rule": z.rule, "points": z.points, "classes": z.classes or [],
+            "severity": z.severity, "dwell_s": z.dwell_s, "active": z.active,
+        } for z in q.order_by(ZoneRule.camera_id, ZoneRule.id).all()]
+
+
+@app.post("/api/zones")
+async def create_zone(request: Request, _p=Depends(require("onboard"))):
+    """Define a rule. Points are normalised 0-1 so the rule survives a
+    resolution change on the source camera."""
+    from netra.analytics.zones import RULE_TYPES
+    from netra.core.models import ZoneRule
+
+    body = await request.json()
+    rule = body.get("rule", "intrusion")
+    if rule not in RULE_TYPES:
+        raise HTTPException(400, f"rule must be one of {RULE_TYPES}")
+
+    points = body.get("points") or []
+    needed = 2 if rule == "crossing" else 3
+    if len(points) < needed:
+        raise HTTPException(
+            400, f"a {rule} rule needs at least {needed} points")
+    for p in points:
+        if len(p) != 2 or not all(0.0 <= float(v) <= 1.0 for v in p):
+            raise HTTPException(400, "points must be normalised [x, y] in 0..1")
+
+    with SessionLocal() as db:
+        if not db.get(Camera, body.get("camera_id")):
+            raise HTTPException(404, "camera not found")
+        z = ZoneRule(
+            camera_id=body["camera_id"], name=body.get("name", "Zone"),
+            rule=rule, points=points, classes=body.get("classes") or [],
+            severity=body.get("severity", "medium"),
+            dwell_s=float(body.get("dwell_s", 30.0)))
+        db.add(z)
+        db.commit()
+        db.refresh(z)
+        zone_id = z.id
+
+    PIPELINE.reload_zone_rules()
+    _audit("zone.create", target=f"{body['camera_id']}:{zone_id}")
+    return {"id": zone_id, "camera_id": body["camera_id"], "rule": rule}
+
+
+@app.delete("/api/zones/{zone_id}")
+def delete_zone(zone_id: int, _p=Depends(require("onboard"))):
+    from netra.core.models import ZoneRule
+    with SessionLocal() as db:
+        z = db.get(ZoneRule, zone_id)
+        if not z:
+            raise HTTPException(404, "not found")
+        db.delete(z)
+        db.commit()
+    PIPELINE.reload_zone_rules()
+    _audit("zone.delete", target=str(zone_id))
+    return {"deleted": zone_id}
+
+
+@app.get("/api/zones/events")
+def zone_events(limit: int = Query(100, le=500), camera_id: str | None = None):
+    from netra.core.models import ZoneEventRow, ZoneRule
+    with SessionLocal() as db:
+        q = db.query(ZoneEventRow)
+        if camera_id:
+            q = q.filter(ZoneEventRow.camera_id == camera_id)
+        rows = q.order_by(ZoneEventRow.at.desc()).limit(limit).all()
+        out = []
+        for e in rows:
+            rule = db.get(ZoneRule, e.zone_rule_id)
+            cam = db.get(Camera, e.camera_id)
+            out.append({
+                "id": e.id, "at": e.at.isoformat(), "camera_id": e.camera_id,
+                "camera_name": cam.name if cam else None,
+                "lat": cam.lat if cam else None, "lon": cam.lon if cam else None,
+                "zone": rule.name if rule else None, "rule": e.rule,
+                "object_class": e.object_class, "direction": e.direction,
+                "detail": e.detail, "severity": e.severity,
+                "evidence": e.evidence_path, "acknowledged": e.acknowledged,
+            })
+    return out
+
+
+# -------------------------------------------------------- traffic analytics --
+@app.get("/api/traffic/live")
+def traffic_live():
+    """Current per-camera counts, class mix, direction split and dwell."""
+    return {"cameras": PIPELINE.engine.trackers.stats(),
+            "zone_events": PIPELINE.stats.get("zone_events", 0)}
+
+
+@app.post("/api/traffic/snapshot")
+def traffic_snapshot(_p=Depends(require("pipeline"))):
+    """Write the current counters into a time bucket for trend reporting."""
+    written = PIPELINE.flush_traffic_stats()
+    _audit("traffic.snapshot", detail={"cameras": written})
+    return {"buckets_written": written}
+
+
+@app.get("/api/traffic/history")
+def traffic_history(camera_id: str | None = None, limit: int = Query(200, le=1000)):
+    from netra.core.models import TrafficStat
+    with SessionLocal() as db:
+        q = db.query(TrafficStat)
+        if camera_id:
+            q = q.filter(TrafficStat.camera_id == camera_id)
+        rows = q.order_by(TrafficStat.bucket_start.desc()).limit(limit).all()
+        return [{
+            "camera_id": r.camera_id, "at": r.bucket_start.isoformat(),
+            "total": r.total, "counts_by_class": r.counts_by_class,
+            "directions": r.directions, "mean_dwell_s": r.mean_dwell_s,
+        } for r in rows]
