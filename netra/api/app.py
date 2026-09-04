@@ -773,6 +773,31 @@ def traffic_history(camera_id: str | None = None, limit: int = Query(200, le=100
         } for r in rows]
 
 
+@app.get("/api/analytics/cloned-plates")
+def cloned_plates(min_confidence: float = Query(0.6, ge=0.0, le=0.99),
+                  limit: int = Query(50, ge=1, le=500)):
+    """Registration numbers seen in two places one vehicle could not have reached.
+
+    Read-only analysis over stored detections; every finding carries the
+    distance, elapsed time and implied speed behind it so an officer can check
+    the claim rather than take it on trust.
+    """
+    from netra.analytics.cloned_plate import find_clones
+    with SessionLocal() as db:
+        rows = (db.query(Detection).options(joinedload(Detection.camera))
+                .filter(Detection.plate_text.isnot(None)).all())
+        findings = find_clones(rows, min_confidence=min_confidence)
+    _audit("analytics.cloned_plates", detail={"findings": len(findings)})
+    return {
+        "findings": [f.to_dict() for f in findings[:limit]],
+        "count": len(findings),
+        "min_confidence": min_confidence,
+        "note": ("Findings are inferred from OCR reads on wide-area cameras and "
+                 "are never certain. Only sightings sharing a recording session "
+                 "are compared."),
+    }
+
+
 @app.get("/api/report", response_class=HTMLResponse)
 def output_report(hours: int = Query(24, ge=1, le=720)):
     """Operational output report, printable to PDF from the browser.

@@ -20,6 +20,8 @@ from datetime import datetime
 
 from netra.analytics.matching import normalise_plate, spacetime_plausible
 from netra.core.geo import haversine_km, time_group
+# Shared with cloned-plate detection so both modules order sightings identically.
+from netra.core.timing import sighting_time as _sighting_time
 
 
 @dataclass
@@ -60,16 +62,6 @@ class Route:
             "time_groups": self.time_groups,
             "hop_count": len(self.hops),
         }
-
-
-def _sighting_time(det) -> datetime:
-    """Prefer the timestamp burned into the source video over our own clock.
-
-    The sandbox replays recordings, so wall time reflects when we happened to
-    connect, not when the scene occurred. Where the camera's own overlay has
-    been parsed, that is the only meaningful ordering.
-    """
-    return det.scene_time or det.wall_time
 
 
 def build_route(detections: list, query: str, min_plate_score: float = 0.6) -> Route:

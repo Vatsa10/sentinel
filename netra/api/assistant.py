@@ -144,6 +144,34 @@ def _find_plate(q: str) -> dict:
                    [{"label": f"Trace {plate}", "view": "route", "query": plate}])
 
 
+def _cloned_plates(_q: str) -> dict:
+    from netra.analytics.cloned_plate import find_clones
+    with SessionLocal() as db:
+        rows = (db.query(Detection).options(joinedload(Detection.camera))
+                .filter(Detection.plate_text.isnot(None)).all())
+        findings = find_clones(rows)
+
+    if not findings:
+        return _answer(
+            "No cloned plates detected. A plate is flagged only when the same "
+            "registration is read at two cameras in the same recording session, "
+            "too far apart for one vehicle to have covered in the time between - "
+            "sightings from different sessions are never compared.",
+            {"count": 0},
+            [{"label": "Open detections", "view": "detections"}])
+
+    top = findings[0]
+    return _answer(
+        f"{len(findings)} possible cloned plates. Strongest: {top.plate} at "
+        f"{top.sighting_a['camera_name']} and {top.sighting_b['camera_name']}, "
+        f"{top.distance_km} km apart in {top.elapsed_s:.0f}s "
+        f"(confidence {top.confidence}). This is inferred from OCR reads and is "
+        f"never certain - check the evidence images before acting.",
+        {"count": len(findings),
+         "findings": [f.to_dict() for f in findings[:10]]},
+        [{"label": f"Trace {top.plate}", "view": "route", "query": top.plate}])
+
+
 def _watchlist_summary(_q: str) -> dict:
     with SessionLocal() as db:
         rows = db.query(WatchlistEntry).filter(
@@ -201,8 +229,8 @@ def _help(_q: str) -> dict:
     return _answer(
         "I answer from live platform data. You can ask about camera health and "
         "which cameras are faulty, detection counts, current alerts, the "
-        "watchlist, pipeline status, coverage by location, or where a specific "
-        "registration number has been seen.",
+        "watchlist, pipeline status, coverage by location, whether any plates look "
+        "cloned, or where a specific registration number has been seen.",
         {}, [{"label": "Camera health", "query": "which cameras are down"},
              {"label": "Current alerts", "query": "show me the alerts"},
              {"label": "Detections", "query": "how many detections"}])
@@ -211,6 +239,11 @@ def _help(_q: str) -> dict:
 # Ordered: the first intent whose keywords appear wins, so specific
 # intents must precede general ones.
 INTENTS = [
+    # Ahead of the trace intent because "find cloned plates" contains "find";
+    # a question naming an actual registration number never reaches here, as
+    # `ask` routes those to the trace handler before the keyword loop runs.
+    (("clone", "cloned", "cloning", "forged", "forgery", "duplicate plate",
+      "fake plate"), _cloned_plates),
     (("where", "seen", "trace", "track", "find", "locate"), _find_plate),
     (("camera", "cameras", "down", "faulty", "degraded", "health", "broken"), _camera_health),
     (("alert", "alerts", "hit", "match", "matches"), _alert_summary),
@@ -243,7 +276,7 @@ def ask(question: str) -> dict:
     return _answer(
         "I could not match that to anything I can answer from platform data. "
         "Ask about camera health, detections, alerts, the watchlist, pipeline "
-        "status, coverage, or a specific registration number.",
+        "status, coverage, cloned plates, or a specific registration number.",
         {}, _help("")["actions"])
 
 
@@ -263,6 +296,15 @@ def _self_check() -> None:
     assert "cameras" in ask("which cameras are down?")["answer"].lower()
     assert ask("show me the alerts")["data"] is not None
     assert "watchlist" in ask("what is on the watchlist")["answer"].lower()
+
+    # The clone intent must not swallow a plate trace, and must win over the
+    # trace keywords when a question is about clones generally.
+    r = ask("any cloned plates?")
+    assert "clone" in r["answer"].lower(), r
+    r = ask("find cloned plates")
+    assert "clone" in r["answer"].lower(), r
+    r = ask("where has GJ01AB1234 been seen?")
+    assert "GJ01AB1234" in r["answer"], r
 
     # Unknown questions must decline rather than invent an answer.
     r = ask("what is the weather in Ahmedabad tomorrow")
