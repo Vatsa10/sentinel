@@ -367,3 +367,155 @@ git status --porcelain data/  -> empty
 The self-check remains network-free and GPU-free. Its one database assertion
 runs against an in-memory SQLite it creates itself and never opens
 `data/netra.db`.
+
+---
+
+# Fix round 4/5
+
+## Important — one OCR misread anchored an entire stream
+
+`ClockAnchor` extrapolates from a single reading, so one wrong digit mis-timed
+every detection on that camera for the rest of the pass. The evidence was in
+the spans: `2025-06-14`, `2026-06-24`, `2028-06-13`, each from one bad read
+that passed every syntactic check.
+
+**Corroboration before trust.** `InferenceEngine._anchor_clock` now holds a
+first reading as *pending* and anchors only when a second, independent reading
+lands within `CLOCK_CORROBORATION_TOLERANCE_S = 2.5` of the first projected
+forward by the PTS between them. A contradicting reading is discarded, never
+averaged — the average of a right answer and a wrong one is a third wrong
+answer — and the newer reading becomes the pending candidate. If no pair
+agrees inside the attempt budget the camera stays unanchored, which is the
+module's stated principle: no scene time is better than a wrong one.
+
+Two supporting details, both measured rather than guessed:
+
+- The attempt budget is no longer spent by a *successful* read. Its purpose is
+  to stop retrying cameras with no legible overlay, not to stop a legible one
+  confirming itself.
+- Attempts are spaced `INDEX_CLOCK_RETRY_MS = 20000` apart through the
+  recording, but only `INDEX_CLOCK_CORROBORATE_RETRY_MS = 1000` while a
+  candidate is pending. Measured on cam13, roughly one attempt in seven yields
+  a legible overlay, so waiting another twenty seconds for the confirming read
+  meant the pair almost never completed. One second is not zero deliberately:
+  it changes the seconds digit, so an agreeing pair has read a *different*
+  number correctly twice. What it still cannot catch is a systematic misread
+  producing the same wrong digit every time — only a differently-derived clock
+  could, and that does not exist here.
+
+**`is_plausible` tightened** from 2015–2035 to 2025–2027. Every recording in
+this sandbox is dated June 2026; one year either side tolerates footage
+re-recorded a season later while rejecting a year that differs by a digit. It
+cannot catch a misread day or hour — that is what corroboration is for — and
+the comment says so.
+
+**Self-check assertions** (in `netra.analytics.inference`, no model, no GPU,
+stubbed OCR): two readings that agree once projected forward anchor; two that
+contradict do not, and the later becomes the pending candidate; a camera
+yielding exactly one reading stays unanchored; a loop cut voids the pending
+reading. In `netra.analytics.scene_clock`: `2028-06-13` and `2015-06-14` are
+now rejected as implausible years.
+
+**It works on real footage.** From the four-camera pass below:
+
+```
+cam13 scene clock anchored to 2026-06-14T07:49:15 (confidence 1.00)
+cam13 scene clock anchored to 2026-06-14T07:49:15 (confidence 0.82)
+cam13 scene clock corroborated to 2026-06-14T07:49:15 (two readings 1.2s
+      apart agreeing to 1.2s)
+cam04 scene clock anchored to 2026-06-14T07:45:46 (confidence 0.43)
+cam04 has no legible timestamp overlay after 30 attempts; sightings on this
+      camera carry no scene time
+```
+
+cam04 is exactly the case the fix exists for: one lone reading at confidence
+0.43, never confirmed, correctly refused.
+
+## The finding: no cross-camera journey is demonstrable in this sandbox
+
+Four cameras, 200 s each, corroborated anchoring, everything persisted:
+
+```
+camera  frames  vehicles  video    clocked detections   scene span
+cam14    1162     7708    189.3s   0%                   —
+cam04     421     2540    190.8s   0%   (1 uncorroborated read, refused)
+cam13     954     8329    185.3s   22.6%  879 clocked   07:49:15 -> 07:49:56
+cam15     402     1375     76.6s   0%                   —
+```
+
+Mining over the rows this pass produced: **0 journeys.** Mining over the whole
+store: **0 journeys.**
+
+**Assessment: this is a data limitation, not a remaining defect.** Three
+independent measurements support that, and none of them points at the mining
+code.
+
+1. **Only one camera anchors at all.** A cross-camera journey needs two clocked
+   cameras. In this pass exactly one — cam13 — produced a corroborated clock.
+   With one clocked camera the answer is arithmetically zero regardless of what
+   the miner does, and the miner correctly refuses to substitute wall time.
+2. **The clock-readable windows do not overlap.** Even taking the older
+   single-read anchors at face value, cam04 sat at 02:29–02:36, cam13 at
+   02:32–07:10, cam14 at 07:02–07:08 and cam15 at 21:23–21:27. The only
+   overlap is cam04/cam13, about four minutes wide — and cam04 is precisely
+   the camera that will not corroborate.
+3. **The mining itself is proven to work on data that contains a journey.**
+   The self-check mines a genuine three-camera journey out of synthetic
+   detections, orders it by scene time, rejects an implausible hop, refuses a
+   same-camera pair and refuses to cross time groups. Feed it a journey and it
+   finds one; feed it 879 clocked detections from a single camera and there is
+   nothing to find.
+
+The honest statement for the submission: *the platform mines cross-camera
+journeys, and the Government sandbox does not contain one that can be
+demonstrated — because on these wide-area night cameras the burned-in clock is
+legible on one camera in four, and the windows where it is legible do not
+overlap between cameras.* Given the choice between reporting that and relaxing
+corroboration to manufacture a journey out of timestamps we know to be wrong,
+this reports it.
+
+What would change the answer, in order of cost: a longer pass over a camera's
+whole loop rather than 200 s of it, since overlay legibility varies strongly
+with the segment; a second clock source (a plate-read timestamp, a scene event)
+to corroborate against; or footage with a legible overlay on two cameras at
+once.
+
+## Round-3 items closed
+
+- `next_mine_in_s: 0.0` is gone. The response carries `last_mined_at` and
+  `next_mine: "only on request, with refresh=true"`, because nothing re-mines
+  on a timer.
+- Mining is now recorded as having *happened*, not by its output:
+  `_journeys_mined_at` marks the group, so a group that legitimately mines zero
+  journeys is not re-mined on every poll once a cooldown lapses. Observed:
+  first request `mined_now: true`, subsequent requests `mining_skipped: true`
+  with a note saying the empty result is the answer, not a pending one.
+- Noted: the round-2 commit message said `/api/analytics/similar`; the route is
+  `/api/vehicles/{id}/similar`. Code was always correct.
+
+## Commands run
+
+```
+python -m netra.analytics.loop_index   -> loop_index self-check passed
+python -m netra.analytics.scene_clock  -> scene clock self-check passed
+python -m netra.analytics.reid         -> reid self-check passed
+python -m netra.analytics.inference    -> inference self-check passed
+python -c "from netra.api.app import app; print('app ok')" -> app ok
+
+four-camera indexing pass, 200s each, output above
+mining over that pass's rows          -> 0 journeys
+mining over the whole store           -> 0 journeys
+git status --porcelain data/          -> empty
+```
+
+Self-checks remain network-free and GPU-free: the corroboration test stubs the
+overlay reader and constructs the engine without loading a model.
+
+## Note on commits
+
+An auto-commit process in this repo committed parts of this work mid-task under
+generic messages (`a24f32e`, `659cf78`, `808fdef`). The content was verified as
+mine and complete — the policy split, the corroboration logic, the tightened
+year window and the endpoint changes are all present and unmodified. The
+remaining corroboration-spacing change and this report are committed
+deliberately.
