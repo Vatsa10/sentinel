@@ -49,6 +49,19 @@ CLOCK_REANCHOR_AFTER_S = 900.0
 INDEX_CLOCK_ATTEMPT_LIMIT = 30
 INDEX_CLOCK_RETRY_MS = 20000.0
 
+#: Spacing between attempts while a first reading is waiting to be
+#: corroborated. Measured on cam13, only about one attempt in seven produces a
+#: legible overlay, so waiting a further twenty seconds of stream time for the
+#: confirming read means the pair almost never completes and the camera stays
+#: unanchored despite a readable clock. Close the gap while a candidate is
+#: pending: the overlay that was legible a moment ago probably still is.
+#: Not zero, though - a second reading of near-identical pixels tests very
+#: little. A second of stream time changes the seconds digit, so an agreeing
+#: pair has read a *different* number correctly twice. What it still cannot
+#: catch is a systematic misread that produces the same wrong digit every
+#: time; only a differently-derived clock could.
+INDEX_CLOCK_CORROBORATE_RETRY_MS = 1000.0
+
 #: How far a second overlay reading may fall from the first one projected
 #: forward by PTS and still corroborate it. Overlays read to the second and
 #: PTS is milliseconds, so a genuine pair agrees to within rounding; anything
@@ -354,8 +367,10 @@ class InferenceEngine:
             # every reason to succeed, so it never skips - but it spaces its
             # attempts through the recording rather than spending the whole
             # budget on the first frames, where the overlay may be obscured.
+            spacing = (INDEX_CLOCK_CORROBORATE_RETRY_MS
+                       if cam in self._clock_pending else INDEX_CLOCK_RETRY_MS)
             last_try = self._clock_last_try.get(cam)
-            if last_try is not None and frame.pts_ms - last_try < INDEX_CLOCK_RETRY_MS:
+            if last_try is not None and frame.pts_ms - last_try < spacing:
                 return
             self._clock_last_try[cam] = frame.pts_ms
         # Anchoring costs roughly a second of OCR per attempt. Detection is the

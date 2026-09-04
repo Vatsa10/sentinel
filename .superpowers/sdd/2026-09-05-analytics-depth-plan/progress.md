@@ -209,3 +209,37 @@ Task 6: Ruling: rounds 4-5 normally take a fresh implementer on a higher tier.
   and holds the indexing context, and the loop is not stuck (each round has
   fixed real defects and surfaced new ones from real data). Cost if wrong:
   loses the fresh-eyes benefit the escalation is meant to buy.
+Task 6: fix round 4/5 code landed as 808fdef (inference.py, scene_clock.py:
+  corroborated anchoring + tightened plausibility). Report pending — the
+  implementer is running the cam04/cam13 indexing pass to answer the journey
+  question honestly.
+Ruling: dispatching Task 8 while Task 6's round-4 report is pending. The file
+  sets are disjoint (Task 8 = netra/web/* + one snapshot endpoint in app.py;
+  round 4 = inference.py + scene_clock.py, already committed). Cost if wrong:
+  a merge conflict on app.py that git will surface, not silently corrupt.
+User direction (05 Sep): skip deployment; order is Task 8 -> VLM attributes as
+  Task 9 -> sweep remaining issues.
+Task 9 (VLM attributes) added at user direction; brief written to
+  task-9-brief.md. Ordered after Task 8.
+Ruling: Task 9 introduces transformers 4.57.6, timm, einops, accelerate,
+  safetensors — a deliberate exception to the no-new-heavyweight-deps
+  constraint. There is no stdlib route to a vision-language model, and the
+  user explicitly chose this feature. Installed into .venv. Cost if wrong:
+  ~2 GB of dependencies and a model download; no effect on any existing
+  module's self-check, all of which import nothing from these packages.
+Florence-2-base feasibility probe dispatched (load + caption on real grid
+  crops) before Task 9 is dispatched, so the task is not sent against an
+  unproven model.
+Florence-2-base probe: PASSED. Load 8.1s, 452 MiB, 0.9-2.6s per crop on
+  RTX 5050. Two mandatory workarounds for transformers 4.57.6 recorded in the
+  Task 9 brief: attn_implementation="eager" and generate(use_cache=False).
+  Real captions from cam13 crops carry colour, body type and markings.
+Task 8: report landed, commit pending. All 17 console endpoints verified 200
+  (snapshot 404 on unknown camera as expected); node --check passes.
+Task 8: minor (deferred, cross-task): plate_vote's voter_count is computed but
+  never persisted on Detection, so the console shows plate_chars instead.
+  Surfacing it needs one additive column. Belongs to the issues sweep after
+  Task 9, not to Task 8.
+Task 8: minor (deferred): /api/detections was not serialising track_id or
+  scene_time despite the columns existing — fixed in this task, noted here so
+  the final review knows it was a latent gap from Task 3/6, not new scope.
