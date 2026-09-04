@@ -24,7 +24,8 @@ from netra.analytics.route import build_route
 from netra.core import auth
 from netra.core.db import SessionLocal, init_db
 from netra.core.geo import TIME_GROUPS, time_group
-from netra.core.models import Alert, AuditLog, Camera, Detection, WatchlistEntry
+from netra.core.models import (Alert, AuditLog, Camera, Detection,
+                               VehicleAttributeRow, WatchlistEntry)
 from netra.pipeline import PIPELINE
 
 logging.basicConfig(level=logging.INFO,
@@ -267,6 +268,10 @@ def list_detections(camera_id: str | None = None, plate: str | None = None,
             q = q.filter(Detection.wall_time >= cutoff)
         total = q.count()
         rows = q.order_by(Detection.wall_time.desc()).offset(offset).limit(limit).all()
+        # One extra query for the page rather than a join: attributes are
+        # sparse - most detections have none - and a left join would carry the
+        # caption text of every row through the main query for the few that do.
+        described = _attributes_for([d.id for d in rows], db)
 
         items = [{
             "id": d.id, "camera_id": d.camera_id,
@@ -282,8 +287,85 @@ def list_detections(camera_id: str | None = None, plate: str | None = None,
             "evidence": d.evidence_path, "bbox": d.bbox,
             "track_id": d.track_id,
             "scene_time": d.scene_time.isoformat() if d.scene_time else None,
+            "attributes": described.get(d.id),
         } for d in rows]
     return {"total": total, "count": len(items), "items": items}
+
+
+def _attribute_dict(row) -> dict:
+    """Serialise one stored description. Provenance travels with it."""
+    return {"body_type": row.body_type, "colour": row.colour,
+            "tinted_windows": row.tinted_windows, "wheels": row.wheels,
+            "roof_rack": row.roof_rack, "markings": row.markings or [],
+            "damage": row.damage or [], "description": row.description,
+            "raw_caption": row.raw_caption, "model": row.model,
+            "confidence": row.confidence, "source": row.source,
+            "at": row.created_at.isoformat() if row.created_at else None,
+            "note": ATTRIBUTE_NOTE}
+
+
+#: Attached to every description the API returns. A caption is a description of
+#: a crop, and the difference between that and an identification is the whole
+#: honesty position of this platform.
+ATTRIBUTE_NOTE = ("A vision-language description of the evidence crop, for "
+                  "search and for an operator to read. It describes what the "
+                  "vehicle looks like; it does not identify the vehicle.")
+
+
+def _attributes_for(detection_ids: list[int], db) -> dict:
+    """detection_id -> serialised attributes, for the ids that have any."""
+    if not detection_ids:
+        return {}
+    rows = (db.query(VehicleAttributeRow)
+            .filter(VehicleAttributeRow.detection_id.in_(detection_ids)).all())
+    return {r.detection_id: _attribute_dict(r) for r in rows}
+
+
+@app.post("/api/detections/{detection_id}/describe")
+def describe_detection(detection_id: int, refresh: bool = False,
+                       _p=Depends(require("read"))):
+    """Describe one vehicle in words, on request.
+
+    The operator-request tier. Extraction is expensive enough that the pipeline
+    only runs it unprompted on alerts, zone events and the largest vehicle on
+    an escalated camera; this is how an officer gets a description of any other
+    detection - synchronously, because they are waiting for it.
+    """
+    from netra.analytics import attributes as attrs
+    from netra.pipeline import evidence_file, store_attributes
+
+    with SessionLocal() as db:
+        det = db.get(Detection, detection_id)
+        if det is None:
+            raise HTTPException(404, "detection not found")
+        existing = db.query(VehicleAttributeRow).filter(
+            VehicleAttributeRow.detection_id == detection_id).one_or_none()
+        if existing is not None and not refresh:
+            return {"detection_id": detection_id, "cached": True,
+                    "attributes": _attribute_dict(existing)}
+        evidence_path = det.evidence_path
+
+    path = evidence_file(evidence_path)
+    if path is None:
+        raise HTTPException(
+            404, "no evidence crop is stored for this detection, so there is "
+                 "nothing to describe")
+
+    result = attrs.describe_image_file(path)
+    if not result.raw_caption:
+        # The model is unavailable or failed. Saying so is the honest answer;
+        # storing an all-unknown row would look like a description that found
+        # nothing, which is a different thing entirely.
+        raise HTTPException(503, result.description)
+
+    store_attributes(detection_id, result, "operator")
+    _audit("detection.describe", target=str(detection_id),
+           detail={"confidence": result.confidence})
+    with SessionLocal() as db:
+        row = db.query(VehicleAttributeRow).filter(
+            VehicleAttributeRow.detection_id == detection_id).one()
+        return {"detection_id": detection_id, "cached": False,
+                "attributes": _attribute_dict(row)}
 
 
 @app.get("/api/detections/stats")
@@ -375,6 +457,7 @@ def list_alerts(limit: int = Query(50, le=500), acknowledged: bool | None = None
         if acknowledged is not None:
             q = q.filter(Alert.acknowledged.is_(acknowledged))
         rows = q.order_by(Alert.created_at.desc()).limit(limit).all()
+        described = _attributes_for([a.detection_id for a in rows], db)
         out = []
         for a in rows:
             det = db.get(Detection, a.detection_id)
@@ -393,6 +476,10 @@ def list_alerts(limit: int = Query(50, le=500), acknowledged: bool | None = None
                 "category": wl.category if wl else None,
                 "case_ref": wl.case_ref if wl else None,
                 "evidence": det.evidence_path if det else None,
+                "detection_id": a.detection_id,
+                # Present where the alert path already produced one; the card
+                # offers a Describe button where it has not.
+                "attributes": described.get(a.detection_id),
             })
     return out
 
@@ -556,7 +643,8 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
     their similarity score, ordered in time, and filtered for space-time
     plausibility - not assertions of identity.
     """
-    from netra.analytics.reid import flag_ambiguity, similarity
+    from netra.analytics.reid import (attribute_agreement, flag_ambiguity,
+                                      similarity)
     from netra.core.geo import haversine_km, time_group
     from netra.analytics.matching import spacetime_plausible
 
@@ -572,6 +660,12 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
         others = (db.query(Detection).options(joinedload(Detection.camera))
                   .filter(Detection.id != detection_id,
                           has_embedding()).all())
+
+        # The third signal. Only ever consulted for candidates appearance has
+        # already selected, and only where both sides carry a description, so
+        # it can corroborate a match but never create one.
+        attr_rows = _attributes_for([detection_id] + [d.id for d in others], db)
+        query_attrs = attr_rows.get(detection_id)
 
         scored = []
         for det in others:
@@ -590,6 +684,15 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
             else:
                 ok, why = True, "same camera"
 
+            # Presented separately from `similarity`, which stays the raw
+            # cosine: an operator must be able to see what appearance alone
+            # said and what the description did to it.
+            presented, adjustment = sim, None
+            agreement = attribute_agreement(query_attrs, attr_rows.get(det.id))
+            if agreement:
+                presented = max(0.0, min(1.0, sim + agreement["delta"]))
+                adjustment = agreement
+
             scored.append({
                 "detection_id": det.id,
                 "camera_id": det.camera_id,
@@ -602,6 +705,9 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
                 "plate_text": det.plate_text,
                 "evidence": det.evidence_path,
                 "similarity": round(sim, 4),
+                "presented_similarity": round(presented, 4),
+                "attributes": attr_rows.get(det.id),
+                "attribute_adjustment": adjustment,
                 "distance_km": round(km, 2),
                 "elapsed_s": round(secs, 1),
                 "plausible": ok,
@@ -609,6 +715,10 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
                 "same_time_group": time_group(det.camera_id) == time_group(query.camera_id),
             })
 
+        # Ordered on raw appearance, not on the adjusted figure: the ranking is
+        # what appearance evidence says, and a description is only allowed to
+        # qualify it. Ambiguity is judged on the same raw scores for the same
+        # reason.
         scored.sort(key=lambda x: x["similarity"], reverse=True)
         # Two vehicles that look alike score alike, so where the top results
         # are separated by less than the appearance model can resolve, every
@@ -623,6 +733,7 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
             "at": query.wall_time.isoformat(),
             "vehicle_class": query.vehicle_class, "colour": query.colour,
             "evidence": query.evidence_path,
+            "attributes": query_attrs,
         }
 
     _audit("vehicle.similar", target=str(detection_id),
@@ -631,7 +742,9 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
         "query": origin,
         "matches": matches,
         "plausible_matches": [m for m in matches if m["plausible"]],
-        "method": "appearance re-identification (ResNet-18 512-d, cosine)",
+        "method": ("appearance re-identification (ResNet-18 512-d, cosine), "
+                   "corroborated where both sightings carry a "
+                   "vision-language description"),
         "ambiguous": any(m.get("ambiguous") for m in matches),
         "note": ("Ranked candidates for operator confirmation, not identification. "
                  "Appearance evidence alone does not establish that two sightings "

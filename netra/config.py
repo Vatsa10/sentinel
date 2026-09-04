@@ -127,3 +127,19 @@ DETECTION_MAX_ROWS = int(os.getenv("NETRA_DETECTION_MAX_ROWS", "2000000"))
 # Floor under the row cap: recent detections are never pruned however far over
 # the cap the table is, because they are what an operator is actively querying.
 DETECTION_KEEP_DAYS = int(os.getenv("NETRA_DETECTION_KEEP_DAYS", "1"))
+
+# --- vehicle attributes (vision-language descriptions) -----------------------
+# A description an officer can read, search and testify to, on a grid where no
+# plate is recoverable. Florence-2-base is 0.23B parameters under an MIT
+# licence and sits in ~450 MiB of VRAM beside YOLOv8m, ReID and OCR.
+ATTRIBUTE_MODEL = os.getenv("NETRA_ATTRIBUTE_MODEL", "microsoft/Florence-2-base")
+ATTRIBUTES_ENABLED = os.getenv("NETRA_ATTRIBUTES", "1") not in ("0", "false", "no")
+# Per escalated camera, how rarely the opportunistic "largest vehicle" pass may
+# run. A caption costs roughly a second of GPU; once every thirty seconds per
+# camera keeps the whole grid's opportunistic spend to a small fraction of one
+# camera's detection budget.
+ATTRIBUTE_ESCALATED_INTERVAL_S = float(
+    os.getenv("NETRA_ATTRIBUTE_INTERVAL", "30"))
+# Bounded and dropping: enrichment must never apply back-pressure to detection.
+# Measured precedent for why - unbounded overlay OCR cost 71% of frames.
+ATTRIBUTE_QUEUE_SIZE = int(os.getenv("NETRA_ATTRIBUTE_QUEUE", "32"))

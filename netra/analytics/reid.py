@@ -46,6 +46,61 @@ _AMBIGUITY_NOTE = (
     "separate them. Confirm against another signal before acting.")
 
 
+#: How far agreeing vision-language attributes may move a presented score.
+#: Deliberately tiny and asymmetric. Attributes are a caption a model wrote
+#: about a night-time crop, so they are corroboration, never the case: two
+#: sightings that already look alike and are also both described as a black SUV
+#: are marginally more likely to be the same vehicle, while being described as
+#: a black SUV and a white bus is much stronger evidence that they are not. The
+#: adjustment cannot promote a candidate appearance never produced, because it
+#: is applied after the similarity threshold has already selected the list.
+ATTRIBUTE_AGREE_BONUS = 0.03
+ATTRIBUTE_DISAGREE_PENALTY = 0.05
+
+
+def attribute_agreement(a: dict | None, b: dict | None) -> dict | None:
+    """Compare two attribute records as a third re-identification signal.
+
+    Returns `{"delta", "detail"}` or None when the comparison cannot be made -
+    which is the common case, because most detections carry no description.
+    Only `body_type` and `colour` are compared: they are the two fields the
+    parser recovers reliably and the two an operator would themselves check.
+
+    Attributes alone never establish a match. This mirrors the rule binding
+    appearance and colour in `matching.py`: a corroborating signal adjusts a
+    score that another signal already produced.
+    """
+    if not a or not b:
+        return None
+    fields = []
+    for key in ("body_type", "colour"):
+        x, y = a.get(key), b.get(key)
+        if not x or not y or "unknown" in (x, y):
+            continue
+        fields.append((key, x, y, x == y))
+    if not fields:
+        return None
+
+    disagreed = [f for f in fields if not f[3]]
+    if disagreed:
+        detail = "; ".join(f"{k}: described as {x} here and {y} there"
+                           for k, x, y, _ in disagreed)
+        return {"delta": -ATTRIBUTE_DISAGREE_PENALTY,
+                "detail": f"Vision-language descriptions disagree ({detail}), "
+                          f"so the presented score is reduced by "
+                          f"{ATTRIBUTE_DISAGREE_PENALTY:.2f}."}
+    # Both fields must be present and agree before anything is added: agreeing
+    # on colour alone is weak enough that it is not worth presenting as a lift.
+    if len(fields) < 2:
+        return None
+    described = ", ".join(f"{k} {x}" for k, x, _, _ in fields)
+    return {"delta": ATTRIBUTE_AGREE_BONUS,
+            "detail": f"Vision-language descriptions agree ({described}), "
+                      f"so the presented score is raised by "
+                      f"{ATTRIBUTE_AGREE_BONUS:.2f}. Attributes corroborate "
+                      f"an appearance match; they never establish one."}
+
+
 def flag_ambiguity(scored: list[dict]) -> list[dict]:
     """Mark results the appearance evidence cannot actually separate.
 
@@ -201,6 +256,30 @@ def _self_check() -> None:
     edge = [{"similarity": 0.90}, {"similarity": 0.88}]
     flag_ambiguity(edge)
     assert edge[0]["ambiguous"] and edge[1]["ambiguous"], edge
+
+    # Attributes as a third signal: corroboration only, bounded both ways.
+    black_suv = {"body_type": "suv", "colour": "black"}
+    assert attribute_agreement(None, black_suv) is None
+    assert attribute_agreement({}, black_suv) is None
+    # Unknown fields are not agreement.
+    assert attribute_agreement({"body_type": "unknown", "colour": None},
+                               black_suv) is None
+    # Colour alone agreeing is too weak to present as a lift.
+    assert attribute_agreement({"colour": "black"}, black_suv) is None
+    agree = attribute_agreement(black_suv, dict(black_suv))
+    assert agree and agree["delta"] == ATTRIBUTE_AGREE_BONUS, agree
+    assert "never establish" in agree["detail"], agree
+    clash = attribute_agreement(black_suv, {"body_type": "bus",
+                                            "colour": "white"})
+    assert clash and clash["delta"] == -ATTRIBUTE_DISAGREE_PENALTY, clash
+    # A single disagreeing field is enough to lower the score.
+    half = attribute_agreement(black_suv, {"body_type": "suv",
+                                           "colour": "white"})
+    assert half and half["delta"] == -ATTRIBUTE_DISAGREE_PENALTY, half
+    # The adjustment is small enough that it can never carry a candidate on
+    # its own: it cannot lift anything over the threshold that appearance
+    # did not already place above it.
+    assert ATTRIBUTE_AGREE_BONUS < AMBIGUITY_MARGIN * 2
 
     print("reid self-check passed")
 

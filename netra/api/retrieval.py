@@ -91,6 +91,15 @@ MIN_TRIGRAM_CONTAINMENT = 0.7
 #: match, which is strict enough to stay safe.
 MIN_TRIGRAM_QUERY_LEN = 4
 
+#: How many described vehicles the index carries, newest first. Cameras, zones
+#: and the watchlist are a few hundred rows between them and are indexed whole;
+#: descriptions accumulate one per described detection and would eventually
+#: dominate a rebuild the TTL performs on an operator's own request. Newest
+#: first because a search for a vehicle is nearly always a search for a recent
+#: one. ponytail: its ceiling is exactly that - an older described vehicle is
+#: unfindable by description, and stays findable only by camera, time or plate.
+VEHICLE_INDEX_LIMIT = 5000
+
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
 log = logging.getLogger(__name__)
@@ -130,7 +139,7 @@ def _trigrams(text: str) -> set[str]:
 @dataclass(frozen=True)
 class EntityMatch:
     """One resolved entity. Carries no facts - an id and how sure we are."""
-    kind: str            # camera | zone | watchlist
+    kind: str            # camera | zone | watchlist | vehicle
     id: str
     label: str
     score: float
@@ -317,7 +326,8 @@ _CACHE: dict[str, object] = {"index": None, "at": 0.0}
 def _rows_from_db() -> list[tuple[str, str, str, str]]:
     """(kind, id, label, searchable text) for every resolvable entity."""
     from netra.core.db import SessionLocal
-    from netra.core.models import Camera, WatchlistEntry, ZoneRule
+    from netra.core.models import (Camera, VehicleAttributeRow,
+                                   WatchlistEntry, ZoneRule)
 
     out: list[tuple[str, str, str, str]] = []
     with SessionLocal() as db:
@@ -335,6 +345,20 @@ def _rows_from_db() -> list[tuple[str, str, str, str]]:
                                         w.category, w.owner_name,
                                         w.vehicle_make) if x)
             out.append(("watchlist", str(w.id), w.plate, text))
+        # Vision-language descriptions, so "the black SUV with a roof rack"
+        # resolves to the detections that were described that way. This is the
+        # only kind whose text is model-written rather than operator-entered,
+        # which changes nothing about the division of labour: it resolves a
+        # phrase to a detection id, and every fact about that detection is then
+        # read from the detections table.
+        for v in (db.query(VehicleAttributeRow)
+                  .order_by(VehicleAttributeRow.id.desc())
+                  .limit(VEHICLE_INDEX_LIMIT).all()):
+            marks = " ".join(str(m) for m in (v.markings or []))
+            text = " ".join(x for x in (v.description, marks) if x)
+            if not text.strip():
+                continue
+            out.append(("vehicle", str(v.detection_id), v.description, text))
     return out
 
 
@@ -392,6 +416,10 @@ _SYNTHETIC = [
      "Bypass hard shoulder intrusion GJ-JUN-004"),
     ("watchlist", "7", "GJ01AB1234",
      "GJ01AB1234 FIR-2026-118 reported stolen from Vadodara stolen"),
+    ("vehicle", "9182", "black suv; tinted windows; alloy wheels; roof rack",
+     "black suv tinted windows alloy wheels roof rack"),
+    ("vehicle", "9200", "white van; markings: Om Travels",
+     "white van markings Om Travels"),
 ]
 
 
@@ -450,6 +478,16 @@ def _self_check() -> None:
     # A watchlist entry resolves by its case reference, not only its plate.
     m = idx.resolve("FIR-2026-118")
     assert m and m[0].kind == "watchlist" and m[0].id == "7", m
+
+    # A vision-language description resolves to its detection, and the id it
+    # returns is the detection id the facts are then read from.
+    m = idx.resolve("the black SUV with a roof rack")
+    assert m and m[0].kind == "vehicle" and m[0].id == "9182", m
+    m = idx.resolve("Om Travels")
+    assert m and m[0].kind == "vehicle" and m[0].id == "9200", m
+    # ...and the description index must not answer questions about cameras.
+    m = idx.resolve("rajkot ring road")
+    assert m and m[0].kind == "camera", m
 
     # An empty corpus must be answerable, not an exception.
     assert build_index([]).resolve("anything") == []

@@ -31,8 +31,8 @@ from sqlalchemy.orm import joinedload
 from netra.api import retrieval
 from netra.core.db import SessionLocal
 from netra.core.geo import TIME_GROUPS
-from netra.core.models import (Alert, Camera, Detection, WatchlistEntry,
-                               ZoneEventRow, ZoneRule)
+from netra.core.models import (Alert, Camera, Detection, VehicleAttributeRow,
+                               WatchlistEntry, ZoneEventRow, ZoneRule)
 
 PLATE_RE = re.compile(r"\b([A-Z]{2}\s?\d{1,2}\s?[A-Z]{0,3}\s?\d{3,4})\b", re.I)
 
@@ -393,8 +393,44 @@ def _watchlist_facts(entry_id: str):
     return text, data
 
 
+def _vehicle_facts(detection_id: str):
+    """Facts about a vehicle the operator found by its description.
+
+    The description resolved the mention; it states none of this. Camera,
+    time, class and colour are read from the detections table, and the stored
+    caption is shown as what a model said about the crop rather than as a
+    property of the vehicle.
+    """
+    with SessionLocal() as db:
+        d = db.get(Detection, int(detection_id))
+        if d is None:
+            return None
+        row = db.query(VehicleAttributeRow).filter(
+            VehicleAttributeRow.detection_id == d.id).one_or_none()
+        cam = db.get(Camera, d.camera_id)
+        when = (d.scene_time or d.wall_time)
+        data = {"detection_id": d.id, "camera_id": d.camera_id,
+                "camera_name": cam.name if cam else None,
+                "at": when.isoformat() if when else None,
+                "scene_time": d.scene_time.isoformat() if d.scene_time else None,
+                "vehicle_class": d.vehicle_class, "colour": d.colour,
+                "plate_text": d.plate_text,
+                "description": row.description if row else None,
+                "confidence": row.confidence if row else None}
+        where = cam.name if cam and cam.name else d.camera_id
+        stamp = when.strftime("%Y-%m-%d %H:%M:%S") if when else "an unknown time"
+        described = (f' Described by {row.model or "the vision-language model"} '
+                     f'as "{row.description}" (confidence '
+                     f'{row.confidence:.2f}) - a description of the crop, not '
+                     f'an identification.') if row else ""
+        text = (f"Detection {d.id} - a {d.colour or 'colour-unknown'} "
+                f"{d.vehicle_class} on {where} at {stamp}."
+                f"{described}")
+    return text, data
+
+
 _FACTS = {"camera": _camera_facts, "zone": _zone_facts,
-          "watchlist": _watchlist_facts}
+          "watchlist": _watchlist_facts, "vehicle": _vehicle_facts}
 
 
 def _entity_action(m: retrieval.EntityMatch) -> dict:
@@ -402,6 +438,9 @@ def _entity_action(m: retrieval.EntityMatch) -> dict:
         return {"label": f"Open {m.id}", "view": "registry", "query": m.id}
     if m.kind == "zone":
         return {"label": "Open zones", "view": "zones"}
+    if m.kind == "vehicle":
+        return {"label": f"Open detection {m.id}", "view": "detections",
+                "query": m.id}
     return {"label": f"Trace {m.label}", "view": "route", "query": m.label}
 
 
@@ -416,7 +455,8 @@ def _search(q: str) -> dict:
     matches = retrieval.resolve(query, limit=5, ignore=INTENT_VOCAB)
     if not matches:
         return _answer(
-            f"Nothing in the camera registry, the zone rules or the watchlist "
+            f"Nothing in the camera registry, the zone rules, the watchlist "
+            f"or the described vehicles "
             f"matches '{query}' closely enough for me to be sure what you "
             f"meant, and guessing would be worse than saying so. A camera id, "
             f"a place name or a registration number will find it.",
@@ -657,7 +697,7 @@ def _self_check() -> None:
     # Resolution decides which row is queried, never what it contains: every
     # fact function reads from the database and none of them is reachable
     # without an id that the index actually holds.
-    assert set(_FACTS) == {"camera", "zone", "watchlist"}
+    assert set(_FACTS) == {"camera", "zone", "watchlist", "vehicle"}
 
     # The honesty constraint on a scoped answer: it must name the entity and
     # mark it as inferred, so a wrong substitution is visible.

@@ -252,3 +252,39 @@ class MinedJourney(Base):
     note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
                                                  default=_utcnow, index=True)
+
+
+class VehicleAttributeRow(Base):
+    """A vision-language description of one detection's evidence crop.
+
+    One row per detection at most: the caption describes that crop, and
+    re-describing it would only re-derive the same words at GPU cost. Kept
+    beside the detection rather than on it because most detections never get
+    one - extraction is tiered, so this table is sparse by design.
+
+    Every structured field is parsed from `raw_caption`, which is stored so an
+    operator (or a court) can see exactly what the model said before the
+    keyword parser reduced it. A description is evidence, not identification.
+    """
+    __tablename__ = "vehicle_attributes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    detection_id: Mapped[int] = mapped_column(
+        ForeignKey("detections.id"), unique=True, index=True)
+
+    body_type: Mapped[str] = mapped_column(String(16), default="unknown", index=True)
+    colour: Mapped[str | None] = mapped_column(String(16), index=True)
+    tinted_windows: Mapped[bool | None] = mapped_column(Boolean)
+    wheels: Mapped[str] = mapped_column(String(16), default="unknown")
+    roof_rack: Mapped[bool | None] = mapped_column(Boolean)
+    markings: Mapped[list] = mapped_column(JSON, default=list)
+    damage: Mapped[list] = mapped_column(JSON, default=list)
+
+    description: Mapped[str] = mapped_column(Text, default="")
+    raw_caption: Mapped[str] = mapped_column(Text, default="")
+    model: Mapped[str] = mapped_column(String(64), default="")
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    #: how this row came to exist: alert | zone | operator | escalated
+    source: Mapped[str] = mapped_column(String(16), default="operator")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                 default=_utcnow, index=True)

@@ -18,7 +18,8 @@ from netra.analytics.inference import InferenceEngine
 from netra.analytics.matching import WatchlistIndex, score_match
 from netra.core.db import SessionLocal
 from netra.core.models import (Alert, Camera, Detection, TrafficStat,
-                               WatchlistEntry, ZoneEventRow, ZoneRule)
+                               VehicleAttributeRow, WatchlistEntry,
+                               ZoneEventRow, ZoneRule)
 from netra.core.notify import NOTIFIER
 from netra.ingest.stream import IngestSupervisor
 
@@ -27,6 +28,18 @@ log = logging.getLogger(__name__)
 #: Detections are persisted in batches rather than one transaction each.
 WRITE_BATCH_SIZE = 50
 WRITE_INTERVAL_S = 1.0
+
+#: How long after an alert a description may still be pushed to the console as
+#: a live update. Past this the operator has already read and acted on the
+#: alert card, so an arriving caption is noise on the wire; the row is still
+#: persisted and the console fetches it on demand.
+ATTRIBUTE_BROADCAST_BOUND_S = 3.0
+
+#: How long after an alert a description may still be pushed to the console as
+#: a live update. Past this the operator has already read and acted on the
+#: alert card, so an arriving caption is noise on the wire; the row is still
+#: persisted and the console fetches it on demand.
+ATTRIBUTE_BROADCAST_BOUND_S = 3.0
 
 
 class Pipeline:
@@ -68,6 +81,34 @@ class Pipeline:
         self.engine.on_zone_event = self._handle_zone_event
         self._last_traffic_flush = 0.0
 
+        # Vision-language descriptions run on their own daemon thread behind a
+        # bounded queue that drops when full. Detection is the primary duty and
+        # a caption costs roughly a second of GPU, so this must never be able
+        # to apply back-pressure to inference or to the writer: the measured
+        # precedent is unbounded overlay OCR, which cost 71% of frames.
+        self._attr_queue: queue.Queue = queue.Queue(
+            maxsize=config.ATTRIBUTE_QUEUE_SIZE)
+        self._attr_stop = threading.Event()
+        self._attr_thread: threading.Thread | None = None
+        #: camera_id -> monotonic time of its last opportunistic description
+        self._attr_last: dict[str, float] = {}
+        self.attribute_stats = {"queued": 0, "processed": 0, "dropped": 0,
+                                "failed": 0, "broadcast": 0}
+
+        # Vision-language descriptions run on their own daemon thread behind a
+        # bounded queue that drops when full. Detection is the primary duty and
+        # a caption costs roughly a second of GPU, so this must never be able
+        # to apply back-pressure to inference or to the writer: the measured
+        # precedent is unbounded overlay OCR, which cost 71% of frames.
+        self._attr_queue: queue.Queue = queue.Queue(
+            maxsize=config.ATTRIBUTE_QUEUE_SIZE)
+        self._attr_stop = threading.Event()
+        self._attr_thread: threading.Thread | None = None
+        #: camera_id -> monotonic time of its last opportunistic description
+        self._attr_last: dict[str, float] = {}
+        self.attribute_stats = {"queued": 0, "processed": 0, "dropped": 0,
+                                "failed": 0, "broadcast": 0}
+
     # -- lifecycle -----------------------------------------------------------
     def start(self, camera_ids: list[str] | None = None,
               source_specs: dict | None = None) -> None:
@@ -91,6 +132,12 @@ class Pipeline:
         self._writer = threading.Thread(target=self._writer_loop,
                                         name="detection-writer", daemon=True)
         self._writer.start()
+        if config.ATTRIBUTES_ENABLED:
+            self._attr_stop.clear()
+            self._attr_thread = threading.Thread(
+                target=self._attribute_loop, name="attribute-worker",
+                daemon=True)
+            self._attr_thread.start()
         self.supervisor.start(ids, source_specs)
         self.running = True
         self.started_at = datetime.now(timezone.utc)
@@ -102,6 +149,11 @@ class Pipeline:
         self._stop_writer.set()
         if self._writer:
             self._writer.join(timeout=15)
+        # Enrichment is abandoned rather than drained: an operator stopping the
+        # pipeline is not waiting on a caption.
+        self._attr_stop.set()
+        if self._attr_thread:
+            self._attr_thread.join(timeout=5)
         self.running = False
 
     def _load_zone_rules(self) -> None:
@@ -161,9 +213,10 @@ class Pipeline:
             db.add(row)
             db.commit()
             db.refresh(row)
+            row_id = row.id
             payload = {
                 "kind": "zone",
-                "id": row.id,
+                "id": row_id,
                 "camera_id": event.camera_id,
                 "zone": event.zone.name,
                 "rule": event.rule,
@@ -178,6 +231,13 @@ class Pipeline:
         self.stats["zone_events"] += 1
         log.warning("ZONE %s on %s: %s", event.rule, event.camera_id, event.detail)
         self._broadcast(payload)
+        # After the broadcast, for the same reason as on the alert path. A zone
+        # event has no detection row to key attributes to - the evidence is a
+        # whole frame rather than one vehicle - so the description is pushed to
+        # the console if it is ready in time, and not stored.
+        self._submit_attributes(None, evidence_path, "zone",
+                                alert={"zone_event_id": row_id,
+                                       "camera_id": event.camera_id})
         NOTIFIER.submit({**payload, "plate_watchlist": event.zone.name,
                          "plate_observed": event.detail,
                          "match_type": event.rule, "score": 1.0,
@@ -317,6 +377,111 @@ class Pipeline:
             if det.plate_text:
                 self._check_watchlist(detection_id, det)
 
+        self._queue_escalated_attributes(rows)
+
+    # -- vehicle attributes --------------------------------------------------
+    def _queue_escalated_attributes(self, rows: list) -> None:
+        """Describe the largest vehicle on each escalated camera, rarely.
+
+        Tiering, again: a camera is escalated because it has traffic worth
+        resolving, so it is the one place an unrequested description is worth
+        anything - and even there, at most once per
+        ATTRIBUTE_ESCALATED_INTERVAL_S, on the biggest crop, which is the only
+        one large enough for a captioner to say anything true about.
+
+        Runs on the writer thread but only ever enqueues, so its whole cost is
+        a dictionary lookup and a `put_nowait`.
+        """
+        if not config.ATTRIBUTES_ENABLED or not rows:
+            return
+        try:
+            escalated = set(self.supervisor.scheduling().get("escalated", []))
+        except Exception:
+            return
+        if not escalated:
+            return
+
+        now = time.monotonic()
+        biggest: dict[str, object] = {}
+        for row in rows:
+            if row.camera_id not in escalated or not row.evidence_path:
+                continue
+            if now - self._attr_last.get(row.camera_id, 0.0) < \
+                    config.ATTRIBUTE_ESCALATED_INTERVAL_S:
+                continue
+            best = biggest.get(row.camera_id)
+            if best is None or _bbox_area(row.bbox) > _bbox_area(best.bbox):
+                biggest[row.camera_id] = row
+
+        for camera_id, row in biggest.items():
+            # Stamped on the attempt, not on the completion: a camera whose
+            # crop is dropped by a full queue must still wait its interval, or
+            # a busy camera would retry on every single flush.
+            self._attr_last[camera_id] = now
+            self._submit_attributes(row.id, row.evidence_path, "escalated")
+
+    def _submit_attributes(self, detection_id, evidence_path,
+                           source: str, alert: dict | None = None) -> bool:
+        """Hand a crop to the attribute worker. Never blocks, may drop."""
+        if not config.ATTRIBUTES_ENABLED or not evidence_path:
+            return False
+        job = {"detection_id": detection_id, "evidence_path": evidence_path,
+               "source": source, "alert": alert, "at": time.monotonic()}
+        try:
+            self._attr_queue.put_nowait(job)
+        except queue.Full:
+            # Dropping is the designed behaviour, but silent dropping is not:
+            # an operator seeing no descriptions deserves to find the count.
+            self.attribute_stats["dropped"] += 1
+            return False
+        self.attribute_stats["queued"] += 1
+        return True
+
+    def _attribute_loop(self) -> None:
+        """Describe queued crops off every other thread, forever."""
+        while not self._attr_stop.is_set():
+            try:
+                job = self._attr_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                self._describe_job(job)
+            except Exception:
+                self.attribute_stats["failed"] += 1
+                log.exception("attribute extraction failed for detection %s",
+                              job.get("detection_id"))
+
+    def _describe_job(self, job: dict) -> None:
+        from netra.analytics import attributes as attrs
+
+        path = evidence_file(job["evidence_path"])
+        if path is None:
+            self.attribute_stats["failed"] += 1
+            return
+        result = attrs.describe_image_file(path)
+        self.attribute_stats["processed"] += 1
+        if not result.raw_caption:
+            # The extractor degraded rather than described. Nothing is stored:
+            # a row saying "unknown" would be indistinguishable from a caption
+            # that genuinely found nothing to say.
+            self.attribute_stats["failed"] += 1
+            return
+
+        if job["detection_id"] is not None:
+            store_attributes(job["detection_id"], result, job["source"])
+
+        # A description that arrives while the operator is still looking at the
+        # alert is worth pushing; one that arrives later is not, and the
+        # console fetches it from the stored row instead.
+        if job.get("alert") is not None and \
+                time.monotonic() - job["at"] <= ATTRIBUTE_BROADCAST_BOUND_S:
+            self.attribute_stats["broadcast"] += 1
+            self._broadcast({"kind": "attributes", **job["alert"],
+                             "detection_id": job["detection_id"],
+                             "description": result.description,
+                             "confidence": result.confidence,
+                             "raw_caption": result.raw_caption})
+
     # -- watchlist -----------------------------------------------------------
     def _watchlist(self) -> list[dict]:
         """Cached watchlist. Reloaded periodically rather than per detection."""
@@ -372,8 +537,9 @@ class Pipeline:
             db.add(alert)
             db.commit()
             db.refresh(alert)
+            alert_id = alert.id
             payload = {
-                "id": alert.id,
+                "id": alert_id,
                 "detection_id": detection_id,
                 "camera_id": det.camera_id,
                 "plate_observed": det.plate_text,
@@ -391,6 +557,13 @@ class Pipeline:
                     entry["plate"], det.camera_id, result.match_type, result.score)
         self._broadcast(payload)
         NOTIFIER.submit(payload)
+
+        # Only now: the vehicle already matters, so a description of it is
+        # worth the GPU - but the alert has already reached the console and the
+        # notifier, so nothing about this can delay it.
+        self._submit_attributes(detection_id, _detection_evidence(detection_id),
+                                "alert", alert={"alert_id": alert_id,
+                                                "camera_id": det.camera_id})
 
     # -- push to consoles ----------------------------------------------------
     def subscribe(self) -> queue.Queue:
@@ -430,8 +603,68 @@ class Pipeline:
             # able to see that a camera is no longer being looked at.
             "dark_cameras": self.engine.dark_cameras(),
             "persistence": self.stats,
+            "attributes": {**self.attribute_stats,
+                           "enabled": config.ATTRIBUTES_ENABLED,
+                           "queue_depth": self._attr_queue.qsize()},
             "cameras": self.supervisor.health(),
         }
+
+
+def _bbox_area(bbox) -> int:
+    """Pixel area of an [x1, y1, x2, y2] box, or 0 if it is not one."""
+    try:
+        return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+    except Exception:
+        return 0
+
+
+def evidence_file(evidence_path):
+    """Resolve a stored `/evidence/x.jpg` reference to a path on disk.
+
+    Crops are read back from disk rather than carried through the queue: a
+    decoded frame is megabytes, and holding a queue of them behind a feature
+    that is allowed to be dropped is exactly the memory pressure the bounded
+    queue exists to avoid.
+    """
+    if not evidence_path:
+        return None
+    name = str(evidence_path).replace("\\", "/").rsplit("/", 1)[-1]
+    # Confined to the evidence directory: the reference comes from the
+    # database, but the path it becomes must not be able to leave.
+    if not name or name in (".", ".."):
+        return None
+    path = config.EVIDENCE / name
+    return path if path.exists() else None
+
+
+def _detection_evidence(detection_id: int):
+    with SessionLocal() as db:
+        row = db.get(Detection, detection_id)
+        return row.evidence_path if row else None
+
+
+def store_attributes(detection_id: int, result, source: str) -> dict:
+    """Persist one description against its detection, one row per detection."""
+    with SessionLocal() as db:
+        row = db.query(VehicleAttributeRow).filter(
+            VehicleAttributeRow.detection_id == detection_id).one_or_none()
+        if row is None:
+            row = VehicleAttributeRow(detection_id=detection_id)
+            db.add(row)
+        row.body_type = result.body_type
+        row.colour = result.colour
+        row.tinted_windows = result.tinted_windows
+        row.wheels = result.wheels
+        row.roof_rack = result.roof_rack
+        row.markings = result.markings
+        row.damage = result.damage
+        row.description = result.description
+        row.raw_caption = result.raw_caption
+        row.model = result.model
+        row.confidence = result.confidence
+        row.source = source
+        db.commit()
+    return result.as_dict()
 
 
 PIPELINE = Pipeline()

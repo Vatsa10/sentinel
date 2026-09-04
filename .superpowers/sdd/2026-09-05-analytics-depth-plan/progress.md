@@ -268,3 +268,39 @@ Task 8: minor (deferred, platform-wide): the zone editor loads the still via
   snapshot 401s in the browser while the rest of the console works. Needs a
   cookie session or signed short-lived URL for the console. Belongs to the
   issues sweep after Task 9.
+Task 8: fix round 1/5 (3 addressed, 0 open; commits ddf5225..90600c3).
+  Re-review independently measured max 1 concurrent ffmpeg for 4 cold requests
+  on cam13, and 2 for two different cameras (per-camera lock, not global).
+  Lock releases on exception via `with`; cache re-check inside the lock cannot
+  serve a frame past TTL.
+Task 8: complete (commits 808fdef..90600c3, review clean)
+Task 6: fix round 4/5 landed as 84888d7 (corroborated anchoring; year window
+  tightened; loop cut voids a pending reading). Measured on 4 cameras x 200s:
+  cam13 corroborated to 2026-06-14T07:49:15 from two readings 1.2s apart;
+  cam04's single 0.43-confidence read refused; cam14/cam15 0%.
+Task 6: Ruling: NO cross-camera journey exists in this sandbox. Verdict is a
+  data limitation, not a defect - the miner finds a three-camera journey in
+  synthetic data; on the grid only ~1 camera in 4 has a legible clock and the
+  legible windows do not overlap. The submission states this plainly.
+  Cost if wrong: we forgo one demo moment; we do not fabricate one.
+Task 6: Ruling (carried to the sweep, load-bearing): ~11,000 detections hold
+  pre-fix uncorroborated scene_time values including the 2025 / 2026-06-24 /
+  2028 spans. Route, clone and journey reasoning over the existing store is
+  partly over known-bad timestamps. They must be nulled or re-indexed before
+  any elapsed-time claim is made from this store. Not deleted by the agent.
+Task 6: minor (deferred): corroboration cannot catch a systematic misread
+  (same OCR error twice); only an independent clock could, and none exists.
+Task 6: minor (deferred): clocked-detection coverage fell from 69-100% to
+  0-23% as the price of correctness; the old figures included provably wrong
+  spans. Console viewers must not read the drop as a regression.
+Task 6: round-4 scoped re-review dispatched over 659cf78..84888d7 (the
+  auto-committer split round 4 across 808fdef, 77c2519 and 84888d7).
+Task 9 (VLM attributes): implementer dispatched in parallel with the Task 6
+  reviewer. Ruling: a read-only reviewer is not an implementer, so this does
+  not breach the one-implementer rule; the reviewer was told which files
+  Task 9 may touch. Cost if wrong: the reviewer reads an uncommitted edit in
+  a file it was told to ignore.
+Task 10 (issues sweep) brief written from the 27 deferred/carried ledger
+  items, triaged A (must: uncorroborated scene_time isolation + purge tool,
+  plate vote persistence, console snapshot under auth, tracker-restart class
+  breakdown) / B (should) / C (if time). Gated on Task 9 closing.
