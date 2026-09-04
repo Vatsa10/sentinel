@@ -14,8 +14,11 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import joinedload
 
+from fastapi import Depends, Header
+
 from netra import config
 from netra.analytics.route import build_route
+from netra.core import auth
 from netra.core.db import SessionLocal, init_db
 from netra.core.geo import TIME_GROUPS, time_group
 from netra.core.models import Alert, AuditLog, Camera, Detection, WatchlistEntry
@@ -35,6 +38,12 @@ WEB_DIR = config.ROOT / "netra" / "web"
 def _startup() -> None:
     init_db()
     log.info("database ready at %s", config.DB_URL)
+    if auth.enabled():
+        log.info("access control ENABLED (%d keys configured)",
+                 len(auth.load_keys()))
+    else:
+        log.warning("ACCESS CONTROL DISABLED - every caller is treated as admin. "
+                    "Run 'python run.py --make-keys' before any shared deployment.")
 
 
 def _audit(action: str, target: str | None = None, detail: dict | None = None,
@@ -42,6 +51,24 @@ def _audit(action: str, target: str | None = None, detail: dict | None = None,
     with SessionLocal() as db:
         db.add(AuditLog(actor=actor, action=action, target=target, detail=detail))
         db.commit()
+
+
+def require(permission: str):
+    """Dependency enforcing one permission on an endpoint.
+
+    In open mode (no API keys configured) every caller is admin, so a
+    demonstration needs no credential setup. Configuring any key switches the
+    whole surface to enforced access.
+    """
+    def _check(x_api_key: str | None = Header(default=None)) -> auth.Principal:
+        principal = auth.resolve(x_api_key)
+        if principal is None:
+            raise HTTPException(401, "valid X-API-Key header required")
+        if not principal.may(permission):
+            raise HTTPException(
+                403, f"role '{principal.role}' may not {permission}")
+        return principal
+    return _check
 
 
 # ---------------------------------------------------------------- registry --
@@ -73,7 +100,7 @@ def list_cameras(capability: str | None = None, city: str | None = None):
 
 
 @app.post("/api/cameras/onboard")
-def onboard(probe: bool = True):
+def onboard(probe: bool = True, _p=Depends(require("onboard"))):
     """Re-run registry onboarding: fetch catalogue, probe, profile, persist."""
     from netra.core.registry import onboard_all
     cams = onboard_all(probe=probe)
@@ -213,7 +240,7 @@ def list_watchlist():
 
 
 @app.post("/api/watchlist")
-async def add_watchlist(request: Request):
+async def add_watchlist(request: Request, _p=Depends(require("watchlist"))):
     body = await request.json()
     if not body.get("plate"):
         raise HTTPException(400, "plate is required")
@@ -237,7 +264,7 @@ async def add_watchlist(request: Request):
 
 
 @app.delete("/api/watchlist/{entry_id}")
-def delete_watchlist(entry_id: int):
+def delete_watchlist(entry_id: int, _p=Depends(require("watchlist"))):
     with SessionLocal() as db:
         e = db.get(WatchlistEntry, entry_id)
         if not e:
@@ -279,7 +306,7 @@ def list_alerts(limit: int = Query(50, le=500), acknowledged: bool | None = None
 
 
 @app.post("/api/alerts/{alert_id}/acknowledge")
-def acknowledge(alert_id: int):
+def acknowledge(alert_id: int, _p=Depends(require("acknowledge"))):
     with SessionLocal() as db:
         a = db.get(Alert, alert_id)
         if not a:
@@ -312,7 +339,7 @@ async def alert_socket(ws: WebSocket):
 
 # --------------------------------------------------------------- pipeline --
 @app.post("/api/pipeline/start")
-def pipeline_start(cameras: str | None = None):
+def pipeline_start(cameras: str | None = None, _p=Depends(require("pipeline"))):
     ids = cameras.split(",") if cameras else None
     PIPELINE.start(ids)
     _audit("pipeline.start", detail={"cameras": ids})
@@ -320,7 +347,7 @@ def pipeline_start(cameras: str | None = None):
 
 
 @app.post("/api/pipeline/stop")
-def pipeline_stop():
+def pipeline_stop(_p=Depends(require("pipeline"))):
     PIPELINE.stop()
     _audit("pipeline.stop")
     return {"running": False}
@@ -403,7 +430,7 @@ SAMPLE_WATCHLIST = [
 
 
 @app.post("/api/watchlist/seed")
-def seed_watchlist():
+def seed_watchlist(_p=Depends(require("watchlist"))):
     """Load a representative watchlist for demonstration.
 
     Participants are expected to supply their own watchlist data; these records
@@ -544,7 +571,7 @@ def appearance_track(detection_id: int, min_similarity: float = 0.82):
 
 # --------------------------------------------------------------- own feed --
 @app.post("/api/cameras/own-feed")
-async def register_own_feed(request: Request):
+async def register_own_feed(request: Request, _p=Depends(require("onboard"))):
     """Onboard a local video file as a camera.
 
     Submission requires a demonstration on the participant's own footage as
@@ -584,7 +611,7 @@ async def register_own_feed(request: Request):
 
 
 @app.post("/api/pipeline/start-own-feed")
-def start_own_feed(camera_id: str, loop: bool = True):
+def start_own_feed(camera_id: str, loop: bool = True, _p=Depends(require("pipeline"))):
     """Run the pipeline against a registered own-feed camera."""
     from netra.ingest.sources import SourceSpec
 

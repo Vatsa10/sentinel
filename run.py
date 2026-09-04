@@ -70,12 +70,25 @@ def main() -> int:
     p.add_argument("--check", action="store_true", help="verify environment")
     p.add_argument("--no-probe", action="store_true",
                    help="onboard without probing streams (fast)")
+    p.add_argument("--make-keys", action="store_true",
+                   help="generate API keys for each role and exit")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--host", default="0.0.0.0")
     args = p.parse_args()
 
     if args.check:
         return check()
+
+    if args.make_keys:
+        from netra.core import auth
+        keys = auth.generate_keys()
+        print("API keys written to", auth.KEYS_PATH)
+        for role, key in keys.items():
+            print(f"  {role:<9} {key}")
+        print()
+        print("Send as an X-API-Key header. "
+              "Keep this file out of version control.")
+        return 0
 
     from netra.core.db import init_db
     init_db()

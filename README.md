@@ -20,10 +20,16 @@ watchlist database, and raises real-time alerts on a map-based operator console.
 | Capability | Where |
 |---|---|
 | Camera registry, geography, capability profiling | `netra/core/registry.py` |
+| Source adapters (RTSP / HLS / file) | `netra/ingest/sources.py` |
 | Stream ingestion, PTS timing, reconnection, loop handling | `netra/ingest/stream.py` |
 | Two-tier GPU inference, ANPR, colour extraction | `netra/analytics/inference.py` |
 | Watchlist fusion matching | `netra/analytics/matching.py` |
 | Cross-camera route reconstruction | `netra/analytics/route.py` |
+| Appearance re-identification | `netra/analytics/reid.py` |
+| Scene-time recovery from overlays | `netra/analytics/scene_clock.py` |
+| Email and webhook alerting | `netra/core/notify.py` |
+| Role-based access control | `netra/core/auth.py` |
+| Control-room assistant | `netra/api/assistant.py` |
 | Pipeline wiring, alerting | `netra/pipeline.py` |
 | REST + WebSocket API | `netra/api/app.py` |
 | Operator console | `netra/web/` |
@@ -75,6 +81,46 @@ SQLite is the default so the stack runs with no external services. The data
 layer is SQLAlchemy throughout, so pointing `NETRA_DB` at PostgreSQL/PostGIS
 requires no code change.
 
+### Access control
+
+The platform runs open by default so a demonstration needs no credential setup,
+and warns loudly at startup that it is doing so. Generating keys switches the
+entire surface to enforced access:
+
+```bash
+python run.py --make-keys      # writes data/api_keys.json, prints one key per role
+```
+
+| Role | May |
+|---|---|
+| `viewer` | Read cameras, detections, alerts, traces |
+| `operator` | Viewer, plus acknowledging alerts and maintaining the watchlist |
+| `admin` | Operator, plus onboarding cameras and controlling the pipeline |
+
+Send the key as an `X-API-Key` header. Keys are never logged; only the role and
+a short fingerprint reach the audit trail.
+
+### Outward alerting
+
+Set `NETRA_NOTIFY=1` with SMTP settings (`NETRA_SMTP_HOST`, `NETRA_MAIL_TO`, …)
+or `NETRA_WEBHOOK` to deliver alerts beyond the console. Severity gating
+(`NETRA_NOTIFY_MIN`) and repeat suppression (`NETRA_NOTIFY_COOLDOWN`) keep the
+channel readable: a vehicle dwelling in view produces one notification, not one
+per frame.
+
+### Demonstrating on your own footage
+
+The Government grid cannot exercise plate recognition (see below), so ANPR is
+demonstrated on supplied video:
+
+```bash
+curl -X POST localhost:8080/api/cameras/own-feed   -H "Content-Type: application/json"   -d '{"path":"/absolute/path/to/video.mp4","camera_id":"own001"}'
+curl -X POST "localhost:8080/api/pipeline/start-own-feed?camera_id=own001"
+```
+
+The file runs through the identical adapter, detection, matching and alerting
+path as a live camera.
+
 ---
 
 ## Design decisions worth knowing
@@ -98,6 +144,19 @@ scored on four independent signals — exact plate, partial plate, appearance,
 and space-time feasibility — and fused, with the per-signal reasoning stored on
 every alert so an operator can see why the system believes what it believes.
 Appearance alone never raises an alert: two silver hatchbacks are not evidence.
+
+**Vehicles are followed by appearance, not only by plate.** Measured over 2,691
+frames on the three best-positioned grid cameras, 200+ detected vehicles yielded
+no readable plate at all. Every detection therefore carries a 512-dimension
+appearance embedding, and cross-camera tracing works without OCR. Results are
+ranked candidates for operator confirmation, never identification.
+
+**Scene time is recovered from the burned-in overlay.** The grid replays
+recordings, so capture time cannot order sightings across cameras. The overlay
+is read once per connection and carried forward on PTS. Readings below a
+confidence floor or outside a plausible recording year are rejected - an early
+misread produced the year 0921 and would have mis-timed every sighting on that
+camera.
 
 **Capability profiling drives everything.** The grid supplies only `{id, name}`,
 so codec, resolution, geography and usable signal quality are all discovered by
