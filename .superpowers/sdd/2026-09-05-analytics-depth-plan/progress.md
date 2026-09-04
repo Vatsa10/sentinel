@@ -243,3 +243,14 @@ Task 8: minor (deferred, cross-task): plate_vote's voter_count is computed but
 Task 8: minor (deferred): /api/detections was not serialising track_id or
   scene_time despite the columns existing — fixed in this task, noted here so
   the final review knows it was a latent gap from Task 3/6, not new scope.
+Task 8: review spec OK (8a-8d). XSS audit: every API-sourced interpolation
+  escaped; a real injection (<img onerror> as a zone name, attribute breakout
+  in classes) rendered inert. Shape verification: every field the JS reads
+  exists in the live JSON. Quality: Approved with 2 Important.
+Task 8: fix round 1 dispatched — Important 1 (no in-flight de-duplication on
+  the cold snapshot grab; N clicks = N 17-second ffmpeg processes on a 40-thread
+  pool) and Important 2 (the expensive snapshot GET carries no require()),
+  plus Minor (delZone(${z.id}) not esc()'d).
+Task 8: minor (deferred): snapshot cache never age-evicts (~10 MB steady state
+  at 30 cameras); UI cannot force refresh=true within the TTL; Traffic tab is
+  refresh-on-demand, not auto-polled.
