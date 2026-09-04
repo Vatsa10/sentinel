@@ -50,6 +50,51 @@ _DIGIT_LAYOUTS = {
 }
 
 
+# A parsed date must be a real recording date, not merely a valid datetime.
+# Without this, an OCR misread like "0921-05-16" is accepted and silently
+# corrupts every downstream correlation - observed on cam04 at confidence 0.02.
+MIN_PLAUSIBLE_YEAR = 2015
+MAX_PLAUSIBLE_YEAR = 2035
+
+#: OCR readings below this confidence are discarded. No scene time is better
+#: than a wrong one: an incorrect anchor mis-times every sighting on a camera.
+MIN_OCR_CONFIDENCE = 0.25
+
+
+def is_plausible(when: datetime | None) -> bool:
+    return bool(when) and MIN_PLAUSIBLE_YEAR <= when.year <= MAX_PLAUSIBLE_YEAR
+
+
+#: Fraction of frame height searched at the top and bottom edges.
+BAND_FRACTION = 0.14
+#: Overlay glyphs are only a few pixels tall at source scale; upscaling before
+#: OCR is what makes them legible at all.
+UPSCALE = 4.0
+
+# EasyOCR's defaults are tuned for document text. Overlay text is thin,
+# low-contrast and short, so detection thresholds are lowered. Measured over
+# the 30 grid cameras, this tuning together with the binarised variants below
+# raised successful anchoring from 2 cameras to 15.
+_OCR_PARAMS = dict(allowlist="0123456789:/-APM ", detail=1, paragraph=False,
+                   text_threshold=0.5, low_text=0.3, link_threshold=0.3,
+                   mag_ratio=2.0)
+
+
+def _preprocess(image):
+    """Yield the variants of one crop that OCR is tried against.
+
+    Overlays on this grid appear as both light-on-dark and dark-on-light, and
+    are usually near-white or near-black against a mid-tone scene. Isolating
+    those extremes recovers text that fails on the greyscale image alone.
+    """
+    import cv2
+    grey = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    yield grey
+    yield cv2.bitwise_not(grey)
+    yield cv2.threshold(grey, 200, 255, cv2.THRESH_BINARY)[1]
+    yield cv2.threshold(grey, 60, 255, cv2.THRESH_BINARY_INV)[1]
+
+
 @dataclass
 class ClockAnchor:
     """Ties one camera's stream clock to real scene time."""
@@ -115,26 +160,32 @@ def read_scene_time(ocr, frame, pts_ms: float, camera_id: str) -> ClockAnchor | 
     if frame is None or getattr(frame, "size", 0) == 0:
         return None
     h, w = frame.shape[:2]
-    strips = [frame[0:int(h * 0.10), :], frame[int(h * 0.90):h, :]]
-
     best: tuple[datetime, float] | None = None
-    for strip in strips:
-        if strip.size == 0:
+
+    for band in (frame[0:int(h * BAND_FRACTION), :],
+                 frame[int(h * (1 - BAND_FRACTION)):h, :]):
+        if band.size == 0:
             continue
-        # Overlay glyphs are small; upscaling materially improves the read.
-        scale = max(1.0, 90 / max(strip.shape[0], 1))
-        big = cv2.resize(strip, None, fx=scale, fy=scale,
-                         interpolation=cv2.INTER_CUBIC)
-        grey = cv2.cvtColor(big, cv2.COLOR_BGR2GRAY)
-        try:
-            results = ocr.readtext(grey, allowlist="0123456789:/-APM ",
-                                   detail=1, paragraph=False)
-        except Exception:
-            continue
-        for _box, text, conf in results:
-            parsed = parse_overlay(text)
-            if parsed and (best is None or conf > best[1]):
-                best = (parsed, float(conf))
+        bh, bw = band.shape[:2]
+        # Overlays sit in a corner, so the halves are searched separately
+        # rather than passing a 1920px-wide strip through OCR.
+        for piece in (band[:, 0:int(bw * 0.55)], band[:, int(bw * 0.45):bw]):
+            if piece.size == 0:
+                continue
+            big = cv2.resize(piece, None, fx=UPSCALE, fy=UPSCALE,
+                             interpolation=cv2.INTER_CUBIC)
+            for variant in _preprocess(big):
+                try:
+                    results = ocr.readtext(variant, **_OCR_PARAMS)
+                except Exception:
+                    continue
+                for _box, text, conf in results:
+                    conf = float(conf)
+                    if conf < MIN_OCR_CONFIDENCE:
+                        continue
+                    parsed = parse_overlay(text)
+                    if is_plausible(parsed) and (best is None or conf > best[1]):
+                        best = (parsed, conf)
 
     if best is None:
         return None
@@ -170,6 +221,13 @@ def _self_check() -> None:
     assert parse_overlay("") is None
     assert parse_overlay("DELIGHT P1 RLVD") is None
     assert parse_overlay("99-99-2026 99:99:99") is None
+
+    # A syntactically valid but impossible recording date must be rejected.
+    # cam04 produced exactly this at confidence 0.02 and it would otherwise
+    # have mis-timed every sighting on that camera.
+    assert not is_plausible(parse_overlay("16-05-0921 20:11:34"))
+    assert is_plausible(parse_overlay("13-06-2026 23:22:47"))
+    assert not is_plausible(None)
 
     # PTS carries the clock forward from the anchor.
     anchor = ClockAnchor("cam04", datetime(2026, 6, 13, 23, 22, 47,
