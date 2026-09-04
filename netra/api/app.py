@@ -632,7 +632,12 @@ def start_own_feed(camera_id: str, loop: bool = True, _p=Depends(require("pipeli
 async def assistant(request: Request):
     """Answer an operational question from live platform state."""
     from netra.api.assistant import ask
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "request body must be JSON: {\"question\": \"...\"}")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be a JSON object")
     question = (body.get("question") or "").strip()
     result = ask(question)
     _audit("assistant.ask", target=question[:120])

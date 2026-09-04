@@ -28,6 +28,27 @@ from netra import config
 
 log = logging.getLogger(__name__)
 
+#: How many frames to spend looking for a timestamp overlay before accepting
+#: that a camera has none. Roughly half the grid has no legible overlay.
+CLOCK_ATTEMPT_LIMIT = 4
+
+#: Minimum crop height worth embedding. Below this an appearance vector cannot
+#: distinguish one vehicle from another, so it is cost without information.
+REID_MIN_CROP_PX = 64
+#: Cap on embeddings per frame. Busy junction cameras routinely show 20+
+#: vehicles; embedding every one saturates the queue and starves detection,
+#: which matters more. Largest vehicles are embedded first.
+REID_MAX_PER_FRAME = 8
+
+#: Minimum vehicle height before a plate read is even attempted. A plate on a
+#: vehicle smaller than this spans a handful of pixels and cannot be resolved,
+#: so the OCR call is pure cost. Measured on this grid, no plate was readable
+#: on any vehicle at all - see docs/feed-recon-findings.md.
+PLATE_MIN_VEHICLE_PX = 110
+#: Cap on plate reads per frame. OCR is the most expensive operation in the
+#: pipeline at roughly 50ms per vehicle.
+PLATE_MAX_PER_FRAME = 4
+
 
 @dataclass
 class VehicleDetection:
@@ -104,6 +125,8 @@ class InferenceEngine:
         self._reid = None
         #: camera_id -> ClockAnchor, tying each stream to real scene time
         self._clocks: dict = {}
+        #: how many overlay reads have been attempted per camera
+        self._clock_attempts: dict = {}
 
         self.stats = {"submitted": 0, "dropped": 0, "processed": 0,
                       "vehicles": 0, "plates": 0, "embedded": 0,
@@ -183,22 +206,47 @@ class InferenceEngine:
         describes this stream and must be read again.
         """
         self._clocks.pop(camera_id, None)
+        self._clock_attempts.pop(camera_id, None)
 
     def _anchor_clock(self, frame) -> None:
-        """Read the burned-in timestamp once per connection, then extrapolate."""
-        if self._ocr is None or frame.camera_id in self._clocks:
+        """Read the burned-in timestamp once per connection, then extrapolate.
+
+        Attempts are capped. Reading an overlay costs several OCR passes over
+        upscaled crops, and about half the cameras on this grid have no legible
+        overlay at all - retrying every frame on those saturates the queue and
+        starves detection, which matters far more than scene time. Measured
+        without the cap: 83% of frames dropped.
+        """
+        cam = frame.camera_id
+        if self._ocr is None or cam in self._clocks:
             return
+        attempts = self._clock_attempts.get(cam, 0)
+        if attempts >= CLOCK_ATTEMPT_LIMIT:
+            return
+
+        # Anchoring costs roughly a second of OCR per attempt. Detection is the
+        # primary duty and must not queue behind it, so scene time is enriched
+        # opportunistically: attempted only while the pipeline has slack, and
+        # skipped whenever frames are backing up. A camera simply anchors a
+        # little later instead of the whole pipeline stalling.
+        if self.queue.qsize() > self.queue.maxsize // 4:
+            return
+
+        self._clock_attempts[cam] = attempts + 1
         from netra.analytics.scene_clock import read_scene_time
         try:
-            anchor = read_scene_time(self._ocr, frame.image, frame.pts_ms,
-                                     frame.camera_id)
+            anchor = read_scene_time(self._ocr, frame.image, frame.pts_ms, cam)
         except Exception:
-            log.debug("scene clock read failed for %s", frame.camera_id,
-                      exc_info=True)
+            log.debug("scene clock read failed for %s", cam, exc_info=True)
             return
+
         if anchor:
-            self._clocks[frame.camera_id] = anchor
+            self._clocks[cam] = anchor
             self.stats["clocks_anchored"] = len(self._clocks)
+        elif self._clock_attempts[cam] >= CLOCK_ATTEMPT_LIMIT:
+            log.info("%s has no legible timestamp overlay after %d attempts; "
+                     "sightings on this camera carry no scene time",
+                     cam, CLOCK_ATTEMPT_LIMIT)
 
     def _process(self, frame) -> None:
         t0 = time.time()
@@ -252,19 +300,37 @@ class InferenceEngine:
 
         self.stats["vehicles"] += len(detections)
 
-        # Embed every vehicle in one batch - far cheaper than one call each.
+        # Embed in one batch - far cheaper than one call each - but only the
+        # vehicles worth embedding. A crop a few dozen pixels tall produces an
+        # appearance vector that cannot distinguish one car from another, so
+        # embedding it both wastes GPU time and pollutes the gallery with
+        # noise that weakens genuine matches. Largest first, capped per frame.
         if self._reid is not None and self._reid.ready and detections:
-            try:
-                vectors = self._reid.encode([d.evidence for d in detections])
-                for det, vec in zip(detections, vectors):
-                    det.embedding = vec.tolist()
-                self.stats["embedded"] = self.stats.get("embedded", 0) + len(detections)
-            except Exception:
-                log.exception("embedding failed")
+            worth = [d for d in detections
+                     if d.evidence is not None
+                     and d.evidence.shape[0] >= REID_MIN_CROP_PX]
+            worth.sort(key=lambda d: -(d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]))
+            worth = worth[:REID_MAX_PER_FRAME]
+            if worth:
+                try:
+                    vectors = self._reid.encode([d.evidence for d in worth])
+                    for det, vec in zip(worth, vectors):
+                        det.embedding = vec.tolist()
+                    self.stats["embedded"] += len(worth)
+                except Exception:
+                    log.exception("embedding failed")
 
-        # Tier 2 only where plate geometry can actually support a read.
+        # Tier 2 only where plate geometry can actually support a read, and
+        # only on vehicles large enough to carry a legible plate. OCR is by far
+        # the most expensive operation here - roughly 50ms per vehicle - so
+        # running it on every detection on a busy junction costs about a second
+        # per frame and starves the whole pipeline. Measured before this limit:
+        # ~2 frames/second processed against ~25 available, 71% dropped.
         if capability == "anpr" and detections:
-            for det in detections:
+            candidates = [d for d in detections
+                          if (d.bbox[3] - d.bbox[1]) >= PLATE_MIN_VEHICLE_PX]
+            candidates.sort(key=lambda d: -(d.bbox[3] - d.bbox[1]))
+            for det in candidates[:PLATE_MAX_PER_FRAME]:
                 self._read_plate(img, det)
 
         if detections and self.on_vehicles_present:

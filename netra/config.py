@@ -87,6 +87,12 @@ TIER1_FPS = float(os.getenv("NETRA_TIER1_FPS", "1.0"))
 TIER2_FPS = float(os.getenv("NETRA_TIER2_FPS", "5.0"))
 # How long a camera stays escalated after its last vehicle sighting (seconds)
 ESCALATION_HOLD_S = float(os.getenv("NETRA_ESCALATION_HOLD", "10.0"))
+# How many cameras may hold a tier-2 slot at once. Tier-2 assumes traffic is
+# intermittent; on busy city junctions every camera wants it continuously and
+# their combined demand exceeds one GPU. Sized so that
+#   MAX_ESCALATED * TIER2_FPS + (cameras - MAX_ESCALATED) * TIER1_FPS
+# stays within measured throughput (~25 fps on an RTX 5050).
+MAX_ESCALATED_CAMERAS = int(os.getenv("NETRA_MAX_ESCALATED", "3"))
 
 # Detection thresholds. Low confidence is deliberate: these are dark, distant,
 # motion-blurred scenes, and a missed vehicle cannot be recovered later while a

@@ -308,15 +308,45 @@ Hardware: NVIDIA RTX 5050 Laptop GPU, 8 GB, CUDA 12.8.
 
 | Measurement | Result |
 |---|---|
-| Inference latency | ~6 ms per 1080p frame (YOLOv8m, 640 px) |
-| Single-stream throughput | ~52 frames/second |
-| Live run | 6/6 cameras connected, 5,846 vehicles detected and embedded in 2 minutes |
-| Frames dropped | 0 |
-| Queue depth under load | stable, 15–28 |
+| Vehicle detection | ~13 ms per 1080p frame at 640 px, ~18 ms at 960 px |
+| Appearance embedding | ~11 ms per frame (8 vehicles) |
+| Colour extraction | ~2 ms per frame (20 vehicles) |
+| Live run, 8 busy Ahmedabad junctions | 8/8 connected, **4,893 vehicles in ~2 minutes** |
+| Frames dropped | **0%** |
+| Inference queue depth | 0–5 |
 | Registry onboarding | 30 cameras probed and profiled in ~35 seconds |
 
-Tier-1 scanning of all 30 cameras requires ~30 fps of capacity against ~52 fps
-measured, leaving headroom for escalation on cameras with traffic.
+### Capacity management
+
+Reaching zero frame loss on eight busy junction cameras required treating GPU
+time as a budget to be allocated, not a resource to be assumed. Four measures,
+each arrived at by measurement rather than estimate:
+
+**Persistence is batched.** Writing each detection in its own transaction, with
+its own evidence JPEG, on the inference thread cost 76% of frames. Detections
+are queued and flushed in batches on a separate thread.
+
+**Expensive analytics are applied only where they can pay off.** Appearance
+embedding is limited to vehicles at least 64 px tall and the eight largest per
+frame; plate reading to vehicles at least 110 px tall and the four largest.
+Below those sizes the operation cannot produce a usable result, so it is cost
+without information - and embedding tiny crops also pollutes the
+re-identification gallery with vectors that weaken genuine matches.
+
+**Tier-2 escalation is admitted, not granted.** Tier-2 assumes traffic is
+intermittent. On city junctions every camera wants it continuously, and their
+combined demand exceeded what one GPU could process: 40 frames/second demanded
+against roughly 25 available. A bounded number of cameras hold a tier-2 slot at
+once; the rest continue at tier-1 and are promoted as slots free. Processing
+fewer cameras properly is worth more than processing all of them badly.
+
+**Scene-time anchoring is opportunistic.** Reading a timestamp overlay costs
+about a second of OCR. Detection is the primary duty, so anchoring is attempted
+only while the queue has slack and skipped whenever frames are backing up. A
+camera anchors a little later instead of the pipeline stalling.
+
+Together these took frame loss on this workload from 71% to 0%, and vehicle
+throughput from 1,646 to 4,893 over the same interval.
 
 ---
 

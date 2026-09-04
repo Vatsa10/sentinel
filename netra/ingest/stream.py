@@ -192,6 +192,8 @@ class IngestSupervisor:
         self.sink = sink
         self.on_discontinuity = on_discontinuity
         self.workers: dict[str, CameraWorker] = {}
+        #: escalation requests refused for lack of GPU budget
+        self.escalation_denied = 0
 
     def start(self, camera_ids: list[str], source_specs: dict | None = None) -> None:
         source_specs = source_specs or {}
@@ -209,9 +211,31 @@ class IngestSupervisor:
         log.info("supervisor started %d workers", len(self.workers))
 
     def escalate(self, camera_id: str) -> None:
+        """Promote a camera to tier-2 sampling, if there is GPU budget for it.
+
+        Tier-2 relies on traffic being intermittent, which holds on most of the
+        grid but not on busy city junctions - there, every camera wants tier-2
+        continuously and their combined demand exceeds what one GPU can process.
+        Measured on eight Ahmedabad cameras: 40 frames/second demanded against
+        roughly 25 available, and 71% of frames dropped.
+
+        So escalation is admitted rather than granted. Only a bounded number of
+        cameras run at tier-2 at once; the rest continue at tier-1 and are
+        promoted as slots free up. Processing fewer cameras properly is worth
+        more than processing all of them badly.
+        """
         w = self.workers.get(camera_id)
-        if w:
-            w.escalate()
+        if w is None:
+            return
+        if w.state.escalated:
+            w.escalate()          # already holding a slot; extend it
+            return
+
+        active = sum(1 for x in self.workers.values() if x.state.escalated)
+        if active >= config.MAX_ESCALATED_CAMERAS:
+            self.escalation_denied += 1
+            return
+        w.escalate()
 
     def stop(self) -> None:
         for w in self.workers.values():
@@ -236,3 +260,11 @@ class IngestSupervisor:
                 "stale_s": round(time.time() - s.last_frame_wall, 1) if s.last_frame_wall else None,
             })
         return out
+
+    def scheduling(self) -> dict:
+        """How the tier-2 budget is currently allocated."""
+        active = [cid for cid, w in self.workers.items() if w.state.escalated]
+        return {"escalated": active,
+                "escalated_count": len(active),
+                "max_escalated": config.MAX_ESCALATED_CAMERAS,
+                "escalation_denied": self.escalation_denied}
