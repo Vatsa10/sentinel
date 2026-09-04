@@ -17,6 +17,7 @@ from sqlalchemy.orm import joinedload
 from fastapi import Depends, Header
 
 from netra import config
+from netra.analytics.loop_index import has_embedding
 from netra.analytics.route import build_route
 from netra.core import auth
 from netra.core.db import SessionLocal, init_db
@@ -479,7 +480,7 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
         qcam = db.get(Camera, query.camera_id)
         others = (db.query(Detection).options(joinedload(Detection.camera))
                   .filter(Detection.id != detection_id,
-                          Detection.embedding.isnot(None)).all())
+                          has_embedding()).all())
 
         scored = []
         for det in others:
@@ -925,15 +926,17 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
     the clock burnt into their frames, so a chain built on scene time is a real
     journey through the Government's own footage rather than a demonstration.
 
-    Served from the mined store, filtered by `min_hops` and `min_similarity`.
-    Those parameters only *re-mine* under `refresh`, because a stricter
-    threshold can change which chains form and not merely which survive; the
-    response says which of the two happened.
+    Mining always runs at the module's own thresholds and stores the full set;
+    `min_hops`, `min_similarity` and `limit` filter what this caller is shown.
+    They deliberately do not change what is mined, because the store is shared
+    and one narrow request must not shrink what every other reader sees.
     """
     import time as _time
 
-    from netra.analytics.loop_index import (exclusion_report, find_journeys,
-                                            persist_journeys, stored_journeys)
+    from netra.analytics.loop_index import (DEFAULT_MIN_SIMILARITY,
+                                            MAX_JOURNEYS, exclusion_report,
+                                            find_journeys, persist_journeys,
+                                            stored_count, stored_journeys)
     from netra.core.geo import TIME_GROUPS
 
     if group not in TIME_GROUPS:
@@ -941,20 +944,26 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
                             detail=f"unknown time group; known groups are "
                                    f"{', '.join(sorted(TIME_GROUPS))}")
 
-    rows = [] if refresh else stored_journeys(group, limit=limit,
-                                              min_hops=min_hops,
-                                              min_similarity=min_similarity)
+    held = stored_count(group)
     last = _journeys_mined_at.get(group, 0.0)
-    cooling = (_time.time() - last) < JOURNEY_REMINE_COOLDOWN_S
-    mined = False
-    if refresh or (not rows and not cooling):
+    waiting = JOURNEY_REMINE_COOLDOWN_S - (_time.time() - last)
+    mined = skipped = False
+
+    if refresh or (not held and waiting <= 0):
         report: dict = {}
-        journeys = find_journeys(group, min_similarity=min_similarity,
-                                 min_hops=min_hops, limit=limit, report=report)
-        persist_journeys(group, journeys, min_similarity=min_similarity)
+        journeys = find_journeys(group, min_similarity=DEFAULT_MIN_SIMILARITY,
+                                 min_hops=2, limit=MAX_JOURNEYS, report=report)
+        persist_journeys(group, journeys,
+                         min_similarity=DEFAULT_MIN_SIMILARITY)
         _journeys_mined_at[group] = _time.time()
-        rows = [j.to_dict() for j in journeys]
+        held = len(journeys)
         mined = True
+    elif not held:
+        skipped = True
+
+    # Always served from the store, so both paths return the identical shape.
+    rows = stored_journeys(group, limit=limit, min_hops=min_hops,
+                           min_similarity=min_similarity)
 
     _audit("analytics.journeys", target=group,
            detail={"journeys": len(rows), "mined": mined})
@@ -963,17 +972,29 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
         "cameras": TIME_GROUPS[group],
         "journeys": rows,
         "count": len(rows),
+        "stored": held,
         "mined_now": mined,
+        "mining_skipped": skipped,
+        "next_mine_in_s": (round(max(0.0, waiting), 1)
+                           if skipped else 0.0),
+        "mined_at_similarity": DEFAULT_MIN_SIMILARITY,
         "filters_applied": {"min_hops": min_hops,
                             "min_similarity": min_similarity,
-                            "applied_by": "mining" if mined else "filter"},
+                            "applied_by": "filter"},
         "index": exclusion_report(group),
         "note": ("Appearance-based candidate journeys for operator "
                  "confirmation, not identifications. Chained on the clock "
                  "recorded in the video, never on capture time, and never "
-                 "across recording sessions. Journeys are mined periodically "
-                 "and served from store; pass refresh=true to re-mine at "
-                 "these thresholds."),
+                 f"across recording sessions. Mined at similarity "
+                 f"{DEFAULT_MIN_SIMILARITY}; your thresholds filter these "
+                 "results rather than re-mining. A stricter threshold can "
+                 "also change which chains form, so pass refresh=true to "
+                 "re-mine. Nothing re-mines on its own once journeys are "
+                 "stored, so detections indexed since the mined_at timestamp "
+                 "are not represented until a refresh."
+                 + (" Mining was skipped: it last ran under the cooldown, so "
+                    "this empty result means not-yet-mined rather than "
+                    "nothing-found." if skipped else "")),
     }
 
 

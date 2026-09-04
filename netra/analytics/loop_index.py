@@ -97,6 +97,12 @@ MAX_HOP_SECONDS = 1800.0
 MAX_CHAIN_HOPS = 12
 MAX_JOURNEY_SECONDS = 3600.0
 
+#: The threshold journeys are always *mined* at. Callers may ask for a stricter
+#: one, but that filters what they are shown; it never re-mines the shared
+#: store at their setting, because one narrow request must not shrink what
+#: every other reader sees.
+DEFAULT_MIN_SIMILARITY = 0.84
+
 #: A journey can never be certain — see the module docstring.
 MAX_CONFIDENCE = 0.95
 
@@ -466,13 +472,24 @@ def find_journeys(time_group: str, min_similarity: float = 0.84,
     """
     if time_group not in TIME_GROUPS:
         return []
-    if detections is None:
+    from_db = detections is None
+    if from_db:
         detections = _load_group_detections(time_group)
 
     usable, excluded = _minable(detections, time_group)
     if report is not None:
-        report.update({"considered": len(usable), "excluded": excluded,
-                       "supplied": len(detections)})
+        report.update({
+            "considered": len(usable), "excluded": excluded,
+            "supplied": len(detections),
+            # Rows read from the database were already filtered in SQL, so the
+            # exclusion counts above describe only what survived that filter -
+            # they are not the whole index. exclusion_report() is. Saying which
+            # population a number describes is the difference between an
+            # honest figure and a misleading one.
+            "population": ("rows already filtered in SQL for scene clock and "
+                           "embedding" if from_db else "the supplied list"),
+            "prefiltered_in_sql": from_db,
+        })
     min_similarity = max(min_similarity, SIMILARITY_THRESHOLD)
 
     used: set[int] = set()
@@ -491,7 +508,7 @@ def find_journeys(time_group: str, min_similarity: float = 0.84,
 
         cursor = i
         truncated = False
-        while len(chain) < MAX_CHAIN_HOPS:
+        while True:
             current = chain[-1]
             current_at = chain_times[-1]
             best = None
@@ -523,6 +540,12 @@ def find_journeys(time_group: str, min_similarity: float = 0.84,
             if best is None:
                 break
             score, j, nxt, nxt_at, leg = best
+            if len(chain) >= MAX_CHAIN_HOPS:
+                # A further hop was available and is being refused, which is
+                # what "truncated" should mean. A chain that simply runs out of
+                # candidates at exactly the ceiling is complete, not cut.
+                truncated = True
+                break
             if (nxt_at - chain_times[0]).total_seconds() > MAX_JOURNEY_SECONDS:
                 # Beyond this the chain is no longer one journey; whatever
                 # follows is a separate claim and must be mined as one.
@@ -534,7 +557,6 @@ def find_journeys(time_group: str, min_similarity: float = 0.84,
             legs.append(leg)
             cursor = j
 
-        truncated = truncated or len(chain) >= MAX_CHAIN_HOPS
         if len(chain) < max(2, min_hops):
             continue
         if len({d.camera_id for d in chain}) < 2:
@@ -570,6 +592,24 @@ def find_journeys(time_group: str, min_similarity: float = 0.84,
     return journeys[:limit]
 
 
+def has_embedding():
+    """SQL for "this detection actually carries an appearance vector".
+
+    `embedding.isnot(None)` is a trap on a JSON column: SQLAlchemy stores a
+    Python None as the JSON literal `null`, which is not SQL NULL, so the
+    obvious filter matches every row. On the live database that is 15,710 rows
+    of `null` counted as usable. Anything comparing embeddings, or counting how
+    many can be compared, must use this instead.
+    """
+    from sqlalchemy import JSON, String, and_, cast
+
+    from netra.core.models import Detection
+    return and_(Detection.embedding.isnot(None),
+                Detection.embedding != JSON.NULL,
+                # An empty vector is stored as `[]` and is equally unusable.
+                cast(Detection.embedding, String) != "[]")
+
+
 def _load_group_detections(group: str) -> list:
     from sqlalchemy.orm import joinedload
 
@@ -583,7 +623,7 @@ def _load_group_detections(group: str) -> list:
         return (db.query(Detection).options(joinedload(Detection.camera))
                 .filter(Detection.camera_id.in_(members),
                         Detection.scene_time.isnot(None),
-                        Detection.embedding.isnot(None))
+                        has_embedding())
                 # Newest first for the cap, matching _minable's tail slice, so
                 # both layers keep the same end of a long index.
                 .order_by(Detection.scene_time.desc())
@@ -592,12 +632,16 @@ def _load_group_detections(group: str) -> list:
 
 # ----------------------------------------------------------- persistence --
 def exclusion_report(group: str) -> dict:
-    """How much of a group's index could not take part in mining, and why.
+    """How much of a group's index cannot take part in mining, and why.
 
     Published rather than kept internal: a reader shown three journeys needs to
     know whether they were drawn from thirty comparable sightings or from three
     thousand of which most had no readable clock. Without that, the journeys
     look like the whole picture when they are a corner of it.
+
+    Every figure below describes the same population — all detections stored
+    for this group's cameras — and the three exclusion counts plus `comparable`
+    sum to it, so the breakdown can be checked rather than trusted.
     """
     from netra.core.db import SessionLocal
     from netra.core.models import Detection
@@ -605,21 +649,26 @@ def exclusion_report(group: str) -> dict:
     members = TIME_GROUPS.get(group, [])
     if not members:
         return {}
+    embedded = has_embedding()
     with SessionLocal() as db:
         base = db.query(Detection).filter(Detection.camera_id.in_(members))
         total = base.count()
         no_clock = base.filter(Detection.scene_time.is_(None)).count()
-        no_embedding = base.filter(Detection.embedding.is_(None)).count()
-        comparable = base.filter(Detection.scene_time.isnot(None),
-                                 Detection.embedding.isnot(None)).count()
+        clocked = base.filter(Detection.scene_time.isnot(None))
+        with_clock = clocked.count()
+        comparable = clocked.filter(embedded).count()
     return {
         "detections_in_group": total,
+        "with_scene_time": with_clock,
         "comparable": comparable,
         "excluded_no_scene_time": no_clock,
-        "excluded_no_embedding": no_embedding,
+        #: counted among the clocked rows only, so the figures reconcile:
+        #: comparable + no_embedding + no_scene_time == detections_in_group
+        "excluded_no_embedding": with_clock - comparable,
         "note": ("A sighting with no scene clock cannot be placed on a "
                  "journey: wall time records when we connected to the loop, "
-                 "not when the vehicle passed."),
+                 "not when the vehicle passed. Counts describe every "
+                 "detection stored for these cameras."),
     }
 
 
@@ -648,6 +697,20 @@ def persist_journeys(group: str, journeys: list[Journey],
                 hops=[asdict(h) for h in j.hops], note=j.note))
         db.commit()
     return len(journeys)
+
+
+def stored_count(group: str) -> int:
+    """How many journeys are stored for a group, before any filtering.
+
+    Lets a caller tell "nothing has been mined yet" from "the filters removed
+    everything", which are different answers to different questions.
+    """
+    from netra.core.db import SessionLocal
+    from netra.core.models import MinedJourney
+
+    with SessionLocal() as db:
+        return (db.query(MinedJourney)
+                .filter(MinedJourney.time_group == group).count())
 
 
 def stored_journeys(group: str, limit: int = MAX_JOURNEYS,
@@ -807,6 +870,31 @@ def _self_check() -> None:
                                                      two_hop.confidence)
     assert all(j.confidence < MAX_CONFIDENCE
                for j in long_j if j.hop_count > 2),         [(j.hop_count, j.confidence) for j in long_j]
+
+    # The JSON-null trap: a Python None in a JSON column is stored as the JSON
+    # literal `null`, not SQL NULL, so `isnot(None)` matches it and every
+    # count built on that filter is wrong. Pinned against an in-memory SQLite
+    # so the honesty figures cannot silently regress. No network, no model.
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from netra.core.db import Base
+    from netra.core.models import Camera, Detection
+
+    mem = create_engine("sqlite://")
+    Base.metadata.create_all(mem)
+    with sessionmaker(bind=mem)() as db:
+        db.add(Camera(id="cam04", name="Paldi Circle"))
+        for emb in (None, [], [0.1, 0.2]):
+            db.add(Detection(camera_id="cam04", pts_ms=1.0, wall_time=t0,
+                             vehicle_class="car", confidence=0.5,
+                             bbox=[1, 2, 3, 4], embedding=emb))
+        db.commit()
+        rows = db.query(Detection)
+        assert rows.count() == 3
+        # The naive filter is the bug: it matches all three.
+        assert rows.filter(Detection.embedding.isnot(None)).count() == 3
+        assert rows.filter(has_embedding()).count() == 1,             rows.filter(has_embedding()).count()
 
     print("loop_index self-check passed")
 

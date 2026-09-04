@@ -220,3 +220,150 @@ git status --porcelain data/  -> empty
 The self-check remains network-free and GPU-free: it constructs synthetic
 detections and numpy vectors and touches neither a source, a model, nor the
 database.
+
+---
+
+# Fix round 2/5
+
+Both new Important issues, all three honesty consequences and both Minors are
+fixed.
+
+## Important A — `embedding.is_(None)` matched nothing
+
+SQLAlchemy stores a Python `None` in a `JSON` column as the JSON literal
+`null`, which is not SQL `NULL`, so `isnot(None)` matched every row and
+`is_(None)` matched none. The surface added last round to make the module
+honest was therefore publishing false numbers.
+
+Added `has_embedding()` in `loop_index.py` — the single criterion anything
+comparing or counting embeddings must use:
+
+```python
+and_(Detection.embedding.isnot(None),
+     Detection.embedding != JSON.NULL,
+     cast(Detection.embedding, String) != "[]")
+```
+
+The `[]` clause is included because `_minable` treats an empty vector as
+unusable too, so the SQL count and the Python filter now agree exactly rather
+than approximately. Applied in `exclusion_report`, in `_load_group_detections`
+(which was spending ~11% of its 4,000-row cap on unusable rows) and in
+`/api/analytics/similar` in `app.py`, which was loading every detection in the
+database including 15,710 with no vector.
+
+Before and after on the live database, `ahmedabad-13jun`:
+
+```
+old: comparable 714, excluded_no_embedding 0
+new: detections_in_group 34083, with_scene_time 714, comparable 634,
+     excluded_no_scene_time 33369, excluded_no_embedding 80
+```
+
+634 is now exactly what the miner reports as usable. The counts reconcile —
+`comparable + excluded_no_embedding + excluded_no_scene_time ==
+detections_in_group` — and the docstring says so, so a reader can check the
+breakdown instead of trusting it.
+
+**Repo-wide grep for the pattern** (`is_(None)` / `isnot(None)`, all `.py`
+outside `.venv`, 19 hits):
+
+- JSON-typed columns — three hits, all `Detection.embedding`, all fixed:
+  `loop_index.py` `_load_group_detections`, `loop_index.py`
+  `exclusion_report` (two counts), `app.py:482` `/api/analytics/similar`.
+- Everything else tests `Detection.plate_text` (String), `evidence_path`
+  (String) or `scene_time` (DateTime) — `app.py` ×4, `assistant.py` ×4,
+  `report.py` ×2, `retention.py` ×2, `verify.py` ×2. None is JSON-typed, so
+  none is affected.
+- **Nothing is left for you to pick up.** No JSON-column `is_(None)` /
+  `isnot(None)` remains in the repo. The other JSON columns named in the
+  brief — `bbox`, `plate_bbox`, `counts_by_class`, `directions`, `reasons`,
+  `classes`, `points`, `detail` — are never tested for NULL in SQL at all.
+
+Pinned by a self-check assertion against an in-memory SQLite holding three
+detections (`None`, `[]`, a real vector): the naive filter returns 3, the fixed
+criterion returns 1. No network, no model, no touch of `data/netra.db`.
+
+## Important B — a narrow refresh destroyed the shared store
+
+Mining now always runs at `DEFAULT_MIN_SIMILARITY = 0.84`, `min_hops=2`,
+`limit=MAX_JOURNEYS`, and persists that full set. `min_hops`, `min_similarity`
+and `limit` from the request filter what that caller is shown and never reach
+`find_journeys` or `persist_journeys`. A `refresh=true&min_hops=9` request can
+no longer leave the default view empty for everyone else.
+
+Verified by patching both functions and issuing `refresh=true&min_hops=9`,
+`refresh=true&limit=1` and `refresh=true&min_similarity=0.98`:
+
+```
+[('find', 0.84, 2, 50), ('persist', 0.84),
+ ('find', 0.84, 2, 50), ('persist', 0.84),
+ ('find', 0.84, 2, 50), ('persist', 0.84)]
+```
+
+The response carries `mined_at_similarity` and states that the caller's
+thresholds filtered rather than re-mined, and that a stricter threshold can
+change which chains *form*, so a caller who needs that must refresh.
+
+## Honesty consequences
+
+1. **Two populations, labelled.** `find_journeys(report=…)` now records
+   `population` and `prefiltered_in_sql`, because rows read from the database
+   were already filtered in SQL and its exclusion counts therefore describe
+   only the survivors — not the index. The CLI prints the index breakdown and
+   the mining breakdown as separate, labelled lines that reconcile:
+
+   ```
+   index: 34083 detections on these cameras; 33369 have no scene clock;
+          of the 714 that do, 80 have no appearance vector, leaving 634 comparable
+   mining: 634 sightings chained over, from 634 rows (rows already filtered in
+          SQL for scene clock and embedding); dropped here: 0 no clock, 0 no
+          appearance vector, 0 outside the group
+   ```
+
+2. **Cooldown is visible.** The response carries `mining_skipped` and
+   `next_mine_in_s`, and the note says an empty result under the cooldown means
+   not-yet-mined rather than nothing-found. Observed: first request
+   `mined_now: true`; second `mining_skipped: true, next_mine_in_s: 299.8`.
+
+3. **No automatic re-mining is stated.** The note says plainly that nothing
+   re-mines on its own once journeys are stored, so detections indexed since
+   `mined_at` are not represented until a refresh. `stored` is also returned,
+   so a caller can tell "nothing mined yet" from "the filters removed
+   everything".
+
+## Minors
+
+- `truncated` is now set only when a further hop was found and refused. A chain
+  that runs out of candidates at exactly `MAX_CHAIN_HOPS` is complete, not cut.
+- Both paths now serve from `stored_journeys`, so the mined and stored
+  responses are the identical shape and the mined path carries
+  `mined_at_similarity` and `mined_at` like the stored one.
+
+## Commands run
+
+```
+python -m netra.analytics.loop_index   -> loop_index self-check passed
+python -m netra.analytics.reid         -> reid self-check passed
+python -m netra.analytics.route        -> route self-check passed
+python -c "from netra.api.app import app; print('app ok')" -> app ok
+
+python tools/index_loops.py --group ahmedabad-13jun --mine-only
+    index: 34083 detections ... leaving 634 comparable
+    mining: 634 sightings chained over, from 634 rows ...
+
+exclusion_report('ahmedabad-13jun') reconciles: 634 + 80 + 33369 == 34083
+
+refresh with min_hops=9 / limit=1 / min_similarity=0.98 -> mining still called
+    at (0.84, 2, 50) and persisted at 0.84 in all three cases
+
+GET /api/analytics/journeys?group=ahmedabad-13jun  -> mined_now True
+GET (again)                                        -> mining_skipped True,
+                                                      next_mine_in_s 299.8
+
+MinedJourney rows left in data/netra.db after testing: 0
+git status --porcelain data/  -> empty
+```
+
+The self-check remains network-free and GPU-free. Its one database assertion
+runs against an in-memory SQLite it creates itself and never opens
+`data/netra.db`.

@@ -116,15 +116,26 @@ def main() -> int:
     report: dict = {}
     journeys = find_journeys(args.group, min_similarity=args.min_similarity,
                              min_hops=args.min_hops, report=report)
-    excluded = report.get("excluded", {})
-    print(f"  {report.get('considered', 0)} sightings comparable, "
-          f"{excluded.get('no_scene_time', 0)} excluded for no scene clock, "
-          f"{excluded.get('no_embedding', 0)} for no appearance vector, "
-          f"{excluded.get('wrong_group', 0)} outside the group")
+    # Two populations, printed so a reader can tell them apart. The index
+    # figures describe every detection stored for these cameras; the mining
+    # figures describe only the rows that reached the miner, which the database
+    # query has already filtered - printing the miner's "0 excluded for no
+    # scene clock" beside an index where most rows have no clock would read as
+    # a contradiction rather than as two different questions.
     index = exclusion_report(args.group)
     if index:
-        print(f"  index holds {index['detections_in_group']} detections on "
-              f"these cameras, {index['comparable']} of them comparable")
+        print(f"  index: {index['detections_in_group']} detections on these "
+              f"cameras; {index['excluded_no_scene_time']} have no scene "
+              f"clock; of the {index['with_scene_time']} that do, "
+              f"{index['excluded_no_embedding']} have no appearance vector, "
+              f"leaving {index['comparable']} comparable")
+    excluded = report.get("excluded", {})
+    print(f"  mining: {report.get('considered', 0)} sightings chained over, "
+          f"from {report.get('supplied', 0)} rows "
+          f"({report.get('population', 'unknown population')}); dropped here: "
+          f"{excluded.get('no_scene_time', 0)} no clock, "
+          f"{excluded.get('no_embedding', 0)} no appearance vector, "
+          f"{excluded.get('wrong_group', 0)} outside the group")
     if not args.no_persist:
         persist_journeys(args.group, journeys)
     _print_journeys(journeys)
