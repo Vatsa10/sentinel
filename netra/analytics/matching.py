@@ -60,7 +60,10 @@ def plate_similarity(observed: str, target: str) -> tuple[float, str]:
         return 0.0, "no plate text recovered"
 
     if obs == tgt:
-        return 1.0, f"exact plate match ({tgt})"
+        # Report the watchlist plate as written, not the confusion-folded form:
+        # an operator reading "exact match (6J01A81234)" for GJ01AB1234 would
+        # reasonably think the system had matched the wrong vehicle.
+        return 1.0, f"exact plate match ({target})"
 
     # Substring: a partial read that is wholly contained in the target.
     if len(obs) >= 4 and obs in tgt:
@@ -153,8 +156,22 @@ def score_match(detection: dict, entry: dict) -> MatchResult:
 
     fused = WEIGHTS["plate"] * p_score + WEIGHTS["appearance"] * a_score
 
-    # Appearance alone must never raise an alert. Two silver hatchbacks are not
-    # evidence of anything; without plate support this is a lead, not a match.
+    # A registration number identifies a vehicle; colour and class do not.
+    # Without this floor, a fully matched plate scores only 0.60 whenever the
+    # appearance attributes disagree - and on wide night cameras they routinely
+    # do, because colour estimation there is unreliable. Weak appearance
+    # evidence must not be allowed to argue down decisive plate evidence.
+    if p_score >= 0.999:
+        fused = max(fused, 0.95)
+        if a_score < 0.5:
+            reasons["policy"] = {
+                "score": 1.0,
+                "detail": ("plate matched exactly; appearance attributes "
+                           "disagree but do not override a registration number"),
+            }
+
+    # The converse: appearance alone must never raise an alert. Two silver
+    # hatchbacks are not evidence; without plate support this is a lead.
     if p_score == 0.0:
         fused = min(fused, 0.35)
         reasons["policy"] = {
@@ -179,6 +196,18 @@ def _self_check() -> None:
     r = score_match({"plate_text": "GJ01AB1234", "vehicle_class": "car"},
                     {"plate": "GJ01AB1234"})
     assert r.match_type == "exact" and r.is_alert, r
+    # The reason must name the plate as written, not the folded form.
+    assert "GJ01AB1234" in r.reasons["plate"]["detail"], r.reasons
+
+    # An exact plate match must stay decisive even when appearance disagrees.
+    # Observed live: OCR read the plate correctly while colour and class were
+    # misjudged on a night camera, scoring the match down to 0.60.
+    r = score_match({"plate_text": "GJ01AB1234", "vehicle_class": "truck",
+                     "colour": "green"},
+                    {"plate": "GJ01AB1234", "vehicle_class": "car",
+                     "vehicle_colour": "silver"})
+    assert r.score >= 0.95, r
+    assert r.is_alert, r
 
     r = score_match({"plate_text": "GJ0IAB12E4".replace("E", "3"), "vehicle_class": "car"},
                     {"plate": "GJ01AB1234"})

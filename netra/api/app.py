@@ -540,3 +540,61 @@ def appearance_track(detection_id: int, min_similarity: float = 0.82):
             "hop_count": len(hops), "total_km": round(total_km, 2),
             "rejected": [m for m in data["matches"] if not m["plausible"]],
             "method": data["method"], "note": data["note"]}
+
+
+# --------------------------------------------------------------- own feed --
+@app.post("/api/cameras/own-feed")
+async def register_own_feed(request: Request):
+    """Onboard a local video file as a camera.
+
+    Submission requires a demonstration on the participant's own footage as
+    well as on the Government feed. That is not merely a formality here: the
+    Government grid's cameras are wide-area night overviews on which plate
+    recognition is not achievable (see docs/feed-recon-findings.md), so
+    end-to-end ANPR has to be shown on video where plates are resolvable.
+
+    The file is onboarded through the same adapter interface as a live camera,
+    so it runs the identical detection, matching and alerting path.
+    """
+    import os
+    body = await request.json()
+    path = body.get("path")
+    if not path or not os.path.exists(path):
+        raise HTTPException(400, f"video file not found: {path}")
+
+    cam_id = body.get("camera_id") or f"own{abs(hash(path)) % 1000:03d}"
+    with SessionLocal() as db:
+        cam = db.get(Camera, cam_id) or Camera(id=cam_id)
+        cam.name = body.get("name") or f"Own feed - {os.path.basename(path)}"
+        cam.city = body.get("city") or "Participant footage"
+        cam.district = body.get("district") or "Own feed"
+        cam.department = "Participant"
+        cam.lat = body.get("lat")
+        cam.lon = body.get("lon")
+        # Own footage is supplied precisely because plates are resolvable in it.
+        cam.capability = body.get("capability", "anpr")
+        cam.health = "ok"
+        cam.rtsp_url = path
+        db.merge(cam)
+        db.commit()
+
+    _audit("camera.own_feed", target=cam_id, detail={"path": path})
+    return {"camera_id": cam_id, "name": cam.name, "path": path,
+            "capability": cam.capability}
+
+
+@app.post("/api/pipeline/start-own-feed")
+def start_own_feed(camera_id: str, loop: bool = True):
+    """Run the pipeline against a registered own-feed camera."""
+    from netra.ingest.sources import SourceSpec
+
+    with SessionLocal() as db:
+        cam = db.get(Camera, camera_id)
+        if cam is None:
+            raise HTTPException(404, "camera not registered")
+        path = cam.rtsp_url
+
+    spec = SourceSpec(camera_id=camera_id, kind="file", uri=path, loop=loop)
+    PIPELINE.start([camera_id], {camera_id: spec})
+    _audit("pipeline.start_own_feed", target=camera_id)
+    return PIPELINE.status()

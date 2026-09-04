@@ -43,7 +43,11 @@ class Pipeline:
         self.started_at: datetime | None = None
 
     # -- lifecycle -----------------------------------------------------------
-    def start(self, camera_ids: list[str] | None = None) -> None:
+    def start(self, camera_ids: list[str] | None = None,
+              source_specs: dict | None = None) -> None:
+        """Begin processing. `source_specs` overrides how a camera is reached,
+        which is how participant-supplied video files are onboarded alongside
+        live grid cameras."""
         if self.running:
             return
         with SessionLocal() as db:
@@ -56,7 +60,7 @@ class Pipeline:
         self.engine.load()
         self.engine.start()
         NOTIFIER.start()
-        self.supervisor.start(ids)
+        self.supervisor.start(ids, source_specs)
         self.running = True
         self.started_at = datetime.now(timezone.utc)
 
