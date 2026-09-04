@@ -903,13 +903,13 @@ def cloned_plates(min_confidence: float = Query(0.6, ge=0.0, le=0.99),
     }
 
 
-#: Mining is an appearance comparison across a whole indexed recording, so a
-#: console polling this endpoint must not trigger one on every poll. A result
-#: is remembered for this long — including an *empty* result, which is the
-#: expensive case: with nothing stored, every poll would otherwise re-mine and
-#: re-write while detection is running, which is exactly the starvation class
-#: the plan warns about.
-JOURNEY_REMINE_COOLDOWN_S = 300.0
+#: Mining is an appearance comparison across a whole indexed recording, so it
+#: runs at most once per group unprompted and otherwise only on request. What
+#: is recorded here is that a mine *happened*, not what it produced: a group
+#: that legitimately yields no journeys is indistinguishable from one never
+#: mined if only the output is remembered, and it would be re-mined on every
+#: poll for as long as it stayed empty — the starvation class the plan warns
+#: about. Per process, so a restart re-mines once and then settles.
 _journeys_mined_at: dict[str, float] = {}
 
 
@@ -945,11 +945,10 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
                                    f"{', '.join(sorted(TIME_GROUPS))}")
 
     held = stored_count(group)
-    last = _journeys_mined_at.get(group, 0.0)
-    waiting = JOURNEY_REMINE_COOLDOWN_S - (_time.time() - last)
+    mined_before = _journeys_mined_at.get(group)
     mined = skipped = False
 
-    if refresh or (not held and waiting <= 0):
+    if refresh or (not held and mined_before is None):
         report: dict = {}
         journeys = find_journeys(group, min_similarity=DEFAULT_MIN_SIMILARITY,
                                  min_hops=2, limit=MAX_JOURNEYS, report=report)
@@ -959,11 +958,14 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
         held = len(journeys)
         mined = True
     elif not held:
+        # Mined already and found nothing, so this is a real answer rather than
+        # an empty one, and it is not re-derived on every poll.
         skipped = True
 
     # Always served from the store, so both paths return the identical shape.
     rows = stored_journeys(group, limit=limit, min_hops=min_hops,
                            min_similarity=min_similarity)
+    last_mined = _journeys_mined_at.get(group)
 
     _audit("analytics.journeys", target=group,
            detail={"journeys": len(rows), "mined": mined})
@@ -975,8 +977,10 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
         "stored": held,
         "mined_now": mined,
         "mining_skipped": skipped,
-        "next_mine_in_s": (round(max(0.0, waiting), 1)
-                           if skipped else 0.0),
+        "last_mined_at": (datetime.fromtimestamp(last_mined, tz=timezone.utc)
+                          .isoformat() if last_mined else None),
+        #: nothing re-mines on a timer, so there is no next time to report
+        "next_mine": "only on request, with refresh=true",
         "mined_at_similarity": DEFAULT_MIN_SIMILARITY,
         "filters_applied": {"min_hops": min_hops,
                             "min_similarity": min_similarity,
@@ -992,9 +996,10 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
                  "re-mine. Nothing re-mines on its own once journeys are "
                  "stored, so detections indexed since the mined_at timestamp "
                  "are not represented until a refresh."
-                 + (" Mining was skipped: it last ran under the cooldown, so "
-                    "this empty result means not-yet-mined rather than "
-                    "nothing-found." if skipped else "")),
+                 + (" This group has been mined and produced no journeys: "
+                    "that is the answer, not a pending one. Index more "
+                    "cameras of this group, or re-mine with refresh=true."
+                    if skipped else "")),
     }
 
 

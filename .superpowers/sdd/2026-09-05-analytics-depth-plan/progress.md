@@ -175,3 +175,17 @@ Task 6: fix round 2 dispatched — NEW Important A (SQLAlchemy JSON columns
   min_hops=9 left every other reader's default view at 0).
   Plus three honesty consequences and a repo-wide grep for the same JSON-null
   pattern on other JSON columns.
+Task 6: fix round 2/5 (2 Important + 3 honesty + 2 minors addressed, 0 open;
+  commits 04e5517..7695b0c). Re-review independently confirmed the JSON-null
+  grep was complete (only Detection.embedding is ever NULL-tested among JSON
+  columns; a third instance in /api/vehicles/{id}/similar was also fixed,
+  which had been loading 15,710 vectorless rows per call), and that a narrow
+  refresh no longer shrinks the shared store.
+Task 6: Ruling: I ran the real indexing pass and it anchored the scene clock
+  on 0% of 27,000 indexed detections, so no journey can form on real data.
+  Cause is InferenceEngine._anchor_clock's opportunistic queue-slack skip,
+  which is correct for the live path but always fires during indexing because
+  index_camera submits blocking and keeps the queue full. This is load-bearing
+  for the whole task, so it enters the fix loop as round 3 rather than being
+  parked. Cost if wrong: the live path's measured 71%-frame-loss protection
+  must not regress, so the fix must preserve it provably.

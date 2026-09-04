@@ -39,6 +39,27 @@ CLOCK_ATTEMPT_LIMIT = 4
 #: cost would justify doing it any more eagerly.
 CLOCK_REANCHOR_AFTER_S = 900.0
 
+#: Anchoring budget for an offline exhaustive pass over a finite recording.
+#: Far larger than the live limit because the two situations are opposites: a
+#: live camera competes with detection for the same second, an indexing pass
+#: competes with nothing and exists precisely to get this right. Attempts are
+#: spaced INDEX_CLOCK_RETRY_MS apart in *stream* time so the budget is spent
+#: across the recording rather than burnt on its first ten seconds - an overlay
+#: obscured by a passing lorry at the join may be perfectly legible a minute in.
+INDEX_CLOCK_ATTEMPT_LIMIT = 30
+INDEX_CLOCK_RETRY_MS = 20000.0
+
+#: How the engine spends its scene-clock budget.
+#:   opportunistic  live: skip the read whenever frames are backing up, because
+#:                  detection is the primary duty. Measured: without this,
+#:                  83% of frames dropped.
+#:   exhaustive     offline indexing: never skip. An indexing pass feeds frames
+#:                  blocking, so the queue is always full and the opportunistic
+#:                  rule would skip every single attempt - which is exactly
+#:                  what it did, anchoring 0% of 27,000 indexed detections.
+CLOCK_OPPORTUNISTIC = "opportunistic"
+CLOCK_EXHAUSTIVE = "exhaustive"
+
 #: Minimum crop height worth embedding. Below this an appearance vector cannot
 #: distinguish one vehicle from another, so it is cost without information.
 REID_MIN_CROP_PX = 64
@@ -176,6 +197,12 @@ class InferenceEngine:
         self._clocks: dict = {}
         #: how many overlay reads have been attempted per camera
         self._clock_attempts: dict = {}
+        #: stream time of the last overlay attempt per camera, used only by the
+        #: exhaustive policy to space its attempts across the recording
+        self._clock_last_try: dict = {}
+        #: live behaviour is the default and is unchanged; only an offline
+        #: indexing pass sets this to CLOCK_EXHAUSTIVE
+        self.clock_policy: str = CLOCK_OPPORTUNISTIC
         #: per-camera trackers; tracking is what counting, direction, dwell
         #: and zone rules are all built on
         from netra.analytics.tracking import TrackerRegistry
@@ -275,6 +302,7 @@ class InferenceEngine:
         """
         self._clocks.pop(camera_id, None)
         self._clock_attempts.pop(camera_id, None)
+        self._clock_last_try.pop(camera_id, None)
         self.trackers.reset(camera_id)
         self._plate_voters.pop(camera_id, None)
         self._dark_streak.pop(camera_id, None)
@@ -305,16 +333,27 @@ class InferenceEngine:
         if (existing is not None
                 and existing.age_s(frame.pts_ms) < CLOCK_REANCHOR_AFTER_S):
             return
+        exhaustive = self.clock_policy == CLOCK_EXHAUSTIVE
+        limit = INDEX_CLOCK_ATTEMPT_LIMIT if exhaustive else CLOCK_ATTEMPT_LIMIT
         attempts = self._clock_attempts.get(cam, 0)
-        if attempts >= CLOCK_ATTEMPT_LIMIT:
+        if attempts >= limit:
             return
 
+        if exhaustive:
+            # An offline pass over a finite recording has nothing to starve and
+            # every reason to succeed, so it never skips - but it spaces its
+            # attempts through the recording rather than spending the whole
+            # budget on the first frames, where the overlay may be obscured.
+            last_try = self._clock_last_try.get(cam)
+            if last_try is not None and frame.pts_ms - last_try < INDEX_CLOCK_RETRY_MS:
+                return
+            self._clock_last_try[cam] = frame.pts_ms
         # Anchoring costs roughly a second of OCR per attempt. Detection is the
-        # primary duty and must not queue behind it, so scene time is enriched
-        # opportunistically: attempted only while the pipeline has slack, and
-        # skipped whenever frames are backing up. A camera simply anchors a
-        # little later instead of the whole pipeline stalling.
-        if self.queue.qsize() > self.queue.maxsize // 4:
+        # primary duty and must not queue behind it, so on the live path scene
+        # time is enriched opportunistically: attempted only while the pipeline
+        # has slack, and skipped whenever frames are backing up. A camera
+        # simply anchors a little later instead of the whole pipeline stalling.
+        elif self.queue.qsize() > self.queue.maxsize // 4:
             return
 
         self._clock_attempts[cam] = attempts + 1
@@ -332,14 +371,14 @@ class InferenceEngine:
             # reading in turn goes stale.
             self._clock_attempts[cam] = 0
             self.stats["clocks_anchored"] = len(self._clocks)
-        elif self._clock_attempts[cam] >= CLOCK_ATTEMPT_LIMIT:
+        elif self._clock_attempts[cam] >= limit:
             # A failed re-anchor leaves the existing anchor alone: an anchor
             # carrying some drift still times sightings far better than none.
             # The attempt still counts, so a camera whose overlay has become
             # unreadable (night, rain, a moved caption) stops retrying instead
             # of burning OCR on every frame for the rest of the connection.
             log.info("%s has no legible timestamp overlay after %d attempts; "
-                     "%s", cam, CLOCK_ATTEMPT_LIMIT,
+                     "%s", cam, limit,
                      "keeping the existing anchor despite its age" if existing
                      else "sightings on this camera carry no scene time")
 

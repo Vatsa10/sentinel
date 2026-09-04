@@ -39,6 +39,8 @@ import time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 
+from netra.analytics.inference import (CLOCK_EXHAUSTIVE,
+                                       INDEX_CLOCK_RETRY_MS)
 from netra.analytics.matching import spacetime_plausible
 from netra.analytics.reid import SIMILARITY_THRESHOLD, similarity
 from netra.core.geo import TIME_GROUPS, haversine_km
@@ -228,7 +230,17 @@ def index_camera(camera_id: str, engine, max_seconds: float = 900.0,
 
     collected: list = []
     previous_callback = engine.on_detection
+    previous_policy = engine.clock_policy
     engine.on_detection = collected.append
+    # The live path reads the overlay clock only while the queue has slack,
+    # because detection must never queue behind a second of OCR. Indexing feeds
+    # frames blocking, so that queue is always full and the opportunistic rule
+    # skipped every attempt - 27,000 detections indexed with a scene clock on
+    # none of them, and no journey can form without one. An offline pass over a
+    # finite recording has nothing to starve, so it anchors unconditionally.
+    # The live default is untouched; only this pass changes policy, and it is
+    # restored below.
+    engine.clock_policy = CLOCK_EXHAUSTIVE
     # Trackers and clock anchors from any earlier run describe a different pass
     # over the same recording; carrying them in would invent motion across the
     # join point.
@@ -276,6 +288,7 @@ def index_camera(camera_id: str, engine, max_seconds: float = 900.0,
     finally:
         source.release()
         engine.on_detection = previous_callback
+        engine.clock_policy = previous_policy
 
     written = _persist(collected) if persist else 0
     with_scene_time = sum(1 for d in collected if getattr(d, "scene_time", None))
@@ -895,6 +908,45 @@ def _self_check() -> None:
         # The naive filter is the bug: it matches all three.
         assert rows.filter(Detection.embedding.isnot(None)).count() == 3
         assert rows.filter(has_embedding()).count() == 1,             rows.filter(has_embedding()).count()
+
+    # The anchoring policy, pinned in both directions. The live path must still
+    # skip the overlay read when frames are backing up - that rule was added
+    # after a measured 83% frame loss - and the indexing path must not, because
+    # skipping it there anchored 0% of 27,000 detections and no journey can
+    # form without a scene clock. No model is loaded: the OCR object and the
+    # reader are both stubs.
+    from netra.analytics import scene_clock as _sc
+    from netra.analytics.inference import (CLOCK_OPPORTUNISTIC,
+                                           InferenceEngine)
+
+    class FakeFrame:
+        camera_id, image, pts_ms = "cam04", None, 0.0
+
+    engine = InferenceEngine(on_detection=lambda d: None)
+    assert engine.clock_policy == CLOCK_OPPORTUNISTIC, engine.clock_policy
+    engine._ocr = object()  # only its presence is checked before the read
+    for _ in range(engine.queue.maxsize // 4 + 1):
+        engine.queue.put_nowait(None)  # frames backing up
+
+    tried: list = []
+    real_reader = _sc.read_scene_time
+    _sc.read_scene_time = lambda ocr, img, pts, cam: tried.append(cam)
+    try:
+        engine._anchor_clock(FakeFrame())
+        assert tried == [], "the live path must skip the read under load"
+        engine.clock_policy = CLOCK_EXHAUSTIVE
+        engine._anchor_clock(FakeFrame())
+        assert tried == ["cam04"], "indexing must anchor regardless of the queue"
+        # ...but exhaustive attempts are spaced through the recording, so an
+        # immediately following frame does not spend another attempt.
+        engine._anchor_clock(FakeFrame())
+        assert tried == ["cam04"], tried
+        later = FakeFrame()
+        later.pts_ms = INDEX_CLOCK_RETRY_MS + 1
+        engine._anchor_clock(later)
+        assert tried == ["cam04", "cam04"], tried
+    finally:
+        _sc.read_scene_time = real_reader
 
     print("loop_index self-check passed")
 
