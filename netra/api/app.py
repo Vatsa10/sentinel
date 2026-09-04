@@ -766,3 +766,16 @@ def traffic_history(camera_id: str | None = None, limit: int = Query(200, le=100
             "total": r.total, "counts_by_class": r.counts_by_class,
             "directions": r.directions, "mean_dwell_s": r.mean_dwell_s,
         } for r in rows]
+
+
+@app.get("/api/report", response_class=HTMLResponse)
+def output_report(hours: int = Query(24, ge=1, le=720)):
+    """Operational output report, printable to PDF from the browser.
+
+    This is the output report the submission asks for: detected vehicles and
+    plates with timestamps, watchlist matches with their reasoning, zone
+    events, per-camera activity, and the cameras measured as unable to deliver.
+    """
+    from netra.api.report import build_report
+    _audit("report.generate", detail={"hours": hours})
+    return HTMLResponse(build_report(hours=hours))
