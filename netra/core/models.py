@@ -203,7 +203,16 @@ class TrafficStat(Base):
     camera_id: Mapped[str] = mapped_column(ForeignKey("cameras.id"), index=True)
     bucket_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     bucket_seconds: Mapped[int] = mapped_column(Integer, default=60)
+    #: traffic counted *during this bucket*. Baselines learn from this, so it
+    #: must not be cumulative: a monotonically rising figure would make the
+    #: learned "norm" a function of uptime rather than of how busy the road is.
     total: Mapped[int] = mapped_column(Integer, default=0)
+    #: the camera's running total since the tracker was created, kept because a
+    #: sandbox recording loops and an operator still wants the headline figure.
+    cumulative_total: Mapped[int] = mapped_column(Integer, default=0)
+    #: how many times the recording had replayed when this bucket was written,
+    #: so the cumulative figure above can be read honestly.
+    loops_seen: Mapped[int] = mapped_column(Integer, default=0)
     counts_by_class: Mapped[dict] = mapped_column(JSON, default=dict)
     directions: Mapped[dict] = mapped_column(JSON, default=dict)
     mean_dwell_s: Mapped[float] = mapped_column(Float, default=0.0)

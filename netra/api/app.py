@@ -768,9 +768,84 @@ def traffic_history(camera_id: str | None = None, limit: int = Query(200, le=100
         rows = q.order_by(TrafficStat.bucket_start.desc()).limit(limit).all()
         return [{
             "camera_id": r.camera_id, "at": r.bucket_start.isoformat(),
-            "total": r.total, "counts_by_class": r.counts_by_class,
+            # `total` is the traffic during this bucket; `cumulative_total` is
+            # the camera's running figure, which spans every replay of a
+            # looping recording and is only honest read beside `loops_seen`.
+            "total": r.total, "cumulative_total": r.cumulative_total,
+            "loops_seen": r.loops_seen, "counts_by_class": r.counts_by_class,
             "directions": r.directions, "mean_dwell_s": r.mean_dwell_s,
         } for r in rows]
+
+
+# ------------------------------------------------------------- baselines --
+#: History read per baseline request. Learning is bounded rather than
+#: unbounded: an operator refreshing a dashboard must never pull the whole
+#: traffic table and starve the detection threads of the database.
+BASELINE_HISTORY_LIMIT = 5000
+
+
+def _load_baselines(camera_id: str | None, limit: int):
+    from netra.analytics import baseline
+    from netra.core.models import TrafficStat
+    with SessionLocal() as db:
+        q = db.query(TrafficStat)
+        if camera_id:
+            q = q.filter(TrafficStat.camera_id == camera_id)
+        rows = q.order_by(TrafficStat.bucket_start.desc()).limit(limit).all()
+    return baseline.learn(rows), len(rows)
+
+
+@app.get("/api/analytics/baselines")
+def analytics_baselines(camera_id: str | None = None,
+                        limit: int = Query(BASELINE_HISTORY_LIMIT, le=20000),
+                        _p=Depends(require("read"))):
+    """What each camera normally sees, per hour of the day, in UTC.
+
+    Baselines below the sample floor are returned too, marked insufficient:
+    knowing the platform cannot yet judge an hour is itself operational
+    information, and hiding those rows would imply coverage that does not exist.
+    """
+    from netra.analytics import baseline
+    learned, sampled = _load_baselines(camera_id, limit)
+    items = sorted((b.as_dict() for b in learned.values()),
+                   key=lambda b: (b["camera_id"], b["hour"]))
+    ready = sum(1 for b in items if b["sufficient"])
+    return {"buckets_read": sampled, "min_samples": baseline.MIN_SAMPLES,
+            "stdev_floor": baseline.STDEV_FLOOR, "hours_learned": len(items),
+            "hours_judgeable": ready, "baselines": items}
+
+
+@app.get("/api/analytics/anomalies")
+def analytics_anomalies(camera_id: str | None = None,
+                        limit: int = Query(BASELINE_HISTORY_LIMIT, le=20000),
+                        include_normal: bool = False,
+                        _p=Depends(require("read"))):
+    """Current per-camera readings judged against the learned norms.
+
+    The current reading is the most recent completed traffic bucket for each
+    camera, so it is measured the same way the baseline was - comparing a live
+    partial count against full-bucket norms would manufacture false quiets.
+    """
+    from netra.analytics import baseline
+    from netra.core.models import TrafficStat
+    learned, sampled = _load_baselines(camera_id, limit)
+
+    with SessionLocal() as db:
+        q = db.query(TrafficStat)
+        if camera_id:
+            q = q.filter(TrafficStat.camera_id == camera_id)
+        recent = q.order_by(TrafficStat.bucket_start.desc()).limit(limit).all()
+
+    latest: dict[str, object] = {}
+    for r in recent:
+        latest.setdefault(r.camera_id, r)   # rows arrive newest first
+
+    found = baseline.detect_anomalies(learned, list(latest.values()),
+                                      include_normal=include_normal)
+    flagged = [a for a in found if a.anomalous]
+    return {"buckets_read": sampled, "cameras_assessed": len(latest),
+            "anomalies": len(flagged),
+            "assessments": [a.as_dict() for a in found]}
 
 
 # ---------------------------------------------------------------- storage --

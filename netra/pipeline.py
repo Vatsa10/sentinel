@@ -55,6 +55,11 @@ class Pipeline:
         self.stats = {"written": 0, "write_dropped": 0, "zone_events": 0,
                       "traffic_buckets": 0}
 
+        # Counters per camera at the last traffic flush, so each bucket can
+        # record the traffic during it rather than the running total.
+        self._traffic_last_total: dict[str, int] = {}
+        self._traffic_last_counts: dict[str, dict[str, int]] = {}
+
         # Zone rules are evaluated inside the inference engine, where the
         # tracks live; the pipeline supplies the engine and receives events.
         from netra.analytics.zones import ZoneEngine
@@ -180,18 +185,49 @@ class Pipeline:
                                               "detail": event.detail}}})
 
     def flush_traffic_stats(self, bucket_seconds: int = 60) -> int:
-        """Snapshot per-camera traffic counters into a time bucket."""
+        """Snapshot per-camera traffic counters into a time bucket.
+
+        `total` is the traffic counted *during this bucket*, obtained by
+        differencing the tracker's cumulative counter against the value at the
+        previous flush. Writing the cumulative figure here - as this once did -
+        made every row larger than the last, because the sandbox replays a
+        fixed recording and the counter spans every replay. Baselines learned
+        from that would describe uptime, not traffic.
+
+        A bucket with no traffic is still written: "this camera saw nothing"
+        is exactly the observation a quiet-road baseline needs, and dropping it
+        would teach the baseline that the road is never empty.
+        """
         now = datetime.now(timezone.utc)
         written = 0
         with SessionLocal() as db:
             for stats in self.engine.trackers.stats():
-                if not stats["total_counted"]:
-                    continue
+                camera_id = stats["camera_id"]
+                cumulative = stats["total_counted"]
+                previous = self._traffic_last_total.get(camera_id)
+                # A tracker recreated mid-run restarts its counter; treat the
+                # whole of a smaller cumulative as this bucket's traffic rather
+                # than persisting a negative count.
+                delta = cumulative if previous is None or cumulative < previous \
+                    else cumulative - previous
+                self._traffic_last_total[camera_id] = cumulative
+
+                # The class breakdown is cumulative for the same reason, and
+                # is differenced the same way: a bucket whose classes summed to
+                # more than its total would be visibly incoherent to an analyst.
+                counts = stats["counts_by_class"]
+                before = self._traffic_last_counts.get(camera_id, {})
+                by_class = {k: v - before.get(k, 0) for k, v in counts.items()
+                            if v - before.get(k, 0) > 0}
+                self._traffic_last_counts[camera_id] = dict(counts)
+
                 db.add(TrafficStat(
-                    camera_id=stats["camera_id"], bucket_start=now,
+                    camera_id=camera_id, bucket_start=now,
                     bucket_seconds=bucket_seconds,
-                    total=stats["total_counted"],
-                    counts_by_class=stats["counts_by_class"],
+                    total=delta,
+                    cumulative_total=cumulative,
+                    loops_seen=stats["loops_seen"],
+                    counts_by_class=by_class,
                     directions=stats["directions"],
                     mean_dwell_s=stats["mean_dwell_s"]))
                 written += 1

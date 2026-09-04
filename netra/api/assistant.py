@@ -225,20 +225,81 @@ def _coverage(_q: str) -> dict:
         [{"label": "Open map", "view": "map"}])
 
 
+def _unusual(_q: str) -> dict:
+    """Anything abnormal, judged against each camera's own learned norm.
+
+    A control room cannot read seventeen thousand detections. It can read
+    "camera 12 is four times its usual 03:00 traffic", which is what this
+    answers - and, just as importantly, says plainly where the platform has not
+    yet watched a camera long enough to have an opinion.
+    """
+    from netra.analytics import baseline
+    from netra.core.models import TrafficStat
+
+    with SessionLocal() as db:
+        rows = (db.query(TrafficStat)
+                .order_by(TrafficStat.bucket_start.desc()).limit(5000).all())
+
+    if not rows:
+        return _answer(
+            "No traffic history has been recorded yet, so there is no norm to "
+            "compare against. Run the pipeline for a while and ask again.",
+            {"buckets": 0}, [{"label": "Overview", "view": "overview"}])
+
+    learned = baseline.learn(rows)
+    latest: dict = {}
+    for r in rows:
+        latest.setdefault(r.camera_id, r)   # newest first
+    found = baseline.detect_anomalies(learned, list(latest.values()))
+    flagged = [a for a in found if a.anomalous]
+    thin = [a for a in found if a.status == "insufficient_data"]
+
+    data = {"buckets": len(rows), "cameras_assessed": len(latest),
+            "anomalies": len(flagged),
+            "assessments": [a.as_dict() for a in found]}
+    actions = [{"label": "Traffic", "view": "traffic"}]
+
+    if not flagged:
+        text = (f"Nothing unusual. All {len(latest)} cameras with a current "
+                f"reading are within their usual range for this hour.")
+        if thin:
+            text += (f" {len(thin)} camera(s) have fewer than "
+                     f"{baseline.MIN_SAMPLES} observations of this hour, so "
+                     f"they are not being judged at all yet.")
+        return _answer(text, data, actions)
+
+    lead = "; ".join(a.explanation for a in flagged[:3])
+    text = (f"{len(flagged)} of {len(latest)} cameras are outside their normal "
+            f"range for this hour of the day. {lead}")
+    if thin:
+        text += (f" A further {len(thin)} camera(s) have too little history "
+                 f"({baseline.MIN_SAMPLES} observations required) for any "
+                 f"judgement to be honest.")
+    return _answer(text, data, actions)
+
+
 def _help(_q: str) -> dict:
     return _answer(
         "I answer from live platform data. You can ask about camera health and "
         "which cameras are faulty, detection counts, current alerts, the "
         "watchlist, pipeline status, coverage by location, whether any plates look "
-        "cloned, or where a specific registration number has been seen.",
+        "cloned, whether anything looks unusual against each camera's normal "
+        "traffic, or where a specific registration number has been seen.",
         {}, [{"label": "Camera health", "query": "which cameras are down"},
              {"label": "Current alerts", "query": "show me the alerts"},
-             {"label": "Detections", "query": "how many detections"}])
+             {"label": "Detections", "query": "how many detections"},
+             {"label": "Anything unusual", "query": "anything unusual?"}])
 
 
 # Ordered: the first intent whose keywords appear wins, so specific
 # intents must precede general ones.
 INTENTS = [
+    # Ahead of everything else: an operator phrases this question with words
+    # that later intents already claim - "which camera is busier than normal"
+    # contains "camera", "where is it unusual" contains "where" - so placed
+    # lower it would be answered by camera health or the plate trace instead.
+    (("unusual", "abnormal", "anomaly", "anomalies", "out of the ordinary",
+      "baseline", "baselines", "spike", "quieter than", "busier than"), _unusual),
     # Ahead of the trace intent because "find cloned plates" contains "find";
     # a question naming an actual registration number never reaches here, as
     # `ask` routes those to the trace handler before the keyword loop runs.
@@ -259,19 +320,31 @@ INTENTS = [
 # the only source of facts - the model chooses the query, never the answer.
 
 
-def ask(question: str) -> dict:
-    """Route a question to a handler and return a grounded answer."""
+def route(question: str):
+    """Which handler a question resolves to, or None for "I cannot answer".
+
+    Split out from `ask` so routing can be checked without running a handler,
+    and therefore without a database: a wrong route is the failure mode that
+    produces a confidently wrong answer, and it is worth pinning down on its
+    own.
+    """
     if not question or not question.strip():
-        return _help("")
-    q = question.lower().strip()
-
-    # A registration number anywhere in the question is unambiguous intent.
+        return _help
     if PLATE_RE.search(question):
-        return _find_plate(question)
-
+        # A registration number anywhere in the question is unambiguous intent.
+        return _find_plate
+    q = question.lower().strip()
     for keywords, handler in INTENTS:
         if any(k in q for k in keywords):
-            return handler(question)
+            return handler
+    return None
+
+
+def ask(question: str) -> dict:
+    """Route a question to a handler and return a grounded answer."""
+    handler = route(question)
+    if handler is not None:
+        return handler(question)
 
     return _answer(
         "I could not match that to anything I can answer from platform data. "
@@ -305,6 +378,24 @@ def _self_check() -> None:
     assert "clone" in r["answer"].lower(), r
     r = ask("where has GJ01AB1234 been seen?")
     assert "GJ01AB1234" in r["answer"], r
+
+    # The unusual/baseline intent must win over the general handlers whose
+    # keywords a naturally phrased question also contains. Routing is asserted
+    # rather than answered, so this needs no database.
+    for q in ("anything unusual?", "is anything abnormal right now",
+              "show me the anomalies", "which camera is busier than normal",
+              "what does the baseline say"):
+        assert route(q) is _unusual, (q, route(q))
+
+    # ...and the reverse direction: the new intent must not steal questions
+    # belonging to the handlers that were already there.
+    assert route("which cameras are down?") is _camera_health
+    assert route("where has GJ01AB1234 been seen?") is _find_plate
+    assert route("find cloned plates") is _cloned_plates
+    assert route("show me the alerts") is _alert_summary
+    assert route("how many detections") is _detection_summary
+    assert route("is the pipeline running") is _pipeline_status
+    assert route("what is the weather in Ahmedabad tomorrow") is None
 
     # Unknown questions must decline rather than invent an answer.
     r = ask("what is the weather in Ahmedabad tomorrow")
