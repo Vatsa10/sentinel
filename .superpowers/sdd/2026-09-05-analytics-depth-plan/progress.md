@@ -259,3 +259,12 @@ Auto-committer note: 77c2519 "feat: add vision-language model..." is a FALSE
   package, the Task 9 brief, and 17 lines of Task 6's in-flight round-4
   inference.py. The message was invented from the brief's filename. cd29d31
   is ledger-only. Neither is a task commit. Self-checks re-run after the sweep.
+Task 8: fix round 1 landed as 90600c3 (per-camera lock + cache re-check inside
+  the lock; require("read") on the snapshot GET; delZone esc()'d).
+  Implementer measured 4 concurrent cold requests -> exactly 1 ffmpeg.
+  Scoped re-review dispatched.
+Task 8: minor (deferred, platform-wide): the zone editor loads the still via
+  <img src>, which cannot send X-API-Key, so with access control enabled the
+  snapshot 401s in the browser while the rest of the console works. Needs a
+  cookie session or signed short-lived URL for the console. Belongs to the
+  issues sweep after Task 9.
