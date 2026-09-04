@@ -399,10 +399,12 @@ class InferenceEngine:
             result = voter.consensus(det.track_id)
             if result is None:
                 continue
-            text, conf, count = result
-            if count < 2:
-                # Nothing was voted on, so leave this frame's own read alone
-                # rather than restating it as a consensus it is not.
+            text, conf, voters = result
+            if voters < 2:
+                # One voter is not a vote. Either the track has a single read,
+                # or the reads disagreed on length and one was passed through
+                # unvoted. Leave this frame's own read alone rather than
+                # presenting a lone OCR guess as a consensus.
                 continue
             det.plate_text = text
             det.plate_conf = conf

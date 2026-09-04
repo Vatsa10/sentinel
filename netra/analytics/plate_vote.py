@@ -85,8 +85,11 @@ class PlateVoter:
     def consensus(self, track_id: int) -> tuple[str | None, float, int] | None:
         """Vote this track's reads into one plate.
 
-        Returns (text, confidence, observation_count), or None if the track has
-        never produced a usable read.
+        Returns (text, confidence, voter_count), or None if the track has never
+        produced a usable read. `voter_count` is the number of observations
+        that actually contributed to the returned text, not the number held -
+        a caller must be able to tell a real vote from a lone read dressed up
+        as one, so the two fallback paths below both report 1.
         """
         observations = self._obs.get(track_id)
         if not observations:
@@ -117,7 +120,7 @@ class PlateVoter:
             # of. Return the single most confident read rather than inventing a
             # consensus out of reads that never agreed.
             best = max(observations, key=lambda o: o.confidence)
-            return best.text, best.confidence, len(observations)
+            return best.text, best.confidence, 1
 
         chars: list[str] = []
         shares: list[float] = []
@@ -138,7 +141,7 @@ class PlateVoter:
             shares.append(group_conf[winner] / total if total > 0 else 0.0)
 
         confidence = sum(shares) / len(shares) if shares else 0.0
-        return "".join(chars), round(confidence, 4), len(observations)
+        return "".join(chars), round(confidence, 4), len(cohort)
 
     def forget(self, track_id: int) -> None:
         """Drop a track's reads once the tracker has expired it."""
@@ -200,7 +203,18 @@ def _self_check() -> None:
     text, conf, n = v.consensus(4)
     assert text == "GJ01AB1234", text
     assert len(text) == 10, text
-    assert n == 3, n  # all reads counted as observations, only some as voters
+    assert n == 2, n  # only the two same-length reads voted, not all three
+
+    # Two reads of differing lengths mean no vote happened at all. The result
+    # is one read passed through, and it must not be reportable as a
+    # 2-observation consensus - a caller gating on "did enough voters agree"
+    # would otherwise write a lone raw OCR guess out as a voted plate.
+    v = PlateVoter()
+    v.add(41, "GJ01AB1234", 0.6, 0.0)
+    v.add(41, "J01AB1234", 0.9, 100.0)
+    text, conf, n = v.consensus(41)
+    assert n == 1, (text, conf, n)
+    assert text == "J01AB1234" and conf == 0.9, (text, conf)
 
     # Confusion folding groups votes: O and 0 are the same vote, G and 6 too.
     # Two reads of "GJO1AB1234" plus one of "GJ01AB1234" agree everywhere once

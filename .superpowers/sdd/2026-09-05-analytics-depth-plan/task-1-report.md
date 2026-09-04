@@ -86,3 +86,71 @@ enforced oldest-first; unknown track returns `None`; `forget`/`retain`/`reset`.
 - `_vote_plates` is exercised only through the module self-check on
   `PlateVoter`; the inference wiring itself has no runnable check, as
   `_process` needs models and frames. Consistent with the rest of that module.
+
+---
+
+# Fix round 1 - length-mismatch fallback was indistinguishable from a real vote
+
+## The finding
+
+`consensus()` returned `len(observations)` as its third element - the number of
+reads *held*, not the number that actually voted. Two reads of differing
+lengths returned `('J01AB1234', 0.9, 2)`: no vote had occurred, one read was
+passed through, yet the caller's `if count < 2: continue` gate saw a
+2-observation consensus and wrote a lone raw OCR guess onto the detection with
+its own confidence presented as a consensus confidence. That is presenting
+inference as fact, which the plan's Global Constraints forbid.
+
+## The fix
+
+The third element is now **`voter_count`**: the number of observations that
+contributed to the returned text.
+
+- Real vote -> `len(cohort)`, the winning-length cohort only. The three-read
+  differing-length case now reports 2, not 3.
+- Single-read path -> 1 (unchanged).
+- Length-mismatch fallback -> **1**, because exactly one read produced the
+  text. Was `len(observations)`.
+
+The docstring now states this explicitly, so the distinction is part of the
+contract rather than an accident of the return value.
+
+`_vote_plates` unpacks `text, conf, voters` and gates on `voters < 2`, with the
+comment naming both paths that can produce a single voter. A fallback now falls
+through and the detection keeps this frame's own honest read, untouched.
+
+## Covering test
+
+Added to `_self_check()`, pinning the exact case the reviewer verified:
+
+```python
+# Two reads of differing lengths mean no vote happened at all. The result
+# is one read passed through, and it must not be reportable as a
+# 2-observation consensus - a caller gating on "did enough voters agree"
+# would otherwise write a lone raw OCR guess out as a voted plate.
+v = PlateVoter()
+v.add(41, "GJ01AB1234", 0.6, 0.0)
+v.add(41, "J01AB1234", 0.9, 100.0)
+text, conf, n = v.consensus(41)
+assert n == 1, (text, conf, n)
+assert text == "J01AB1234" and conf == 0.9, (text, conf)
+```
+
+The existing differing-length test also tightened from `assert n == 3` to
+`assert n == 2` - only the two same-length reads voted.
+
+## Commands run and output
+
+```
+$ .venv/Scripts/python.exe -m netra.analytics.plate_vote
+plate_vote self-check passed
+
+$ .venv/Scripts/python.exe -c "from netra.analytics.inference import InferenceEngine; print('ok')"
+ok
+```
+
+## Scope
+
+Two files, nothing else touched: `netra/analytics/plate_vote.py` (return value,
+docstring, two self-check assertions) and `netra/analytics/inference.py`
+(unpack and gate on `voters`).
