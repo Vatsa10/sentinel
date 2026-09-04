@@ -24,6 +24,8 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 _ADDED_COLUMNS = [
     ("traffic_stats", "cumulative_total", "INTEGER DEFAULT 0"),
     ("traffic_stats", "loops_seen", "INTEGER DEFAULT 0"),
+    ("mined_journeys", "min_similarity", "REAL DEFAULT 0.84"),
+    ("mined_journeys", "truncated", "BOOLEAN DEFAULT 0"),
 ]
 
 

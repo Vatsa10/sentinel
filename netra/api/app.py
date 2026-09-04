@@ -902,6 +902,16 @@ def cloned_plates(min_confidence: float = Query(0.6, ge=0.0, le=0.99),
     }
 
 
+#: Mining is an appearance comparison across a whole indexed recording, so a
+#: console polling this endpoint must not trigger one on every poll. A result
+#: is remembered for this long — including an *empty* result, which is the
+#: expensive case: with nothing stored, every poll would otherwise re-mine and
+#: re-write while detection is running, which is exactly the starvation class
+#: the plan warns about.
+JOURNEY_REMINE_COOLDOWN_S = 300.0
+_journeys_mined_at: dict[str, float] = {}
+
+
 @app.get("/api/analytics/journeys")
 def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
                    min_similarity: float = Query(0.84, ge=0.5, le=0.99),
@@ -915,11 +925,15 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
     the clock burnt into their frames, so a chain built on scene time is a real
     journey through the Government's own footage rather than a demonstration.
 
-    Served from the mined store; `refresh` re-runs the mining, which is an
-    appearance comparison across the whole index and is not cheap.
+    Served from the mined store, filtered by `min_hops` and `min_similarity`.
+    Those parameters only *re-mine* under `refresh`, because a stricter
+    threshold can change which chains form and not merely which survive; the
+    response says which of the two happened.
     """
-    from netra.analytics.loop_index import (find_journeys, persist_journeys,
-                                            stored_journeys)
+    import time as _time
+
+    from netra.analytics.loop_index import (exclusion_report, find_journeys,
+                                            persist_journeys, stored_journeys)
     from netra.core.geo import TIME_GROUPS
 
     if group not in TIME_GROUPS:
@@ -927,12 +941,18 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
                             detail=f"unknown time group; known groups are "
                                    f"{', '.join(sorted(TIME_GROUPS))}")
 
-    rows = [] if refresh else stored_journeys(group, limit=limit)
+    rows = [] if refresh else stored_journeys(group, limit=limit,
+                                              min_hops=min_hops,
+                                              min_similarity=min_similarity)
+    last = _journeys_mined_at.get(group, 0.0)
+    cooling = (_time.time() - last) < JOURNEY_REMINE_COOLDOWN_S
     mined = False
-    if not rows:
+    if refresh or (not rows and not cooling):
+        report: dict = {}
         journeys = find_journeys(group, min_similarity=min_similarity,
-                                 min_hops=min_hops, limit=limit)
-        persist_journeys(group, journeys)
+                                 min_hops=min_hops, limit=limit, report=report)
+        persist_journeys(group, journeys, min_similarity=min_similarity)
+        _journeys_mined_at[group] = _time.time()
         rows = [j.to_dict() for j in journeys]
         mined = True
 
@@ -944,10 +964,16 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
         "journeys": rows,
         "count": len(rows),
         "mined_now": mined,
+        "filters_applied": {"min_hops": min_hops,
+                            "min_similarity": min_similarity,
+                            "applied_by": "mining" if mined else "filter"},
+        "index": exclusion_report(group),
         "note": ("Appearance-based candidate journeys for operator "
                  "confirmation, not identifications. Chained on the clock "
                  "recorded in the video, never on capture time, and never "
-                 "across recording sessions."),
+                 "across recording sessions. Journeys are mined periodically "
+                 "and served from store; pass refresh=true to re-mine at "
+                 "these thresholds."),
     }
 
 

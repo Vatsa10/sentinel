@@ -240,6 +240,11 @@ class MinedJourney(Base):
     elapsed_s: Mapped[float] = mapped_column(Float, default=0.0)
     mean_similarity: Mapped[float] = mapped_column(Float, default=0.0)
     confidence: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    #: the appearance threshold this journey was mined at, so a later request
+    #: asking for a stricter one can tell whether these rows answer it
+    min_similarity: Mapped[float] = mapped_column(Float, default=0.84)
+    #: the chain was cut at a ceiling rather than ending naturally
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
     #: scene time, not wall time: these bound the journey on the recorded clock
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

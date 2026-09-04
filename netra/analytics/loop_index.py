@@ -69,6 +69,17 @@ READ_FAILURE_LIMIT = 60
 #: scored second is followed down the wrong branch and no backtracking recovers
 #: it. An exhaustive search over an indexed loop is not affordable inside an
 #: API request, and a bounded search that says so is the honest trade.
+#:
+#: A chain is capped at MAX_CHAIN_HOPS sightings and MAX_JOURNEY_SECONDS of
+#: recorded time, and confidence decays with every additional hop. Without
+#: those two ceilings a greedy chain welds itself onward indefinitely — 20,000
+#: synthetic detections produced one 1,500-hop "journey" spanning twelve hours
+#: at maximum confidence, because every individual leg is feasible. On real
+#: footage, where a hundred silver hatchbacks look alike, that is not one
+#: vehicle; it is dozens, presented as overwhelming evidence. The ceiling is
+#: therefore a correctness property, not a performance one, and it is
+#: deliberately tight: beyond a dozen transitive appearance links there is no
+#: honest reading of the chain as one vehicle.
 MAX_MINED_DETECTIONS = 4000
 MAX_CANDIDATES_PER_DETECTION = 8
 #: Rows looked at ahead of a hop before the search gives up on extending it.
@@ -80,8 +91,20 @@ MAX_JOURNEYS = 50
 #: evidence is doing all the work and the space-time check none of it.
 MAX_HOP_SECONDS = 1800.0
 
+#: Sightings one journey may contain, and the recorded time it may span. A
+#: vehicle followed continuously for hours across a dozen transitive
+#: appearance links is not a claim this evidence supports.
+MAX_CHAIN_HOPS = 12
+MAX_JOURNEY_SECONDS = 3600.0
+
 #: A journey can never be certain — see the module docstring.
 MAX_CONFIDENCE = 0.95
+
+#: Confidence lost per hop beyond the first pair. Every extra hop is another
+#: transitive appearance match, and the chance that one of them jumped to a
+#: different vehicle of the same colour compounds — so a long chain is weaker
+#: evidence than a short one, not stronger, and the arithmetic must say so.
+CHAIN_DECAY_PER_HOP = 0.08
 
 JOURNEY_NOTE = (
     "Appearance-based candidate journey, not an identification. Each hop is a "
@@ -93,12 +116,18 @@ JOURNEY_NOTE = (
 # --------------------------------------------------------------- indexing --
 def estimate_loop_length(camera_id: str, timeout_s: float = LOOP_PROBE_TIMEOUT_S,
                          spec=None) -> float | None:
-    """Observed length of one camera's recording, in seconds, or None.
+    """Length of one camera's recording in seconds, measured, or None.
 
-    Read PTS until it jumps backwards; the highest PTS reached before that jump
-    is the recording's length. This is measured rather than asked for, because
-    the grid publishes no duration and two of its cameras declare 0/0 fps, so
-    nothing in the catalogue can be trusted to describe timing.
+    Measured rather than asked for: the grid publishes no duration and two of
+    its cameras declare 0/0 fps, so nothing in the catalogue can be trusted to
+    describe timing.
+
+    The measurement is restart-to-restart. Joining mid-loop and timing to the
+    first restart would only ever see the tail of the recording, and reporting
+    that as *the* loop length would understate it by however long we happened
+    to arrive late — so the first restart starts the clock and the second stops
+    it. That costs up to two loops of patience, hence the timeout, and returns
+    None rather than a lower bound dressed up as a measurement.
     """
     from netra.ingest.sources import build, spec_for_camera
 
@@ -111,7 +140,7 @@ def estimate_loop_length(camera_id: str, timeout_s: float = LOOP_PROBE_TIMEOUT_S
         return None
 
     deadline = time.time() + timeout_s
-    first_pts: float | None = None
+    restarts = 0
     highest = 0.0
     last = 0.0
     failures = 0
@@ -125,21 +154,20 @@ def estimate_loop_length(camera_id: str, timeout_s: float = LOOP_PROBE_TIMEOUT_S
                     return None
                 continue
             failures = 0
-            if first_pts is None:
-                first_pts = pts
             if pts + LOOP_JUMP_TOLERANCE_MS < last:
-                # The recording restarted. What we saw between join and restart
-                # is a lower bound only if we joined mid-loop, so report the
-                # span actually observed and let the caller judge it.
-                length = (highest - first_pts) / 1000.0
-                return round(length, 2) if length > 0 else None
+                restarts += 1
+                if restarts >= 2:
+                    # A complete pass, start to start.
+                    return round(highest / 1000.0, 2) if highest > 0 else None
+                highest = 0.0  # discard the partial loop we joined
             last = pts
-            highest = max(highest, pts)
+            if restarts >= 1:
+                highest = max(highest, pts)
     finally:
         source.release()
 
-    log.warning("%s loop probe timed out after %.0fs without a restart",
-                camera_id, timeout_s)
+    log.warning("%s loop probe timed out after %.0fs having seen %d restart(s)",
+                camera_id, timeout_s, restarts)
     return None
 
 
@@ -174,6 +202,14 @@ def index_camera(camera_id: str, engine, max_seconds: float = 900.0,
     """
     from netra.ingest.sources import build, spec_for_camera
     from netra.ingest.stream import Frame
+
+    # Fail here rather than silently indexing nothing: an unloaded engine
+    # accepts frames and produces no detections at all, which looks exactly
+    # like a camera with no traffic.
+    if getattr(engine, "_vehicle_model", None) is None:
+        raise RuntimeError("engine must be load()ed before indexing")
+    if getattr(engine, "_thread", None) is None or not engine._thread.is_alive():
+        raise RuntimeError("engine must be start()ed before indexing")
 
     spec = spec or spec_for_camera(camera_id)
     source = build(spec)
@@ -304,6 +340,9 @@ class Journey:
     elapsed_s: float
     mean_similarity: float
     confidence: float
+    #: the chain hit MAX_CHAIN_HOPS or MAX_JOURNEY_SECONDS and was cut, so
+    #: what is shown is a bounded slice rather than the whole of what matched
+    truncated: bool = False
     note: str = JOURNEY_NOTE
     cameras: list[str] = field(default_factory=list)
 
@@ -321,6 +360,7 @@ class Journey:
             "elapsed_s": round(self.elapsed_s, 1),
             "mean_similarity": round(self.mean_similarity, 3),
             "confidence": self.confidence,
+            "truncated": self.truncated,
             "note": self.note,
         }
 
@@ -367,15 +407,20 @@ def _leg(prev_det, det, prev_at: datetime, at: datetime) -> tuple[bool, dict]:
 def _confidence(similarities: list[float], hop_count: int) -> float:
     """How strongly the appearance evidence supports this chain.
 
-    Mean similarity leads, because that is what the evidence actually is. A
-    longer chain earns a small addition — three cameras agreeing is a stronger
-    argument than two — but only a small one, since a greedy chain can extend
-    itself through a wrong link as easily as a right one. Capped below
-    certainty: this is never an identification.
+    Mean similarity leads, because that is what the evidence actually is, and
+    it is then attenuated by chain length. A chain of many hops is a chain of
+    many chances to have stepped onto a different vehicle that merely looks the
+    same, and a greedy search takes the best-scoring step whether or not it is
+    the right one — so length must cost confidence rather than earn it. Only a
+    two-hop journey, the shortest thing that is a journey at all, can approach
+    the cap, and even that is capped below certainty: this is never an
+    identification.
     """
-    mean = sum(similarities) / len(similarities) if similarities else 0.0
-    length_bonus = min(0.06, 0.02 * max(0, hop_count - 2))
-    return round(min(MAX_CONFIDENCE, mean * 0.95 + length_bonus), 3)
+    if not similarities:
+        return 0.0
+    mean = sum(similarities) / len(similarities)
+    decay = 1.0 / (1.0 + CHAIN_DECAY_PER_HOP * max(0, hop_count - 2))
+    return round(min(MAX_CONFIDENCE, mean * 0.95 * decay), 3)
 
 
 def _minable(detections: list, group: str) -> tuple[list, dict]:
@@ -395,7 +440,8 @@ def _minable(detections: list, group: str) -> tuple[list, dict]:
             excluded["no_embedding"] += 1
             continue
         usable.append(det)
-    # Newest first for the cap, so a long-running index keeps its recent pass.
+    # Ordered oldest first, then tail-sliced: where the cap bites, the most
+    # recent pass over the recording is the one kept.
     usable.sort(key=sighting_time)
     if len(usable) > MAX_MINED_DETECTIONS:
         usable = usable[-MAX_MINED_DETECTIONS:]
@@ -404,11 +450,16 @@ def _minable(detections: list, group: str) -> tuple[list, dict]:
 
 def find_journeys(time_group: str, min_similarity: float = 0.84,
                   min_hops: int = 2, detections: list | None = None,
-                  limit: int = MAX_JOURNEYS) -> list[Journey]:
+                  limit: int = MAX_JOURNEYS,
+                  report: dict | None = None) -> list[Journey]:
     """Mine one time group's indexed detections for real cross-camera journeys.
 
     `detections` are ORM Detection rows with `.camera` loaded; when omitted they
     are read from the database for the group's cameras.
+
+    `report`, when supplied, is filled with how many sightings were considered
+    and how many were excluded and why. A reader cannot judge what the journeys
+    mean without knowing how much of the index could not take part.
 
     Chaining is greedy and bounded — see MAX_MINED_DETECTIONS above for the
     ceiling and what it costs.
@@ -418,7 +469,10 @@ def find_journeys(time_group: str, min_similarity: float = 0.84,
     if detections is None:
         detections = _load_group_detections(time_group)
 
-    usable, _excluded = _minable(detections, time_group)
+    usable, excluded = _minable(detections, time_group)
+    if report is not None:
+        report.update({"considered": len(usable), "excluded": excluded,
+                       "supplied": len(detections)})
     min_similarity = max(min_similarity, SIMILARITY_THRESHOLD)
 
     used: set[int] = set()
@@ -436,7 +490,8 @@ def find_journeys(time_group: str, min_similarity: float = 0.84,
         legs: list[dict] = []
 
         cursor = i
-        while True:
+        truncated = False
+        while len(chain) < MAX_CHAIN_HOPS:
             current = chain[-1]
             current_at = chain_times[-1]
             best = None
@@ -468,12 +523,18 @@ def find_journeys(time_group: str, min_similarity: float = 0.84,
             if best is None:
                 break
             score, j, nxt, nxt_at, leg = best
+            if (nxt_at - chain_times[0]).total_seconds() > MAX_JOURNEY_SECONDS:
+                # Beyond this the chain is no longer one journey; whatever
+                # follows is a separate claim and must be mined as one.
+                truncated = True
+                break
             chain.append(nxt)
             chain_times.append(nxt_at)
             sims.append(score)
             legs.append(leg)
             cursor = j
 
+        truncated = truncated or len(chain) >= MAX_CHAIN_HOPS
         if len(chain) < max(2, min_hops):
             continue
         if len({d.camera_id for d in chain}) < 2:
@@ -500,6 +561,7 @@ def find_journeys(time_group: str, min_similarity: float = 0.84,
             elapsed_s=(chain_times[-1] - chain_times[0]).total_seconds(),
             mean_similarity=sum(sims) / len(sims),
             confidence=_confidence(sims, len(chain)),
+            truncated=truncated,
             cameras=sorted({d.camera_id for d in chain}),
         ))
 
@@ -522,12 +584,47 @@ def _load_group_detections(group: str) -> list:
                 .filter(Detection.camera_id.in_(members),
                         Detection.scene_time.isnot(None),
                         Detection.embedding.isnot(None))
-                .order_by(Detection.scene_time)
+                # Newest first for the cap, matching _minable's tail slice, so
+                # both layers keep the same end of a long index.
+                .order_by(Detection.scene_time.desc())
                 .limit(MAX_MINED_DETECTIONS).all())
 
 
 # ----------------------------------------------------------- persistence --
-def persist_journeys(group: str, journeys: list[Journey]) -> int:
+def exclusion_report(group: str) -> dict:
+    """How much of a group's index could not take part in mining, and why.
+
+    Published rather than kept internal: a reader shown three journeys needs to
+    know whether they were drawn from thirty comparable sightings or from three
+    thousand of which most had no readable clock. Without that, the journeys
+    look like the whole picture when they are a corner of it.
+    """
+    from netra.core.db import SessionLocal
+    from netra.core.models import Detection
+
+    members = TIME_GROUPS.get(group, [])
+    if not members:
+        return {}
+    with SessionLocal() as db:
+        base = db.query(Detection).filter(Detection.camera_id.in_(members))
+        total = base.count()
+        no_clock = base.filter(Detection.scene_time.is_(None)).count()
+        no_embedding = base.filter(Detection.embedding.is_(None)).count()
+        comparable = base.filter(Detection.scene_time.isnot(None),
+                                 Detection.embedding.isnot(None)).count()
+    return {
+        "detections_in_group": total,
+        "comparable": comparable,
+        "excluded_no_scene_time": no_clock,
+        "excluded_no_embedding": no_embedding,
+        "note": ("A sighting with no scene clock cannot be placed on a "
+                 "journey: wall time records when we connected to the loop, "
+                 "not when the vehicle passed."),
+    }
+
+
+def persist_journeys(group: str, journeys: list[Journey],
+                     min_similarity: float = 0.84) -> int:
     """Replace the stored journeys for one group.
 
     Replaced rather than appended: mining is deterministic over the index, so a
@@ -547,24 +644,41 @@ def persist_journeys(group: str, journeys: list[Journey]) -> int:
                 total_km=round(j.total_km, 2), elapsed_s=round(j.elapsed_s, 1),
                 mean_similarity=round(j.mean_similarity, 3),
                 confidence=j.confidence, first_seen=first, last_seen=last,
+                min_similarity=min_similarity, truncated=j.truncated,
                 hops=[asdict(h) for h in j.hops], note=j.note))
         db.commit()
     return len(journeys)
 
 
-def stored_journeys(group: str, limit: int = MAX_JOURNEYS) -> list[dict]:
-    """Journeys mined earlier, so the console need not re-run the mining."""
+def stored_journeys(group: str, limit: int = MAX_JOURNEYS,
+                    min_hops: int = 2, min_similarity: float = 0.0) -> list[dict]:
+    """Journeys mined earlier, so the console need not re-run the mining.
+
+    `min_hops` and `min_similarity` filter the stored rows rather than
+    re-mining. Filtering is exact for hop count; for similarity it keeps
+    journeys whose weakest hop clears the bar, which is a subset of what
+    re-mining at that threshold would produce — a stricter threshold can also
+    change which chains form, so a caller who needs that must ask for a
+    refresh. The endpoint says which of the two it did.
+    """
     from netra.core.db import SessionLocal
     from netra.core.models import MinedJourney
 
     with SessionLocal() as db:
         rows = (db.query(MinedJourney)
-                .filter(MinedJourney.time_group == group)
-                .order_by(MinedJourney.confidence.desc()).limit(limit).all())
+                .filter(MinedJourney.time_group == group,
+                        MinedJourney.hop_count >= min_hops)
+                .order_by(MinedJourney.confidence.desc()).all())
+    if min_similarity > 0:
+        rows = [r for r in rows
+                if min(([h.get("similarity") or 1.0 for h in r.hops] or [0.0]))
+                >= min_similarity]
+    rows = rows[:limit]
     return [{
         "time_group": r.time_group, "hops": r.hops, "hop_count": r.hop_count,
         "cameras": r.cameras, "total_km": r.total_km, "elapsed_s": r.elapsed_s,
         "mean_similarity": r.mean_similarity, "confidence": r.confidence,
+        "truncated": bool(r.truncated), "mined_at_similarity": r.min_similarity,
         "note": r.note, "mined_at": r.created_at.isoformat() if r.created_at else None,
     } for r in rows]
 
@@ -581,6 +695,7 @@ def _self_check() -> None:
         v = rng.normal(size=32).astype(np.float32)
         return (v / np.linalg.norm(v)).tolist()
 
+    L_MAX_HOPS = MAX_CHAIN_HOPS
     silver, red = vec(1), vec(2)
     assert similarity(silver, red) < 0.5, "test vectors must be distinguishable"
 
@@ -662,6 +777,36 @@ def _self_check() -> None:
 
     # An unknown group mines nothing rather than raising.
     assert find_journeys("no-such-group", detections=dets) == []
+
+    # Exclusions are reported to the caller, not computed and discarded.
+    report: dict = {}
+    find_journeys("ahmedabad-13jun", detections=no_clock + [FakeDet(c10, t0, silver)],
+                  report=report)
+    assert report["excluded"]["no_scene_time"] == 1, report
+    assert report["excluded"]["wrong_group"] == 1, report
+    assert report["considered"] == 1, report
+
+    # A long chain must not become a maximum-confidence mega-journey. Every
+    # individual leg here is feasible, so nothing but the chain ceilings stops
+    # it running to a thousand hops.
+    long_run = []
+    for k in range(400):
+        cam = (c04, c14, c01)[k % 3]
+        long_run.append(FakeDet(cam, t0 + timedelta(minutes=3 * k), silver))
+    long_j = find_journeys("ahmedabad-13jun", detections=long_run)
+    assert long_j, "a long chain should still produce journeys"
+    longest = max(long_j, key=lambda j: j.hop_count)
+    assert longest.hop_count <= L_MAX_HOPS, longest.hop_count
+    assert all(j.elapsed_s <= MAX_JOURNEY_SECONDS for j in long_j),         [j.elapsed_s for j in long_j]
+    assert longest.truncated, "a chain cut at a ceiling must say so"
+    # Length costs confidence rather than earning it: the longest chain scores
+    # below a two-hop journey built from the identical embedding, and no
+    # journey of more than two hops can reach the cap.
+    two_hop = find_journeys("ahmedabad-13jun", detections=two)[0]
+    assert longest.confidence < two_hop.confidence, (longest.confidence,
+                                                     two_hop.confidence)
+    assert all(j.confidence < MAX_CONFIDENCE
+               for j in long_j if j.hop_count > 2),         [(j.hop_count, j.confidence) for j in long_j]
 
     print("loop_index self-check passed")
 

@@ -22,8 +22,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from netra.analytics.loop_index import (estimate_loop_length,  # noqa: E402
-                                        find_journeys, index_camera,
-                                        persist_journeys)
+                                        exclusion_report, find_journeys,
+                                        index_camera, persist_journeys)
 from netra.core.db import SessionLocal, init_db  # noqa: E402
 from netra.core.geo import TIME_GROUPS  # noqa: E402
 from netra.core.models import Camera  # noqa: E402
@@ -94,7 +94,8 @@ def main() -> int:
                 if args.probe_loops:
                     length = estimate_loop_length(cam)
                     print(f"{cam}: loop length "
-                          f"{f'{length:.1f}s' if length else 'not observed'}")
+                          f"{f'{length:.1f}s (restart to restart)' if length
+                             else 'not measured within the probe timeout'}")
                 t0 = time.time()
                 result = index_camera(cam, engine, max_seconds=args.max_seconds)
                 if result.get("error"):
@@ -112,8 +113,18 @@ def main() -> int:
             engine.stop()
 
     print(f"\nMining '{args.group}' ({', '.join(TIME_GROUPS[args.group])})")
+    report: dict = {}
     journeys = find_journeys(args.group, min_similarity=args.min_similarity,
-                             min_hops=args.min_hops)
+                             min_hops=args.min_hops, report=report)
+    excluded = report.get("excluded", {})
+    print(f"  {report.get('considered', 0)} sightings comparable, "
+          f"{excluded.get('no_scene_time', 0)} excluded for no scene clock, "
+          f"{excluded.get('no_embedding', 0)} for no appearance vector, "
+          f"{excluded.get('wrong_group', 0)} outside the group")
+    index = exclusion_report(args.group)
+    if index:
+        print(f"  index holds {index['detections_in_group']} detections on "
+              f"these cameras, {index['comparable']} of them comparable")
     if not args.no_persist:
         persist_journeys(args.group, journeys)
     _print_journeys(journeys)
