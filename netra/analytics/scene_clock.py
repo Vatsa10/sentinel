@@ -107,6 +107,16 @@ class ClockAnchor:
         """Scene time for any frame, carried forward by PTS."""
         return self.scene_time + timedelta(milliseconds=pts_ms - self.pts_ms)
 
+    def age_s(self, pts_ms: float) -> float:
+        """How far, in stream seconds, this anchor is being extrapolated.
+
+        Extrapolation is only as good as the decoder's timing. Small errors in
+        PTS accumulate, so an anchor read hours ago is quietly less trustworthy
+        than one read a minute ago; callers use this to decide when to re-read
+        the overlay rather than extrapolating from one reading forever.
+        """
+        return (pts_ms - self.pts_ms) / 1000.0
+
 
 def parse_overlay(text: str) -> datetime | None:
     """Interpret one OCR reading of a timestamp overlay.
@@ -235,6 +245,12 @@ def _self_check() -> None:
     assert anchor.at(61000.0) == datetime(2026, 6, 13, 23, 23, 47,
                                           tzinfo=timezone.utc), anchor.at(61000.0)
     assert anchor.at(1000.0) == anchor.scene_time
+
+    # Anchor age is measured in stream time, from the frame it was read on.
+    assert anchor.age_s(1000.0) == 0.0, anchor.age_s(1000.0)
+    assert anchor.age_s(61000.0) == 60.0, anchor.age_s(61000.0)
+    # A stream that has rewound (a loop cut before reset) must not read as old.
+    assert anchor.age_s(0.0) == -1.0, anchor.age_s(0.0)
 
     print("scene clock self-check passed")
 

@@ -464,7 +464,7 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
     their similarity score, ordered in time, and filtered for space-time
     plausibility - not assertions of identity.
     """
-    from netra.analytics.reid import similarity
+    from netra.analytics.reid import flag_ambiguity, similarity
     from netra.core.geo import haversine_km, time_group
     from netra.analytics.matching import spacetime_plausible
 
@@ -518,7 +518,11 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
             })
 
         scored.sort(key=lambda x: x["similarity"], reverse=True)
-        matches = scored[:limit]
+        # Two vehicles that look alike score alike, so where the top results
+        # are separated by less than the appearance model can resolve, every
+        # one of them is flagged. The console needs this to avoid rendering a
+        # coin-toss as an identification.
+        matches = flag_ambiguity(scored[:limit])
 
         origin = {
             "detection_id": query.id, "camera_id": query.camera_id,
@@ -536,6 +540,7 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
         "matches": matches,
         "plausible_matches": [m for m in matches if m["plausible"]],
         "method": "appearance re-identification (ResNet-18 512-d, cosine)",
+        "ambiguous": any(m.get("ambiguous") for m in matches),
         "note": ("Ranked candidates for operator confirmation, not identification. "
                  "Appearance evidence alone does not establish that two sightings "
                  "are the same vehicle."),

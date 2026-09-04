@@ -32,6 +32,13 @@ log = logging.getLogger(__name__)
 #: that a camera has none. Roughly half the grid has no legible overlay.
 CLOCK_ATTEMPT_LIMIT = 4
 
+#: Stream seconds after which an anchor is re-read from the overlay. One
+#: reading extrapolated indefinitely drifts with the decoder's timing, so
+#: timestamps on a long-lived connection grow silently wrong. Fifteen minutes
+#: is far more often than drift becomes material, and far rarer than the OCR
+#: cost would justify doing it any more eagerly.
+CLOCK_REANCHOR_AFTER_S = 900.0
+
 #: Minimum crop height worth embedding. Below this an appearance vector cannot
 #: distinguish one vehicle from another, so it is cost without information.
 REID_MIN_CROP_PX = 64
@@ -227,16 +234,25 @@ class InferenceEngine:
             self.zone_engine.reset_camera(camera_id)
 
     def _anchor_clock(self, frame) -> None:
-        """Read the burned-in timestamp once per connection, then extrapolate.
+        """Read the burned-in timestamp, then extrapolate until it goes stale.
 
         Attempts are capped. Reading an overlay costs several OCR passes over
         upscaled crops, and about half the cameras on this grid have no legible
         overlay at all - retrying every frame on those saturates the queue and
         starves detection, which matters far more than scene time. Measured
         without the cap: 83% of frames dropped.
+
+        The anchor is re-read once it has been extrapolated for
+        CLOCK_REANCHOR_AFTER_S of stream time, because decoder timing drift
+        accumulates and an hours-old anchor times sightings wrongly without
+        ever saying so.
         """
         cam = frame.camera_id
-        if self._ocr is None or cam in self._clocks:
+        if self._ocr is None:
+            return
+        existing = self._clocks.get(cam)
+        if (existing is not None
+                and existing.age_s(frame.pts_ms) < CLOCK_REANCHOR_AFTER_S):
             return
         attempts = self._clock_attempts.get(cam, 0)
         if attempts >= CLOCK_ATTEMPT_LIMIT:
@@ -260,11 +276,21 @@ class InferenceEngine:
 
         if anchor:
             self._clocks[cam] = anchor
+            # The budget is per anchoring window, not per connection, so a
+            # camera that anchors successfully may re-anchor again when this
+            # reading in turn goes stale.
+            self._clock_attempts[cam] = 0
             self.stats["clocks_anchored"] = len(self._clocks)
         elif self._clock_attempts[cam] >= CLOCK_ATTEMPT_LIMIT:
+            # A failed re-anchor leaves the existing anchor alone: an anchor
+            # carrying some drift still times sightings far better than none.
+            # The attempt still counts, so a camera whose overlay has become
+            # unreadable (night, rain, a moved caption) stops retrying instead
+            # of burning OCR on every frame for the rest of the connection.
             log.info("%s has no legible timestamp overlay after %d attempts; "
-                     "sightings on this camera carry no scene time",
-                     cam, CLOCK_ATTEMPT_LIMIT)
+                     "%s", cam, CLOCK_ATTEMPT_LIMIT,
+                     "keeping the existing anchor despite its age" if existing
+                     else "sightings on this camera carry no scene time")
 
     def _process(self, frame) -> None:
         t0 = time.time()

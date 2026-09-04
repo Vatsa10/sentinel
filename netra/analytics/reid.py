@@ -36,6 +36,44 @@ EMBED_DIM = 512
 #: Cosine similarity above which two crops are considered a plausible match.
 #: Tuned to be permissive: this produces candidates for review, not verdicts.
 SIMILARITY_THRESHOLD = 0.80
+#: When the runner-up scores within this of the top match, the two cannot be
+#: told apart on appearance and neither may be presented as the answer.
+AMBIGUITY_MARGIN = 0.02
+
+_AMBIGUITY_NOTE = (
+    "Near-identical appearance scores: other candidates are within "
+    f"{AMBIGUITY_MARGIN:.2f} of the top match, so appearance alone cannot "
+    "separate them. Confirm against another signal before acting.")
+
+
+def flag_ambiguity(scored: list[dict]) -> list[dict]:
+    """Mark results the appearance evidence cannot actually separate.
+
+    Two silver hatchbacks embed almost identically, so a ranked list whose top
+    scores are nearly equal has picked a winner the evidence does not support.
+    The ambiguous candidates are kept rather than dropped - an operator shown
+    "three near-identical candidates" is better served than one shown a single
+    confident wrong answer - but every result carries the flag so the console
+    can never render the top hit as if it stood alone.
+
+    Mutates and returns the list in place; it is expected to be sorted with the
+    highest similarity first.
+
+    ponytail: ambiguity is judged against the top score only, so a tight
+    cluster further down the list is not flagged. That cluster is not competing
+    to be the answer, so it does not mislead in the same way.
+    """
+    # An epsilon, because a gap of exactly the margin must land on the
+    # cautious side rather than on whichever side binary floats round it to.
+    limit = AMBIGUITY_MARGIN + 1e-9
+    # Both keys are set on every result, including a lone one, so no consumer
+    # has to distinguish "unambiguous" from "never checked".
+    top = scored[0]["similarity"] if scored else 0.0
+    ambiguous = len(scored) >= 2 and (top - scored[1]["similarity"]) <= limit
+    for row in scored:
+        row["ambiguous"] = ambiguous and (top - row["similarity"]) <= limit
+        row["ambiguity_note"] = _AMBIGUITY_NOTE if row["ambiguous"] else None
+    return scored
 
 
 class ReIdEncoder:
@@ -116,7 +154,9 @@ def rank_candidates(query_embedding, detections: list, top_k: int = 25) -> list[
         if s >= SIMILARITY_THRESHOLD:
             scored.append({"detection": det, "similarity": round(s, 4)})
     scored.sort(key=lambda x: x["similarity"], reverse=True)
-    return scored[:top_k]
+    # Truncate first: ambiguity is about what the caller is shown, so it is
+    # judged over the returned list rather than over candidates it never sees.
+    return flag_ambiguity(scored[:top_k])
 
 
 def _self_check() -> None:
@@ -138,6 +178,29 @@ def _self_check() -> None:
             FakeDet(None, "no-embedding")]
     ranked = rank_candidates(a, dets)
     assert len(ranked) == 1 and ranked[0]["detection"].name == "same", ranked
+    # A lone result has nothing to be confused with.
+    assert ranked[0]["ambiguous"] is False and ranked[0]["ambiguity_note"] is None
+
+    # Two candidates scoring within the margin are both flagged: this is the
+    # two-silver-hatchbacks case, where presenting the top hit implies a
+    # confidence the evidence does not support.
+    close = [{"similarity": 0.91}, {"similarity": 0.90}, {"similarity": 0.82}]
+    flag_ambiguity(close)
+    assert close[0]["ambiguous"] and close[1]["ambiguous"], close
+    assert close[0]["ambiguity_note"], close[0]
+    # The distant third is not part of the confusion and is not flagged.
+    assert close[2]["ambiguous"] is False and close[2]["ambiguity_note"] is None
+
+    # A clear winner is reported as one.
+    clear = [{"similarity": 0.95}, {"similarity": 0.84}]
+    flag_ambiguity(clear)
+    assert not any(r["ambiguous"] for r in clear), clear
+
+    # Exactly on the margin counts as ambiguous: the boundary should not be
+    # resolved in favour of false confidence.
+    edge = [{"similarity": 0.90}, {"similarity": 0.88}]
+    flag_ambiguity(edge)
+    assert edge[0]["ambiguous"] and edge[1]["ambiguous"], edge
 
     print("reid self-check passed")
 

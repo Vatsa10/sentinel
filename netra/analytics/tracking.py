@@ -33,6 +33,10 @@ BASE_IOU_THRESHOLD = 0.25
 APPEARANCE_RESCUE = 0.86
 #: A track with no sighting for this long in stream time is closed.
 TRACK_TIMEOUT_S = 6.0
+#: Hard ceiling on live tracks per camera. Timeout alone is not a bound: a busy
+#: junction can open tracks faster than they expire, and the platform is meant
+#: to run for hours, so the dictionary needs a ceiling as well as an age limit.
+MAX_TRACKS_PER_CAMERA = 300
 
 
 def iou(a: list[int], b: list[int]) -> float:
@@ -104,10 +108,28 @@ class CameraTracker:
         #: cumulative count of distinct vehicles seen, by class
         self.counts: dict[str, int] = {}
         self.total_count = 0
+        #: vehicles counted since the last loop cut, so a headline figure can be
+        #: reported per playthrough as well as cumulatively
+        self.counted_this_loop = 0
+        #: how many times the recording has restarted under this tracker
+        self.loops_seen = 0
+        #: tracks discarded by the cap rather than by timeout
+        self.dropped_tracks = 0
 
     def reset(self) -> None:
-        """Discard all state. Called at a loop cut, where continuity is void."""
+        """Discard track state at a loop cut, where continuity is void.
+
+        `total_count` deliberately survives: those vehicles really were
+        observed, and zeroing the figure would throw away real observation.
+        But the recording replays, so the same vehicles are counted again on
+        every loop, and a cumulative total taken alone reads as far more
+        traffic than the footage contains. `counted_this_loop` is therefore
+        reset here and `loops_seen` incremented, so anyone reading a count of
+        "4,893 vehicles" can see whether that is one playthrough or six.
+        """
         self.tracks.clear()
+        self.counted_this_loop = 0
+        self.loops_seen += 1
 
     def _match(self, det, pts_ms: float) -> Track | None:
         """Best existing track for this detection, or None."""
@@ -175,6 +197,7 @@ class CameraTracker:
                 self.counts[track.vehicle_class] = \
                     self.counts.get(track.vehicle_class, 0) + 1
                 self.total_count += 1
+                self.counted_this_loop += 1
                 newly_counted.append(track)
         return newly_counted
 
@@ -183,6 +206,19 @@ class CameraTracker:
                  if (pts_ms - t.last_pts_ms) / 1000.0 > TRACK_TIMEOUT_S]
         for tid in stale:
             del self.tracks[tid]
+
+        # Timeout is an age limit, not a bound. Under rapid turnover the
+        # dictionary can still grow without limit, so the least recently seen
+        # tracks are dropped once the cap is passed: a track unseen for longest
+        # is the one least likely to receive another detection, so it is the
+        # cheapest to lose. Drops are counted rather than hidden - a rising
+        # figure means the camera is busier than the tracker can follow.
+        excess = len(self.tracks) - MAX_TRACKS_PER_CAMERA
+        if excess > 0:
+            oldest = sorted(self.tracks.items(), key=lambda kv: kv[1].last_pts_ms)
+            for tid, _ in oldest[:excess]:
+                del self.tracks[tid]
+            self.dropped_tracks += excess
 
     def stats(self) -> dict:
         active = list(self.tracks.values())
@@ -195,6 +231,9 @@ class CameraTracker:
             "camera_id": self.camera_id,
             "active_tracks": len(active),
             "total_counted": self.total_count,
+            "counted_this_loop": self.counted_this_loop,
+            "loops_seen": self.loops_seen,
+            "dropped_tracks": self.dropped_tracks,
             "counts_by_class": dict(self.counts),
             "directions": directions,
             "mean_dwell_s": round(
@@ -294,6 +333,37 @@ def _self_check() -> None:
     t8.update([Det([0, 0, 100, 100])], 0.0)
     t8.update([Det([900, 900, 950, 950])], 30_000.0)
     assert len(t8.tracks) == 1, "the original track should have expired"
+
+    # The cap bounds live tracks, and it is the least recently seen that go.
+    t9 = CameraTracker("cam09")
+    for i in range(MAX_TRACKS_PER_CAMERA + 50):
+        # Boxes far enough apart never associate, so each detection opens a
+        # track; staggered PTS gives them a well-defined recency order.
+        t9.update([Det([i * 200, 0, i * 200 + 20, 20])], float(i))
+    # Trimming happens on expiry, so the cap may be exceeded by the current
+    # frame's own detections until the next update; one expiry settles it.
+    t9._expire(float(MAX_TRACKS_PER_CAMERA + 50))
+    assert len(t9.tracks) == MAX_TRACKS_PER_CAMERA, len(t9.tracks)
+    assert t9.dropped_tracks == 50, t9.dropped_tracks
+    assert min(tr.last_pts_ms for tr in t9.tracks.values()) == 50.0, (
+        "the oldest tracks should be the ones dropped")
+    assert t9.stats()["dropped_tracks"] == 50
+
+    # A loop cut keeps cumulative observation but restarts the per-loop figure,
+    # so a count inflated by replays is visible rather than silent.
+    t10 = CameraTracker("cam10")
+    t10.update([Det([100, 100, 200, 200])], 0.0)
+    t10.update([Det([110, 100, 210, 200])], 1000.0)
+    assert t10.total_count == 1 and t10.counted_this_loop == 1
+    t10.reset()
+    assert t10.total_count == 1, "cumulative observation is real and must survive"
+    assert t10.counted_this_loop == 0, t10.counted_this_loop
+    assert t10.loops_seen == 1, t10.loops_seen
+    t10.update([Det([100, 100, 200, 200])], 0.0)
+    t10.update([Det([110, 100, 210, 200])], 1000.0)
+    st = t10.stats()
+    assert st["total_counted"] == 2 and st["counted_this_loop"] == 1, st
+    assert st["loops_seen"] == 1, st
 
     print("tracking self-check passed")
 
