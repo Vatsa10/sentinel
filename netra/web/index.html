@@ -105,6 +105,16 @@ input.mono{font-family:var(--mono);letter-spacing:1px;text-transform:uppercase}
 .hop:last-child{border-bottom:none}
 .hop .num{width:26px;height:26px;border-radius:50%;background:var(--accent);color:#111;display:grid;place-items:center;font-weight:800;font-size:12px;flex-shrink:0}
 .hop img{height:52px;border-radius:5px;border:1px solid var(--line)}
+.muted{opacity:.55}
+.zwrap{position:relative;display:inline-block;background:#000;border:1px solid var(--line);border-radius:9px;overflow:hidden;max-width:100%}
+.zwrap img{display:block;max-width:100%}
+.zwrap canvas{position:absolute;inset:0;width:100%;height:100%;cursor:crosshair}
+.zone-item{display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-bottom:1px solid var(--line)}
+.zone-item:last-child{border-bottom:none}
+.sparks{display:flex;align-items:flex-end;gap:2px;height:38px;margin-top:8px}
+.sparks i{flex:1;background:var(--blue);border-radius:2px 2px 0 0;min-height:2px;display:block}
+.zev{border-left:3px solid var(--warn);background:var(--panel2);border-radius:0 9px 9px 0;padding:10px 13px;margin-bottom:8px;font-size:12.5px}
+.zev img{max-height:56px;border-radius:5px;border:1px solid var(--line);margin-top:6px}
 .toast{position:fixed;right:18px;bottom:18px;z-index:9999;display:flex;flex-direction:column;gap:9px;max-width:390px}
 .toast .t{background:var(--panel2);border:1px solid var(--bad);border-left:4px solid var(--bad);border-radius:9px;padding:12px 15px;box-shadow:0 12px 32px rgba(0,0,0,.6);animation:slideIn .25s}
 </style>
@@ -130,6 +140,9 @@ input.mono{font-family:var(--mono);letter-spacing:1px;text-transform:uppercase}
   <a data-view="route">Vehicle Trace</a>
   <a data-view="watchlist">Watchlist</a>
   <a data-view="alerts">Alerts</a>
+  <a data-view="zones">Zones</a>
+  <a data-view="traffic">Traffic</a>
+  <a data-view="intel">Intelligence</a>
   <a data-view="registry">Registry &amp; Gaps</a>
   <a data-view="assistant">Assistant</a>
 </nav>
@@ -194,8 +207,8 @@ input.mono{font-family:var(--mono);letter-spacing:1px;text-transform:uppercase}
       <span class="faint" id="dCount" style="font-size:12px"></span>
     </div>
     <div class="panel"><div style="max-height:calc(100vh - 250px);overflow:auto"><table id="tblDet">
-      <thead><tr><th>Time (UTC)</th><th>PTS</th><th>Camera</th><th>Class</th><th>Colour</th><th>Plate</th><th>Conf</th><th>Evidence</th></tr></thead>
-      <tbody><tr><td colspan="8" class="empty">No detections.</td></tr></tbody>
+      <thead><tr><th>Time (UTC)</th><th>PTS</th><th>Camera</th><th>Class</th><th>Colour</th><th>Plate</th><th>Conf</th><th>Track</th><th>Scene time</th><th>Evidence</th></tr></thead>
+      <tbody><tr><td colspan="10" class="empty">No detections.</td></tr></tbody>
     </table></div></div>
   </section>
 
@@ -269,6 +282,80 @@ input.mono{font-family:var(--mono);letter-spacing:1px;text-transform:uppercase}
         <div class="row" id="asstChips" style="margin:0"></div>
       </div>
     </div>
+  </section>
+
+  <!-- ZONES -->
+  <section class="view" id="v-zones">
+    <div class="two">
+      <div>
+        <div class="panel" style="margin-bottom:14px">
+          <h3>Define a rule on a live still</h3>
+          <div class="body">
+            <div class="row">
+              <select id="zCam"></select>
+              <button id="zLoad" class="primary">Load still frame</button>
+              <select id="zRule">
+                <option value="intrusion">Intrusion (area)</option>
+                <option value="crossing">Line crossing (2 points)</option>
+                <option value="loitering">Loitering (area)</option>
+              </select>
+              <input id="zName" placeholder="Rule name" style="width:150px">
+              <select id="zClasses"><option value="">Any class</option><option>car</option>
+                <option>truck</option><option>bus</option><option>motorcycle</option><option>person</option></select>
+              <select id="zSev"><option value="critical">Critical</option><option value="high">High</option>
+                <option value="medium" selected>Medium</option><option value="low">Low</option></select>
+              <input id="zDwell" type="number" value="30" style="width:90px" title="Dwell seconds (loitering)">
+              <button id="zClear">Clear points</button>
+              <button id="zSave" class="primary">Save rule</button>
+            </div>
+            <div class="zwrap" id="zWrap" style="display:none">
+              <img id="zImg" alt="camera still">
+              <canvas id="zCanvas"></canvas>
+            </div>
+            <div class="faint" id="zHint" style="font-size:12px;margin-top:8px">
+              Load a still, then click to place points. Points are stored normalised 0&ndash;1,
+              so a rule survives a resolution change on the source camera.</div>
+          </div>
+        </div>
+        <div class="panel"><h3>Live zone events</h3>
+          <div class="body" id="zEvents" style="max-height:340px;overflow:auto">
+            <div class="empty">No zone events yet.</div></div></div>
+      </div>
+      <div class="panel"><h3>Configured rules</h3>
+        <div class="body" id="zList"><div class="empty">No rules configured.</div></div></div>
+    </div>
+  </section>
+
+  <!-- TRAFFIC -->
+  <section class="view" id="v-traffic">
+    <div class="row">
+      <button id="tSnap" class="primary">Write traffic snapshot</button>
+      <button id="tRefresh">Refresh</button>
+      <span class="faint" style="font-size:12px">Counts are cumulative across every replay of a looping
+        recording. <b>Counted this loop</b> beside <b>loops seen</b> is the honest reading.</span>
+    </div>
+    <div class="grid stats" id="tStats"></div>
+    <div class="panel"><h3>Per-camera counters</h3>
+      <div style="max-height:calc(100vh - 380px);overflow:auto"><table id="tblTraffic">
+        <thead><tr><th>Camera</th><th>Active tracks</th><th>Counted this loop</th><th>Total counted</th>
+          <th>Loops seen</th><th>Dropped</th><th>Class mix</th><th>Directions</th><th>Mean dwell</th>
+          <th>History</th></tr></thead>
+        <tbody><tr><td colspan="10" class="empty">Start the pipeline to begin counting.</td></tr></tbody>
+      </table></div></div>
+  </section>
+
+  <!-- INTELLIGENCE -->
+  <section class="view" id="v-intel">
+    <div class="row"><button id="iRefresh" class="primary">Refresh analysis</button>
+      <select id="iGroup"></select>
+      <span class="faint" style="font-size:12px">Every finding here is inference from wide-area footage,
+        carrying the arithmetic behind it. None of it is an identification.</span></div>
+    <div class="panel" style="margin-bottom:14px"><h3>Cloned-plate findings</h3>
+      <div class="body" id="iClones"><div class="empty">Not analysed yet.</div></div></div>
+    <div class="panel" style="margin-bottom:14px"><h3>Behavioural anomalies</h3>
+      <div class="body" id="iAnoms"><div class="empty">Not analysed yet.</div></div></div>
+    <div class="panel"><h3>Mined cross-camera journeys</h3>
+      <div class="body" id="iJourneys"><div class="empty">Not analysed yet.</div></div></div>
   </section>
 
   <!-- REGISTRY -->

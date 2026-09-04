@@ -20,6 +20,9 @@ $$("nav a").forEach(a => a.onclick = () => {
   if (a.dataset.view === "watchlist") loadWatchlist();
   if (a.dataset.view === "alerts") loadAlerts();
   if (a.dataset.view === "detections") loadDetections();
+  if (a.dataset.view === "zones") loadZones();
+  if (a.dataset.view === "traffic") loadTraffic();
+  if (a.dataset.view === "intel") loadIntel();
 });
 
 function toast(html) {
@@ -176,14 +179,19 @@ async function loadDetections() {
   const d = await api("/api/detections?" + q);
   $("#dCount").textContent = `${d.count} of ${d.total}`;
   const tb = $("#tblDet tbody");
-  if (!d.items.length) { tb.innerHTML = `<tr><td colspan="8" class="empty">No matching detections.</td></tr>`; return; }
+  if (!d.items.length) { tb.innerHTML = `<tr><td colspan="10" class="empty">No matching detections.</td></tr>`; return; }
   tb.innerHTML = d.items.map(x => `<tr>
     <td class="mono">${esc(x.at.replace("T", " ").slice(0, 19))}</td>
     <td class="mono faint">${Math.round(x.pts_ms)}</td>
     <td>${esc(x.camera_name || x.camera_id)}</td>
     <td>${esc(x.vehicle_class)}</td><td class="dim">${esc(x.colour || "—")}</td>
-    <td class="mono">${x.plate_text ? esc(x.plate_text) : '<span class="faint">—</span>'}</td>
+    <td class="mono">${x.plate_text ? esc(x.plate_text) : '<span class="faint">—</span>'}
+      ${x.plate_chars ? `<span class="faint" style="font-size:10.5px">· ${esc(x.plate_chars)} chars</span>` : ""}</td>
     <td class="dim">${x.plate_conf ?? "—"}</td>
+    <td class="mono faint">${x.track_id != null ? esc(x.track_id) : "—"}</td>
+    <td class="mono faint">${x.scene_time
+      ? esc(x.scene_time.replace("T", " ").slice(0, 19))
+      : '<span title="no clock recovered from the overlay">—</span>'}</td>
     <td>${x.evidence ? `<img src="${esc(x.evidence)}" style="height:34px;border-radius:4px">` : ""}</td></tr>`).join("");
 }
 $("#dSearch").onclick = loadDetections;
@@ -371,6 +379,20 @@ function connectWs() {
     if (a.type === "ping") return;
     const feed = $("#alertFeed");
     if (feed.querySelector(".empty")) feed.innerHTML = "";
+    if (a.kind === "zone") {
+      // A rule breach is not a watchlist hit, and rendering one as the other
+      // would put an identity claim on an event that carries none.
+      feed.insertAdjacentHTML("afterbegin", zoneEventHtml(a));
+      const ze = $("#zEvents");
+      if (ze) {
+        if (ze.querySelector(".empty")) ze.innerHTML = "";
+        ze.insertAdjacentHTML("afterbegin", zoneEventHtml(a));
+      }
+      toast(`<b style="color:#ffb066">ZONE ${esc(a.rule)}</b><br>
+        <span style="font-size:12px;color:#8b9bb4">${esc(a.zone || "")} ·
+        ${esc(a.camera_id)} · ${esc(a.detail || "")}</span>`);
+      return;
+    }
     feed.insertAdjacentHTML("afterbegin", alertHtml(a));
     toast(`<b style="color:#ff8080">WATCHLIST HIT</b><br>
       <span class="mono" style="font-size:15px">${esc(a.plate_watchlist)}</span><br>
@@ -486,7 +508,9 @@ $("#rAppearance").onclick = async () => {
         <div style="font-size:11.5px;margin-top:3px">
           ${esc(h.colour || "")} ${esc(h.vehicle_class || "")}
           ${h.similarity ? `· <b style="color:#c99bff">similarity ${h.similarity}</b>` : "· query vehicle"}
-          ${h.leg_km != null ? `· ${h.leg_km} km from previous` : ""}</div>
+          ${h.leg_km != null ? `· ${h.leg_km} km from previous` : ""}
+          ${h.ambiguous ? `<div class="tag t-degraded" style="margin-top:4px">ambiguous</div>
+            <div class="faint" style="font-size:11px;margin-top:3px">${esc(h.ambiguity_note || "")}</div>` : ""}</div>
         ${h.evidence || h.evidence_path ? `<img src="${esc(h.evidence || h.evidence_path)}">` : ""}
       </div></div>`).join("");
 
@@ -495,3 +519,278 @@ $("#rAppearance").onclick = async () => {
         <b class="mono">${esc(x.camera_id)}</b> — ${esc(x.plausibility || "excluded")}</div>`).join("")
     : `<div class="faint" style="font-size:12px">None excluded.</div>`;
 };
+
+/* ---------------------------------------------------------------- zones --- */
+let ZPOINTS = [];                      // normalised [x, y] pairs, in click order
+
+function zoneEventHtml(e) {
+  return `<div class="zev">
+    <div class="row" style="margin:0 0 5px 0;gap:8px">
+      <span class="tag sev-${esc(e.severity || "medium")}">${esc(e.severity || "")}</span>
+      <span class="tag t-vehicle">${esc(e.rule)}</span>
+      <b>${esc(e.zone || "zone")}</b>
+      <span class="faint mono" style="font-size:11px">${esc(e.camera_name || e.camera_id)}</span>
+      <span style="margin-left:auto" class="faint mono">${esc((e.at || "").slice(11, 19))}</span>
+    </div>
+    <div class="dim">${esc(e.detail || "")}
+      ${e.object_class ? `· ${esc(e.object_class)}` : ""}
+      ${e.direction ? `· heading ${esc(e.direction)}` : ""}</div>
+    ${e.evidence ? `<img src="${esc(e.evidence)}">` : ""}
+  </div>`;
+}
+
+function drawZone() {
+  const cv = $("#zCanvas"), img = $("#zImg");
+  if (!cv || !img || !img.naturalWidth) return;
+  cv.width = img.clientWidth; cv.height = img.clientHeight;
+  const g = cv.getContext("2d");
+  g.clearRect(0, 0, cv.width, cv.height);
+  const pts = ZPOINTS.map(([x, y]) => [x * cv.width, y * cv.height]);
+  if (!pts.length) return;
+  g.strokeStyle = "#ff6b00"; g.lineWidth = 2;
+  g.fillStyle = "rgba(255,107,0,.18)";
+  g.beginPath();
+  pts.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y));
+  if ($("#zRule").value !== "crossing" && pts.length > 2) { g.closePath(); g.fill(); }
+  g.stroke();
+  pts.forEach(([x, y], i) => {
+    g.beginPath(); g.arc(x, y, 6, 0, 6.283); g.fillStyle = "#ff6b00"; g.fill();
+    g.fillStyle = "#111"; g.font = "bold 10px monospace";
+    g.fillText(String(i + 1), x - 3, y + 3);
+  });
+}
+
+$("#zLoad").onclick = async () => {
+  const cam = $("#zCam").value;
+  if (!cam) return;
+  const btn = $("#zLoad");
+  btn.disabled = true; btn.textContent = "Grabbing frame…";
+  const img = $("#zImg");
+  img.onload = () => { $("#zWrap").style.display = "inline-block"; drawZone(); };
+  img.onerror = () => toast("Could not grab a still from " + esc(cam) +
+    " — the camera may be down or the feed unreachable.");
+  img.src = `/api/cameras/${encodeURIComponent(cam)}/snapshot?t=${Date.now()}`;
+  try { await img.decode(); } catch (e) { /* onerror has already reported it */ }
+  btn.disabled = false; btn.textContent = "Load still frame";
+};
+
+$("#zCanvas").onclick = (e) => {
+  const r = e.currentTarget.getBoundingClientRect();
+  ZPOINTS.push([(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]);
+  drawZone();
+  $("#zHint").textContent = `${ZPOINTS.length} point(s) placed.`;
+};
+$("#zClear").onclick = () => {
+  ZPOINTS = []; drawZone(); $("#zHint").textContent = "Points cleared.";
+};
+$("#zRule").onchange = drawZone;
+window.addEventListener("resize", drawZone);
+
+$("#zSave").onclick = async () => {
+  const rule = $("#zRule").value;
+  const needed = rule === "crossing" ? 2 : 3;
+  if (ZPOINTS.length < needed) {
+    toast(`A ${esc(rule)} rule needs at least ${needed} points.`); return;
+  }
+  const body = {
+    camera_id: $("#zCam").value, name: $("#zName").value || "Zone",
+    rule, points: ZPOINTS.map(([x, y]) => [+x.toFixed(4), +y.toFixed(4)]),
+    classes: $("#zClasses").value ? [$("#zClasses").value] : [],
+    severity: $("#zSev").value, dwell_s: parseFloat($("#zDwell").value) || 30,
+  };
+  const r = await fetch("/api/zones", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) { toast("Rule rejected: " + esc(out.detail || r.status)); return; }
+  ZPOINTS = []; drawZone();
+  toast("Rule saved on " + esc(body.camera_id) + ".");
+  loadZones();
+};
+
+window.delZone = async (id) => {
+  await fetch("/api/zones/" + id, { method: "DELETE" });
+  loadZones();
+};
+
+async function loadZones() {
+  if (!$("#zCam").options.length) {
+    $("#zCam").innerHTML = CAMERAS.map(c =>
+      `<option value="${esc(c.id)}">${esc(c.id)} — ${esc(c.name)}</option>`).join("");
+  }
+  const zones = await api("/api/zones");
+  $("#zList").innerHTML = zones.length ? zones.map(z => `<div class="zone-item">
+    <div style="flex:1">
+      <div><b>${esc(z.name)}</b>
+        <span class="tag t-vehicle" style="margin-left:6px">${esc(z.rule)}</span>
+        <span class="tag sev-${esc(z.severity)}" style="margin-left:4px">${esc(z.severity)}</span>
+        ${z.active ? "" : `<span class="tag t-degraded" style="margin-left:4px">inactive</span>`}</div>
+      <div class="faint mono" style="font-size:11.5px;margin-top:3px">${esc(z.camera_id)} ·
+        ${esc((z.points || []).length)} points ·
+        ${(z.classes || []).length ? esc((z.classes || []).join(", ")) : "any class"}
+        ${z.rule === "loitering" ? `· dwell ${esc(z.dwell_s)}s` : ""}</div>
+    </div>
+    <button onclick="delZone(${z.id})">Delete</button></div>`).join("")
+    : `<div class="empty">No rules configured.</div>`;
+
+  const events = await api("/api/zones/events?limit=50");
+  $("#zEvents").innerHTML = events.length
+    ? events.map(zoneEventHtml).join("") : `<div class="empty">No zone events yet.</div>`;
+}
+
+/* -------------------------------------------------------------- traffic --- */
+function sparks(values) {
+  const max = Math.max(1, ...values);
+  return `<div class="sparks">${values.map(v =>
+    `<i style="height:${Math.round(100 * v / max)}%" title="${esc(v)}"></i>`).join("")}</div>`;
+}
+const kv = (obj) => Object.entries(obj || {})
+  .map(([k, v]) => `${esc(k)} ${esc(v)}`).join(" · ") || "—";
+
+async function loadTraffic() {
+  const live = await api("/api/traffic/live");
+  const history = await api("/api/traffic/history?limit=1000");
+  const byCam = {};
+  history.forEach(h => (byCam[h.camera_id] = byCam[h.camera_id] || []).push(h.total));
+
+  const cams = live.cameras || [];
+  const totals = cams.reduce((a, c) => a + (c.total_counted || 0), 0);
+  const loop = cams.reduce((a, c) => a + (c.counted_this_loop || 0), 0);
+  const active = cams.reduce((a, c) => a + (c.active_tracks || 0), 0);
+  const loops = cams.length ? Math.max(...cams.map(c => c.loops_seen || 0)) : 0;
+  $("#tStats").innerHTML = [
+    card(cams.length, "Cameras counting", cams.length ? "ok" : ""),
+    card(active, "Active tracks", "", "being followed right now"),
+    card(loop, "Counted this loop", "ok", "current pass of the recording"),
+    card(totals, "Total counted", "", "cumulative across every replay"),
+    card(loops, "Loops seen", loops > 1 ? "warn" : "", "recording replays observed"),
+    card(live.zone_events ?? 0, "Zone events", live.zone_events ? "warn" : "", "rule breaches raised"),
+  ].join("");
+
+  const tb = $("#tblTraffic tbody");
+  tb.innerHTML = cams.length ? cams.map(c => {
+    const cam = CAMERAS.find(x => x.id === c.camera_id);
+    const hist = (byCam[c.camera_id] || []).slice(0, 30).reverse();
+    return `<tr>
+      <td><b>${esc(cam ? cam.name : c.camera_id)}</b>
+        <div class="faint mono" style="font-size:11px">${esc(c.camera_id)}</div></td>
+      <td class="mono">${esc(c.active_tracks)}</td>
+      <td class="mono" style="color:#4ade80;font-weight:700">${esc(c.counted_this_loop)}</td>
+      <td class="mono">${esc(c.total_counted)}</td>
+      <td class="mono faint">${esc(c.loops_seen)}</td>
+      <td class="mono faint">${esc(c.dropped_tracks)}</td>
+      <td class="dim">${kv(c.counts_by_class)}</td>
+      <td class="dim">${kv(c.directions)}</td>
+      <td class="mono">${esc(c.mean_dwell_s)}s</td>
+      <td style="min-width:110px">${hist.length ? sparks(hist)
+        : `<span class="faint">no snapshots</span>`}</td></tr>`;
+  }).join("") : `<tr><td colspan="10" class="empty">No cameras counting — start the pipeline.</td></tr>`;
+}
+$("#tRefresh").onclick = loadTraffic;
+$("#tSnap").onclick = async () => {
+  const r = await api("/api/traffic/snapshot", { method: "POST" });
+  toast(`Traffic snapshot written for ${esc(r.buckets_written)} camera(s).`);
+  loadTraffic();
+};
+
+/* --------------------------------------------------------- intelligence --- */
+async function loadIntel() {
+  if (!$("#iGroup").options.length) {
+    const groups = [...new Set(CAMERAS.map(c => c.time_group).filter(Boolean))].sort();
+    $("#iGroup").innerHTML = groups.map(g =>
+      `<option value="${esc(g)}">${esc(g)}</option>`).join("");
+  }
+  loadClones(); loadAnomalies(); loadJourneys();
+}
+$("#iRefresh").onclick = loadIntel;
+$("#iGroup").onchange = loadJourneys;
+
+async function loadClones() {
+  const r = await api("/api/analytics/cloned-plates");
+  const f = r.findings || [];
+  $("#iClones").innerHTML =
+    `<div class="faint" style="font-size:12px;margin-bottom:9px">${esc(r.note)}</div>` +
+    (f.length ? f.map(x => `<div class="finding" style="border-color:var(--bad);background:rgba(239,68,68,.06)">
+      <b class="mono" style="font-size:14px;color:#fff">${esc(x.plate)}</b>
+      <span class="faint mono" style="font-size:11px">· confidence ${esc(x.confidence)}</span>
+      <div style="margin-top:5px">${esc(x.sighting_a.camera_name)}
+        <span class="faint mono">${esc(x.sighting_a.at)}</span> &rarr;
+        ${esc(x.sighting_b.camera_name)}
+        <span class="faint mono">${esc(x.sighting_b.at)}</span></div>
+      <div class="dim" style="margin-top:4px">${esc(x.distance_km)} km ·
+        ${esc(x.elapsed_s)} s ·
+        ${x.implied_kmh == null ? "speed not computable" : esc(x.implied_kmh) + " km/h implied"}</div>
+      <div style="margin-top:5px">${esc(x.reason)}</div></div>`).join("")
+      : `<div class="empty">No cloned-plate findings in the stored detections.</div>`);
+}
+
+async function loadAnomalies() {
+  const r = await api("/api/analytics/anomalies");
+  const a = r.assessments || [];
+  const head = `<div class="faint" style="font-size:12px;margin-bottom:9px">
+    ${esc(r.cameras_assessed)} camera(s) assessed against ${esc(r.buckets_read)} stored buckets ·
+    ${esc(r.anomalies)} flagged. Cameras with too little history to judge are shown muted rather
+    than hidden: hiding them would imply coverage that does not exist.</div>`;
+  $("#iAnoms").innerHTML = head + (a.length ? a.map(x => {
+    const thin = x.status === "insufficient_data";
+    const colour = thin ? "var(--faint)" : (x.anomalous ? "var(--warn)" : "var(--ok)");
+    return `<div class="finding ${thin ? "muted" : ""}"
+      style="border-color:${colour};background:rgba(59,130,246,.05)">
+      <b class="mono">${esc(x.camera_id)}</b>
+      <span class="tag ${thin ? "t-unknown" : (x.anomalous ? "sev-high" : "t-anpr")}"
+        style="margin-left:6px">${esc(x.status)}</span>
+      <span class="faint mono" style="font-size:11px;margin-left:6px">hour ${esc(x.hour)} UTC ·
+        observed ${esc(x.observed)}${x.z_score == null ? "" : " · z " + esc(x.z_score)}</span>
+      <div style="margin-top:4px">${esc(x.explanation)}</div>
+      ${x.baseline ? `<div class="faint" style="font-size:11px;margin-top:3px">
+        baseline mean ${esc(x.baseline.mean)} · stdev ${esc(x.baseline.stdev)} ·
+        ${esc(x.baseline.samples)} samples</div>` : ""}</div>`;
+  }).join("") : `<div class="empty">No traffic snapshots stored yet — write one from the Traffic tab.</div>`);
+}
+
+async function loadJourneys() {
+  const g = $("#iGroup").value;
+  if (!g) { $("#iJourneys").innerHTML = `<div class="empty">No time group available.</div>`; return; }
+  const r = await api("/api/analytics/journeys?group=" + encodeURIComponent(g));
+  if (r.detail) { $("#iJourneys").innerHTML = `<div class="empty">${esc(r.detail)}</div>`; return; }
+  const idx = r.index || {};
+  let head = `<div class="faint" style="font-size:12px;margin-bottom:9px">
+    ${esc(r.note)}<br>Index: ${esc(idx.detections_in_group ?? 0)} detections ·
+    ${esc(idx.comparable ?? 0)} comparable ·
+    ${esc(idx.excluded_no_scene_time ?? 0)} without a scene clock ·
+    ${esc(idx.excluded_no_embedding ?? 0)} without an appearance vector.</div>`;
+  if (r.mining_skipped) {
+    head += `<div class="finding">Mining was skipped: this group has been mined already and held no
+      journeys, so it is not re-derived on every poll. Nothing re-mines on a timer —
+      next mine ${esc(r.next_mine)}.</div>`;
+  }
+  const js = r.journeys || [];
+  if (!js.length) {
+    $("#iJourneys").innerHTML = head +
+      `<div class="empty">No cross-camera journey found in the indexed recordings.</div>`;
+    return;
+  }
+  $("#iJourneys").innerHTML = head + js.map((j, n) => `<div class="panel" style="margin-bottom:12px">
+    <h3>Journey ${n + 1} · ${esc(j.hop_count)} hops · ${esc(j.total_km)} km ·
+      confidence ${esc(j.confidence)}
+      ${j.truncated ? `<span class="tag t-degraded">truncated</span>` : ""}</h3>
+    <div class="body">
+      ${j.note ? `<div class="faint" style="font-size:11.5px;margin-bottom:8px">${esc(j.note)}</div>` : ""}
+      ${(j.hops || []).map((h, i) => `<div class="hop">
+        <div class="num">${i + 1}</div>
+        <div style="flex:1">
+          <div><b>${esc(h.camera_name || h.camera_id)}</b>
+            <span class="faint mono">${esc(h.camera_id)}</span></div>
+          <div class="mono dim" style="font-size:11.5px">${esc(h.at)}</div>
+          <div style="font-size:11.5px;margin-top:3px">
+            ${esc(h.colour || "")} ${esc(h.vehicle_class || "")}
+            ${h.plate_text ? `· plate <span class="mono">${esc(h.plate_text)}</span>` : ""}
+            ${h.similarity != null ? `· <b style="color:#c99bff">similarity ${esc(h.similarity)}</b>`
+              : "· first sighting"}
+            ${h.leg_km != null ? `· ${esc(h.leg_km)} km · ${esc(h.implied_kmh ?? "?")} km/h` : ""}</div>
+          ${h.reason ? `<div class="faint" style="font-size:11px;margin-top:3px">${esc(h.reason)}</div>` : ""}
+          ${h.evidence_path ? `<img src="${esc(h.evidence_path)}">` : ""}
+        </div></div>`).join("")}
+    </div></div>`).join("");
+}

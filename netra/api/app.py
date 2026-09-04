@@ -9,7 +9,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (HTMLResponse, JSONResponse, Response,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import joinedload
@@ -158,6 +159,59 @@ def gap_analysis():
     }
 
 
+#: A snapshot opens an RTSP connection, so it is cached: an operator placing
+#: points in the zone editor clicks many times on one camera and must not cost
+#: one connection per click. Short enough that the still stays current.
+SNAPSHOT_TTL_S = 30.0
+SNAPSHOT_TIMEOUT_S = 25.0
+_snapshots: dict[str, tuple[float, bytes]] = {}
+
+
+@app.get("/api/cameras/{camera_id}/snapshot")
+def camera_snapshot(camera_id: str, refresh: bool = False):
+    """One still frame from a camera, for placing zone rules on.
+
+    Points are stored normalised, so the still only has to show the operator
+    the scene; it does not have to match the resolution the pipeline decodes.
+    """
+    import os
+    import subprocess
+    import tempfile
+    import time as _time
+
+    with SessionLocal() as db:
+        if not db.get(Camera, camera_id):
+            raise HTTPException(404, "camera not found")
+
+    cached = _snapshots.get(camera_id)
+    if cached and not refresh and (_time.time() - cached[0]) < SNAPSHOT_TTL_S:
+        data = cached[1]
+    else:
+        fd, path = tempfile.mkstemp(suffix=".jpg")
+        os.close(fd)
+        try:
+            subprocess.run(
+                ["ffmpeg", "-v", "error", "-rtsp_transport", "tcp",
+                 "-i", config.rtsp_url(camera_id), "-frames:v", "1",
+                 "-q:v", "4", path, "-y"],
+                capture_output=True, timeout=SNAPSHOT_TIMEOUT_S)
+            data = open(path, "rb").read() if os.path.exists(path) else b""
+        except Exception as exc:                      # timeout, no ffmpeg, ...
+            log.warning("snapshot failed for %s: %s", camera_id, exc)
+            data = b""
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+        if len(data) < 1000:
+            raise HTTPException(
+                503, f"could not grab a frame from {camera_id} within "
+                     f"{SNAPSHOT_TIMEOUT_S:.0f}s")
+        _snapshots[camera_id] = (_time.time(), data)
+
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store"})
+
+
 # -------------------------------------------------------------- detections --
 @app.get("/api/detections")
 def list_detections(camera_id: str | None = None, plate: str | None = None,
@@ -190,7 +244,10 @@ def list_detections(camera_id: str | None = None, plate: str | None = None,
             "vehicle_class": d.vehicle_class, "confidence": round(d.confidence, 3),
             "colour": d.colour, "plate_text": d.plate_text,
             "plate_conf": round(d.plate_conf, 3) if d.plate_conf else None,
+            "plate_chars": d.plate_chars,
             "evidence": d.evidence_path, "bbox": d.bbox,
+            "track_id": d.track_id,
+            "scene_time": d.scene_time.isoformat() if d.scene_time else None,
         } for d in rows]
     return {"total": total, "count": len(items), "items": items}
 
