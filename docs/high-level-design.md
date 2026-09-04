@@ -368,6 +368,40 @@ headroom. Approximately 400–550 such nodes cover 80,000 cameras; fewer with
 datacentre-class accelerators. Regional nodes are sized to district camera
 counts, and a node failure affects only its own district.
 
+### Bandwidth, measured
+
+The edge argument is easy to assert, so it was measured on the live grid rather
+than estimated. Four cameras were recorded over RTSP with no decoding, giving
+the true network payload, and compared against the size of the metadata those
+cameras produce.
+
+| Measurement | Result |
+|---|---|
+| Video, mean per camera | 0.34 Mbit/s (151 MB/hour) |
+| Metadata record, compact | 316 bytes |
+| Metadata record, with appearance embedding | 5,963 bytes |
+| Metadata per camera-hour at 3,000 detections/hour | 0.95 MB |
+| **Reduction, compact metadata** | **159x** |
+| Reduction, retaining embeddings centrally | 8x |
+
+Extrapolated to 80,000 cameras:
+
+| Approach | Sustained bandwidth |
+|---|---|
+| Continuous video to a central site | **~27 Gbit/s** |
+| Compact metadata from edge nodes | **~0.17 Gbit/s** (76 GB/hour) |
+
+Two notes on reading these figures honestly. First, the sandbox streams are
+comparatively low bitrate; production CCTV commonly runs several times higher,
+which makes the 159x reduction a **conservative** figure rather than an
+optimistic one. Second, the appearance embedding is what allows a vehicle to be
+matched across cameras, and is 512 floats. An edge node retains embeddings
+locally for within-district matching and forwards the compact record; embeddings
+cross the network only when a cross-district query needs them.
+
+Evidence crops are additional and are transmitted on demand or with an alert,
+not continuously.
+
 **Storage.** Metadata rather than video dominates: a detection row with an
 evidence crop is on the order of tens of kilobytes against gigabytes per camera
 per day for continuous recording. Hot, warm and cold tiers follow retention
@@ -384,7 +418,161 @@ catalogue import, not an integration project.
 
 ---
 
-## 9. Prerequisites from participating departments
+## 9. High availability and disaster recovery
+
+The failure domains are deliberately small, because a statewide policing
+platform must degrade rather than stop.
+
+| Failure | Effect | Recovery |
+|---|---|---|
+| One camera goes down | That camera only; others unaffected | Supervised worker reconnects with backoff, 2 s to a 30 s cap. Health reported in the registry. |
+| One camera sends corrupt video | Classified degraded at onboarding and excluded from analytics rather than producing noise | Reported for maintenance in the gap analysis |
+| A regional edge node fails | Analytics for that district pause. Departmental recording is untouched, because NETRA never held it. | Node restarts from the registry; cameras re-onboard automatically. Neighbouring districts unaffected. |
+| Central database unavailable | Edge nodes buffer metadata locally and forward on recovery | Detection continues; nothing already written to the edge is lost |
+| Central API unavailable | Console and alerting pause | Stateless services behind a load balancer; restart or failover |
+| Inference falls behind | Frames are dropped, never queued indefinitely | Bounded queue plus tier-2 admission control; the platform sheds load rather than collapsing |
+
+**No single point of data loss.** Departmental video remains under departmental
+control. NETRA holds derived metadata and evidence crops, replicated with the
+central database.
+
+**Backup.** Registry, watchlist and audit tables are small and are backed up on
+a conventional schedule. Detection tables are partitioned by time and district
+so old partitions archive without touching live operations. Evidence crops live
+on object storage with lifecycle rules matching the retention policy.
+
+**Recovery objectives** for a district node: recovery time under 15 minutes
+(restart and re-onboard from the registry); recovery point effectively zero for
+anything already forwarded, and bounded by the local buffer window otherwise.
+
+---
+
+## 10. Indicative costs
+
+Figures establish the order of magnitude and the shape of the cost, not a
+quotation. They follow from the measured throughput in section 7.
+
+### Per regional edge node
+
+| Item | Indicative cost (INR) |
+|---|---|
+| GPU server, single datacentre-class accelerator, 128 GB RAM | 8,00,000 - 12,00,000 |
+| Local storage, 20 TB for buffering and evidence | 1,50,000 |
+| Networking, UPS, rack | 1,00,000 |
+| **Per node, capital** | **~10,50,000 - 14,50,000** |
+
+One such node sustains on the order of 300-600 cameras, being several times the
+150-200 measured on a single laptop-class RTX 5050. For 80,000 cameras that
+implies roughly 150-250 nodes.
+
+### Statewide, indicative
+
+| Component | Indicative cost (INR crore) |
+|---|---|
+| Edge nodes, ~200 units | 21 - 29 |
+| Central cluster: API, database, object storage, DR site | 6 - 9 |
+| Network augmentation to district nodes | 4 - 7 |
+| Integration, deployment, departmental onboarding | 5 - 8 |
+| **Capital, total** | **~36 - 53** |
+| Annual operations: power, connectivity, AMC, staffing | ~8 - 12 per year |
+
+### What the architecture avoids
+
+The costs **not** incurred are the more important number.
+
+- **No centralised video recording.** Continuously recording 80,000 cameras at
+  the measured per-camera bitrate would require storage on the order of tens of
+  petabytes per month at a 30-day retention, plus the estate and power to hold
+  it. NETRA stores structured metadata and evidence crops instead.
+- **No backbone rebuild.** Edge nodes transmit metadata, not video (section 8),
+  which is the difference between a network upgrade programme and a software
+  deployment.
+- **No camera replacement programme as a precondition.** The platform consumes
+  the installed base as it is, and reports which cameras cannot deliver, so
+  replacement is prioritised by evidence rather than performed wholesale.
+- **No vendor lock-in.** Adding a VMS or protocol is one adapter, so future
+  procurement is not constrained by this platform's choices.
+
+### Benefit
+
+The measurable operational benefit is investigative time. Tracing a vehicle
+across departmental boundaries today means contacting control rooms
+individually and reviewing footage manually. The platform answers the same
+question from a single query and produces the timestamped movement history and
+evidence images as a report.
+
+The secondary benefit is the camera capability audit: the State's first
+evidence-based view of which of its cameras actually work, directing
+maintenance spending that is currently allocated without that visibility.
+
+---
+
+## 11. Statewide rollout plan
+
+Phased so that each phase produces something operationally useful and validates
+the assumptions of the next.
+
+**Phase 1 - District pilot (0-3 months).** One district, 500-1,000 cameras, one
+edge node. Objectives: confirm the per-node camera capacity extrapolated in
+section 8, complete the capability audit for that district, and establish the
+departmental onboarding process end to end. Deliverable: a working district
+control-room deployment and a measured sizing model.
+
+**Phase 2 - Multi-district and integration (3-9 months).** Four to six districts
+covering the range of conditions - dense urban, highway, border, rural. Bring
+the central tier into production, integrate authoritative watchlist sources
+(VAHAN, eGujCop/CCTNS), and establish access control and audit under real
+operational governance. Deliverable: cross-district vehicle tracing.
+
+**Phase 3 - Departmental expansion (9-18 months).** Onboard departments beyond
+Home: Transport, Food and Civil Supplies, Municipal Corporations. Each is a
+catalogue import plus, where a new VMS is involved, one adapter. Deliverable:
+the unified statewide registry that Model 1 specifies.
+
+**Phase 4 - Statewide coverage (18-36 months).** Remaining districts, node by
+node, prioritised by camera density and crime statistics. Deliverable: full
+coverage with district-level failure isolation.
+
+**Throughout.** The capability audit runs continuously, so maintenance
+priorities stay current rather than being a one-off survey.
+
+---
+
+## 12. Future roadmap
+
+Ordered by the value each adds against the effort it costs.
+
+**Near term**
+
+- Vehicle-specific re-identification model, trained on VeRi-776 or equivalent,
+  replacing the general-purpose backbone. The interface does not change; only
+  cross-camera precision improves.
+- ANPR-grade camera placement guidance derived from the capability audit. The
+  platform already knows which cameras cannot read plates and why, which is
+  precisely the input a placement programme needs.
+- Model 3 federation adapters for departments that prefer to expose a VMS API
+  rather than direct camera access.
+
+**Medium term**
+
+- Facial recognition on cameras where facial geometry supports it, gated by the
+  same measured-capability approach used for plates, and subject to the legal
+  and privacy framework governing its use.
+- Automatic incident detection: stopped vehicle on a carriageway, wrong-way
+  movement, sudden crowd formation. Tracking already provides the primitives.
+- Predictive maintenance for cameras, from the health history the registry
+  accumulates.
+
+**Longer term**
+
+- Multi-modal correlation with other authorised State data sources, under the
+  same audit regime.
+- Federated analytics across districts, so a query can run statewide without
+  centralising the underlying data.
+
+---
+
+## 13. Prerequisites from participating departments
 
 To assess integration feasibility, each department should supply:
 
@@ -403,7 +591,7 @@ determined automatically and continuously.
 
 ---
 
-## 10. Assumptions and limitations
+## 14. Assumptions and limitations
 
 Stated explicitly, because a proposal that hides them is less useful.
 
@@ -424,7 +612,7 @@ Stated explicitly, because a proposal that hides them is less useful.
 
 ---
 
-## 11. Deployment
+## 15. Deployment
 
 Containerised on the CUDA 12.8 runtime required by Blackwell GPUs, with model
 weights and the database on a mounted volume. A health endpoint supports
