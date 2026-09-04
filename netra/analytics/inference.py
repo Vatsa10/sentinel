@@ -133,6 +133,9 @@ class InferenceEngine:
         #: and zone rules are all built on
         from netra.analytics.tracking import TrackerRegistry
         self.trackers = TrackerRegistry()
+        #: camera_id -> PlateVoter; plate reads from one tracked vehicle vote
+        #: together, because a single frame's read is a guess
+        self._plate_voters: dict = {}
         #: set by the pipeline so zone rules can be evaluated here, where the
         #: tracks live
         self.zone_engine = None
@@ -140,7 +143,8 @@ class InferenceEngine:
 
         self.stats = {"submitted": 0, "dropped": 0, "processed": 0,
                       "vehicles": 0, "plates": 0, "embedded": 0,
-                      "clocks_anchored": 0, "infer_ms": 0.0}
+                      "clocks_anchored": 0, "plate_votes": 0,
+                      "infer_ms": 0.0}
 
     # -- model loading -------------------------------------------------------
     def load(self) -> None:
@@ -218,6 +222,7 @@ class InferenceEngine:
         self._clocks.pop(camera_id, None)
         self._clock_attempts.pop(camera_id, None)
         self.trackers.reset(camera_id)
+        self._plate_voters.pop(camera_id, None)
         if self.zone_engine is not None:
             self.zone_engine.reset_camera(camera_id)
 
@@ -352,6 +357,12 @@ class InferenceEngine:
         tracker = self.trackers.get(frame.camera_id)
         tracker.update(detections, frame.pts_ms)
 
+        # Tracking has now assigned track ids, so the per-frame plate reads
+        # taken above can be pooled per vehicle and voted on. A read from one
+        # frame is a guess; ten reads of the same track are evidence.
+        if capability == "anpr":
+            self._vote_plates(frame, tracker, detections)
+
         if self.zone_engine is not None:
             try:
                 h, w = img.shape[:2]
@@ -371,6 +382,36 @@ class InferenceEngine:
 
         self.stats["processed"] += 1
         self.stats["infer_ms"] = round((time.time() - t0) * 1000, 1)
+
+    def _vote_plates(self, frame, tracker, detections: list) -> None:
+        """Fold this frame's plate reads into each track's running vote."""
+        voter = self._plate_voters.get(frame.camera_id)
+        if voter is None:
+            from netra.analytics.plate_vote import PlateVoter
+            voter = self._plate_voters[frame.camera_id] = PlateVoter()
+
+        for det in detections:
+            if det.track_id is None:
+                continue
+            if det.plate_text:
+                voter.add(det.track_id, det.plate_text,
+                          det.plate_conf or 0.0, frame.pts_ms)
+            result = voter.consensus(det.track_id)
+            if result is None:
+                continue
+            text, conf, count = result
+            if count < 2:
+                # Nothing was voted on, so leave this frame's own read alone
+                # rather than restating it as a consensus it is not.
+                continue
+            det.plate_text = text
+            det.plate_conf = conf
+            det.plate_chars = len(text)
+            self.stats["plate_votes"] += 1
+
+        # The tracker expires stale tracks internally; without this the voter
+        # would hold reads for vehicles that left the frame long ago.
+        voter.retain(tracker.tracks.keys())
 
     def _read_plate(self, img, det: VehicleDetection) -> None:
         """Localise and read the plate on one vehicle."""
