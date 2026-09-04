@@ -773,6 +773,35 @@ def traffic_history(camera_id: str | None = None, limit: int = Query(200, le=100
         } for r in rows]
 
 
+# ---------------------------------------------------------------- storage --
+@app.get("/api/storage")
+def storage(_p=Depends(require("read"))):
+    """What the evidence directory and detections table hold, against budget."""
+    from netra.core import retention
+    return retention.storage_report()
+
+
+@app.post("/api/storage/prune")
+def storage_prune(dry_run: bool = False, _p=Depends(require("manage"))):
+    """Bring evidence and detections back inside their configured budgets.
+
+    Guarded by `manage` and audited: this deletes evidence, and who asked for
+    that deletion is exactly the kind of thing an enquiry later asks about.
+    `dry_run` reports what would go without touching anything.
+    """
+    from netra.core import retention
+    evidence = retention.prune_evidence(dry_run=dry_run)
+    detections = retention.prune_detections(dry_run=dry_run)
+    _audit("storage.prune", detail={"dry_run": dry_run,
+                                    "files_deleted": evidence["deleted"],
+                                    "bytes_freed": evidence["bytes_freed"],
+                                    "rows_deleted": detections["deleted"],
+                                    "retained_protected":
+                                        evidence["retained_protected"]})
+    return {"evidence": evidence, "detections": detections,
+            "storage": retention.storage_report()}
+
+
 @app.get("/api/analytics/cloned-plates")
 def cloned_plates(min_confidence: float = Query(0.6, ge=0.0, le=0.99),
                   limit: int = Query(50, ge=1, le=500)):

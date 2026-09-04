@@ -56,6 +56,46 @@ PLATE_MIN_VEHICLE_PX = 110
 #: pipeline at roughly 50ms per vehicle.
 PLATE_MAX_PER_FRAME = 4
 
+#: Mean luma below which a frame carries no scene at all. The registry
+#: classifies dead cameras at onboarding, but a camera can go dark afterwards -
+#: nightfall, a failed IR illuminator, a lens cover - and a black feed still
+#: costs a full YOLO pass per frame, forever, on a GPU that is the scarcest
+#: resource here. Measured across this grid, usable night frames sit well above
+#: 18 while dead feeds sit near zero.
+DARK_LUMA_THRESHOLD = 18
+#: Consecutive dark frames with nothing detected before a camera is skipped.
+#: Sixty at tier-1 rate is about a minute, which is long enough that a lorry
+#: parked against the lens or a passing cloud cannot trip it.
+DARK_FRAME_LIMIT = 60
+#: A dark camera is re-tested every this many frames so it recovers on its own
+#: at dawn. At tier-1 rate that is a probe roughly every five minutes: cheap
+#: against the ~99.7% of inference passes it saves, and quick enough that no
+#: real traffic is missed for long.
+DARK_RECHECK_FRAMES = 300
+#: Stride used to downscale a frame before measuring luma. Sampling every 8th
+#: pixel is a numpy view rather than a copy, so the measurement costs
+#: microseconds - it must not become a cost of its own.
+LUMA_SAMPLE_STRIDE = 8
+
+
+def mean_luma(image) -> float:
+    """Mean brightness of a frame, measured on a strided sample.
+
+    BT.601 weights on BGR. Deliberately not cv2.cvtColor over the full frame:
+    that allocates a greyscale copy of every frame on every camera, which is
+    real cost to answer a question about darkness.
+    """
+    if image is None or getattr(image, "size", 0) == 0:
+        return 0.0
+    sample = image[::LUMA_SAMPLE_STRIDE, ::LUMA_SAMPLE_STRIDE]
+    if sample.size == 0:
+        return 0.0
+    if sample.ndim == 3 and sample.shape[2] >= 3:
+        b, g, r = (sample[:, :, 0].mean(), sample[:, :, 1].mean(),
+                   sample[:, :, 2].mean())
+        return float(0.114 * b + 0.587 * g + 0.299 * r)
+    return float(sample.mean())
+
 
 @dataclass
 class VehicleDetection:
@@ -143,6 +183,12 @@ class InferenceEngine:
         #: camera_id -> PlateVoter; plate reads from one tracked vehicle vote
         #: together, because a single frame's read is a guess
         self._plate_voters: dict = {}
+        #: camera_id -> consecutive dark, empty frames seen
+        self._dark_streak: dict = {}
+        #: camera_id -> when it was marked dark; presence means "skip"
+        self._dark_cameras: dict = {}
+        #: camera_id -> frames skipped since the last probe
+        self._dark_skipped: dict = {}
         #: set by the pipeline so zone rules can be evaluated here, where the
         #: tracks live
         self.zone_engine = None
@@ -151,6 +197,7 @@ class InferenceEngine:
         self.stats = {"submitted": 0, "dropped": 0, "processed": 0,
                       "vehicles": 0, "plates": 0, "embedded": 0,
                       "clocks_anchored": 0, "plate_votes": 0,
+                      "dark_cameras": 0, "dark_frames_skipped": 0,
                       "infer_ms": 0.0}
 
     # -- model loading -------------------------------------------------------
@@ -230,6 +277,10 @@ class InferenceEngine:
         self._clock_attempts.pop(camera_id, None)
         self.trackers.reset(camera_id)
         self._plate_voters.pop(camera_id, None)
+        self._dark_streak.pop(camera_id, None)
+        self._dark_cameras.pop(camera_id, None)
+        self._dark_skipped.pop(camera_id, None)
+        self.stats["dark_cameras"] = len(self._dark_cameras)
         if self.zone_engine is not None:
             self.zone_engine.reset_camera(camera_id)
 
@@ -300,6 +351,9 @@ class InferenceEngine:
         if capability == "degraded":
             return  # corrupt or unusable feed; health monitoring only
 
+        if not self._dark_gate(frame.camera_id):
+            return  # feed has gone dark; skipping until the next probe frame
+
         self._anchor_clock(frame)
         anchor = self._clocks.get(frame.camera_id)
         scene_time = anchor.at(frame.pts_ms) if anchor else None
@@ -322,8 +376,10 @@ class InferenceEngine:
             return
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
+            self._note_luma(frame.camera_id, img, found=False)
             self.stats["processed"] += 1
             return
+        self._note_luma(frame.camera_id, img, found=True)
 
         detections: list[VehicleDetection] = []
         for box in boxes:
@@ -408,6 +464,53 @@ class InferenceEngine:
 
         self.stats["processed"] += 1
         self.stats["infer_ms"] = round((time.time() - t0) * 1000, 1)
+
+    # -- dark feeds ----------------------------------------------------------
+    def _dark_gate(self, camera_id: str) -> bool:
+        """False while this camera is dark and not due for its probe frame.
+
+        A camera marked dark is never abandoned: one frame in every
+        DARK_RECHECK_FRAMES goes through the full pass, so dawn, a restored
+        illuminator or an uncovered lens brings it back with no operator
+        action. Recovery is decided by that frame's own result, in _note_luma.
+        """
+        if camera_id not in self._dark_cameras:
+            return True
+        seen = self._dark_skipped.get(camera_id, 0) + 1
+        if seen < DARK_RECHECK_FRAMES:
+            self._dark_skipped[camera_id] = seen
+            self.stats["dark_frames_skipped"] += 1
+            return False
+        self._dark_skipped[camera_id] = 0
+        return True
+
+    def _note_luma(self, camera_id: str, img, found: bool) -> None:
+        """Track the dark-frame streak for one camera.
+
+        Darkness alone is not enough to stop looking: a genuinely dark scene
+        that still yields detections is a camera doing its job. Only frames
+        that are both dark *and* empty count towards the streak, and either
+        condition failing clears it and restores the camera.
+        """
+        if not found and mean_luma(img) < DARK_LUMA_THRESHOLD:
+            streak = self._dark_streak.get(camera_id, 0) + 1
+            self._dark_streak[camera_id] = streak
+            if streak >= DARK_FRAME_LIMIT and camera_id not in self._dark_cameras:
+                self._dark_cameras[camera_id] = time.time()
+                self._dark_skipped[camera_id] = 0
+                log.warning("%s has produced %d dark, empty frames - skipping "
+                            "inference, re-testing every %d frames",
+                            camera_id, streak, DARK_RECHECK_FRAMES)
+        else:
+            self._dark_streak.pop(camera_id, None)
+            if self._dark_cameras.pop(camera_id, None) is not None:
+                self._dark_skipped.pop(camera_id, None)
+                log.info("%s is no longer dark - resuming inference", camera_id)
+        self.stats["dark_cameras"] = len(self._dark_cameras)
+
+    def dark_cameras(self) -> list[str]:
+        """Cameras currently being skipped, for pipeline status."""
+        return sorted(self._dark_cameras)
 
     def _vote_plates(self, frame, tracker, detections: list) -> None:
         """Fold this frame's plate reads into each track's running vote."""
@@ -506,3 +609,59 @@ def _run_ocr(reader, crop) -> tuple[str | None, float | None]:
     if len(text) < 4:
         return None, None
     return text, float(best[2])
+
+
+def _self_check() -> None:
+    """Check the dark-feed short-circuit without loading a model or a GPU."""
+    engine = InferenceEngine.__new__(InferenceEngine)  # no models, no threads
+    engine._dark_streak, engine._dark_cameras, engine._dark_skipped = {}, {}, {}
+    engine.stats = {"dark_cameras": 0, "dark_frames_skipped": 0}
+
+    black = np.zeros((240, 320, 3), dtype=np.uint8)
+    lit = np.full((240, 320, 3), 90, dtype=np.uint8)
+    assert mean_luma(black) == 0.0
+    assert mean_luma(lit) > DARK_LUMA_THRESHOLD
+    assert mean_luma(None) == 0.0
+
+    # Dark but not yet decided: one frame short of the limit still runs.
+    for _ in range(DARK_FRAME_LIMIT - 1):
+        engine._note_luma("CAM1", black, found=False)
+    assert engine._dark_cameras == {}, engine._dark_streak
+    assert engine._dark_gate("CAM1") is True
+
+    engine._note_luma("CAM1", black, found=False)
+    assert "CAM1" in engine._dark_cameras
+    assert engine.dark_cameras() == ["CAM1"]
+    assert engine.stats["dark_cameras"] == 1
+
+    # Skipped until the probe frame, then one frame goes through.
+    for _ in range(DARK_RECHECK_FRAMES - 1):
+        assert engine._dark_gate("CAM1") is False
+    assert engine.stats["dark_frames_skipped"] == DARK_RECHECK_FRAMES - 1
+    assert engine._dark_gate("CAM1") is True          # the probe
+    assert engine._dark_gate("CAM1") is False         # back to skipping
+
+    # A probe that finds light must restore the camera by itself.
+    engine._note_luma("CAM1", lit, found=False)
+    assert engine._dark_cameras == {} and engine._dark_streak == {}
+    assert engine.stats["dark_cameras"] == 0
+
+    # A dark scene that still yields detections is a camera doing its job and
+    # must never be short-circuited, however long it stays dark.
+    for _ in range(DARK_FRAME_LIMIT * 2):
+        engine._note_luma("CAM2", black, found=True)
+    assert "CAM2" not in engine._dark_cameras
+    assert engine._dark_gate("CAM2") is True
+
+    # A streak broken before the limit starts again from zero.
+    for _ in range(DARK_FRAME_LIMIT - 1):
+        engine._note_luma("CAM3", black, found=False)
+    engine._note_luma("CAM3", black, found=True)
+    engine._note_luma("CAM3", black, found=False)
+    assert engine._dark_streak["CAM3"] == 1 and "CAM3" not in engine._dark_cameras
+
+    print("inference self-check passed")
+
+
+if __name__ == "__main__":
+    _self_check()

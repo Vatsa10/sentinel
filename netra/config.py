@@ -109,3 +109,21 @@ RECONNECT_BASE_S = 2.0
 RECONNECT_MAX_S = 30.0
 # A backwards PTS jump larger than this means the loop restarted, not jitter.
 LOOP_CUT_THRESHOLD_MS = 2000.0
+
+# --- retention ---------------------------------------------------------------
+# Evidence and detections both grow without limit while the pipeline runs: one
+# JPEG and one row per observed vehicle, forever. These are the ceilings the
+# pruner enforces so a long deployment cannot fill the disk or the database.
+# 5 GiB is roughly a fortnight of evidence at the measured crop size on this
+# grid, and leaves room on the smallest edge node we target.
+EVIDENCE_MAX_BYTES = int(os.getenv("NETRA_EVIDENCE_MAX_BYTES", str(5 * 1024**3)))
+# Beyond a week an evidence crop is no longer operationally useful; the
+# detection row and its metadata survive far longer for trend and route work.
+EVIDENCE_MAX_AGE_DAYS = int(os.getenv("NETRA_EVIDENCE_MAX_AGE_DAYS", "7"))
+# Row cap on the detections table. SQLite query plans on the indexed columns
+# stay comfortable to a few million rows; past that the console's time-window
+# queries start to be felt.
+DETECTION_MAX_ROWS = int(os.getenv("NETRA_DETECTION_MAX_ROWS", "2000000"))
+# Floor under the row cap: recent detections are never pruned however far over
+# the cap the table is, because they are what an operator is actively querying.
+DETECTION_KEEP_DAYS = int(os.getenv("NETRA_DETECTION_KEEP_DAYS", "1"))

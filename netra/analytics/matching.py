@@ -83,6 +83,95 @@ def plate_similarity(observed: str, target: str) -> tuple[float, str]:
     return score, f"{agree}/{span} characters agree ({obs} vs {tgt})"
 
 
+# --- watchlist prefilter -----------------------------------------------------
+# `score_match` is cheap, but a watchlist of 10,000 entries scored against
+# every detection at thousands of detections per minute is tens of millions of
+# comparisons per minute, on the thread that also has to persist detections.
+# The prefilter's only job is to drop entries that cannot possibly match, so
+# full scoring still decides every candidate and the matching behaviour
+# downstream is unchanged.
+INDEX_WINDOW = 4
+
+
+def plate_windows(plate: str | None) -> set[str]:
+    """Every INDEX_WINDOW-character window of the confusion-folded plate.
+
+    Windows, not a prefix: `plate_similarity` matches an observed read that is
+    a *substring* of the watchlist plate, so "AB1234" must find "GJ01AB1234"
+    even though their first four characters have nothing in common. Folding
+    first is equally load-bearing - comparison happens on folded text, so an
+    index built on raw text would miss every OCR confusion the matcher is
+    specifically designed to absorb.
+    """
+    folded = normalise_plate(plate)
+    if len(folded) < INDEX_WINDOW:
+        return set()
+    return {folded[i:i + INDEX_WINDOW]
+            for i in range(len(folded) - INDEX_WINDOW + 1)}
+
+
+class WatchlistIndex:
+    """Entries bucketed by the windows of their plate, for candidate lookup.
+
+    Built once per watchlist reload and thrown away with it; nothing here is
+    incremental, because a rebuild over 10,000 entries is a few milliseconds
+    every thirty seconds.
+
+    ponytail: an entry whose plate folds to fewer than INDEX_WINDOW characters
+    goes in a bucket that is always considered, since no window can be formed
+    from it and `plate_similarity` may still score it positionally. If a
+    watchlist were mostly two-character stubs the prefilter would degrade to
+    the full scan it replaces - which is correct, just not fast.
+    """
+
+    def __init__(self, entries: list[dict] | None = None):
+        self.entries: list[dict] = list(entries or [])
+        self._buckets: dict[str, list[dict]] = {}
+        self._short: list[dict] = []
+        for entry in self.entries:
+            windows = plate_windows(entry.get("plate"))
+            if not windows:
+                self._short.append(entry)
+                continue
+            for key in windows:
+                self._buckets.setdefault(key, []).append(entry)
+
+    def candidates(self, plate_text: str | None) -> list[dict]:
+        """Entries worth scoring against this observed plate.
+
+        A detection is tested against the buckets of every window of its own
+        folded plate, so a partial read matches wherever it sits inside the
+        target. Order is stable so alert ordering does not change with the
+        prefilter's internals.
+        """
+        windows = plate_windows(plate_text)
+        if not windows:
+            # Too little recovered to index on. `plate_similarity` refuses to
+            # score reads this short anyway, but the short bucket is returned
+            # rather than nothing so the filter never invents a rule the
+            # scorer does not have.
+            return list(self._short)
+
+        seen: set[int] = set()
+        out: list[dict] = []
+        for key in windows:
+            for entry in self._buckets.get(key, ()):
+                marker = id(entry)
+                if marker not in seen:
+                    seen.add(marker)
+                    out.append(entry)
+        for entry in self._short:
+            if id(entry) not in seen:
+                out.append(entry)
+        return out
+
+    def stats(self) -> dict:
+        return {"entries": len(self.entries), "buckets": len(self._buckets),
+                "unindexed": len(self._short),
+                "largest_bucket": max((len(v) for v in self._buckets.values()),
+                                      default=0)}
+
+
 def appearance_similarity(det_class: str | None, det_colour: str | None,
                           wl_class: str | None, wl_colour: str | None) -> tuple[float, str]:
     """Score vehicle class and colour agreement.
@@ -242,6 +331,72 @@ def _self_check() -> None:
     assert not ok, why
     ok, why = spacetime_plausible(distance_km=2.0, elapsed_s=180)
     assert ok, why
+
+    # --- watchlist prefilter ------------------------------------------------
+    entries = [{"id": 1, "plate": "GJ01AB1234"},
+               {"id": 2, "plate": "MH12XY9999"},
+               {"id": 3, "plate": "GJ18CD5678"},
+               {"id": 4, "plate": "XY9"}]          # too short to index
+    index = WatchlistIndex(entries)
+
+    # The property the prefilter exists to preserve: a partial read that full
+    # scoring would match must survive it. A naive first-four-characters index
+    # would bucket entry 1 under "GJ01" and never consider it for "AB1234",
+    # silently losing an alert - which is why the index is built on windows.
+    got = {e["id"] for e in index.candidates("AB1234")}
+    assert 1 in got, got
+    assert score_match({"plate_text": "AB1234"}, entries[0]).reasons["plate"]["score"] > 0.5
+
+    # Confusion folding happens before bucketing, so an OCR read of "AB1Z34"
+    # still finds the entry written "AB1234".
+    assert 1 in {e["id"] for e in index.candidates("GJ0IAB1Z34")}
+
+    # An exact read reaches its own entry and skips the unrelated ones.
+    got = {e["id"] for e in index.candidates("GJ01AB1234")}
+    assert got == {1, 4}, got          # 4 is the always-considered short bucket
+    assert 2 not in got and 3 not in got, got
+
+    # A read too short to index still sees the short bucket rather than
+    # nothing, so the prefilter never enforces a rule the scorer does not.
+    assert {e["id"] for e in index.candidates("G1")} == {4}
+
+    # Superset property over realistic degradations: contiguous partial reads
+    # and OCR confusions, which is what this grid actually produces.
+    import random
+    rng = random.Random(7)
+    plates = [f"GJ{rng.randint(1, 38):02d}{chr(65 + rng.randrange(26))}"
+              f"{chr(65 + rng.randrange(26))}{rng.randint(0, 9999):04d}"
+              for _ in range(200)]
+    corpus = [{"id": i, "plate": p} for i, p in enumerate(plates)]
+    big = WatchlistIndex(corpus)
+    scanned = 0
+    for target in plates[:40]:
+        start = rng.randrange(0, len(target) - 4)
+        observed = target[start:start + rng.randint(4, len(target) - start)]
+        observed = "".join(
+            {"0": "O", "1": "I", "5": "S"}.get(ch, ch) for ch in observed)
+        candidates = big.candidates(observed)
+        scanned += len(candidates)
+        keep = {id(e) for e in candidates}
+        for entry in corpus:
+            if score_match({"plate_text": observed}, entry).is_alert:
+                assert id(entry) in keep, (observed, entry)
+    # It must actually filter, or it is a scan with extra steps.
+    assert scanned < 40 * len(corpus) * 0.5, scanned
+
+    # The honest ceiling. `plate_similarity` also scores positional agreement,
+    # and two plates can agree on 70% of their characters with the mismatches
+    # spread out so that they share no 4-character window at all. Such a pair
+    # is not a candidate. It needs three scattered OCR errors in one read -
+    # degraded enough that the fused score rarely clears the alert threshold -
+    # and the alternative, a 2-character index, buckets 10,000 entries into
+    # 1,296 keys and prefilters almost nothing. Pinned here so the trade-off
+    # is visible rather than discovered.
+    missed_obs, missed_tgt = "GJX1AX12X4", "GJ01AB1234"
+    assert plate_similarity(missed_obs, missed_tgt)[0] > 0
+    assert not (plate_windows(missed_obs) & plate_windows(missed_tgt))
+    assert not score_match({"plate_text": missed_obs},
+                           {"plate": missed_tgt}).is_alert
 
     print("matching self-check passed")
 

@@ -15,7 +15,7 @@ import cv2
 
 from netra import config
 from netra.analytics.inference import InferenceEngine
-from netra.analytics.matching import score_match
+from netra.analytics.matching import WatchlistIndex, score_match
 from netra.core.db import SessionLocal
 from netra.core.models import (Alert, Camera, Detection, TrafficStat,
                                WatchlistEntry, ZoneEventRow, ZoneRule)
@@ -43,6 +43,7 @@ class Pipeline:
         self._lock = threading.Lock()
 
         self._watchlist_cache: list[dict] = []
+        self._watchlist_index = WatchlistIndex([])
         self._watchlist_loaded_at = 0.0
         self.running = False
         self.started_at: datetime | None = None
@@ -294,6 +295,10 @@ class Pipeline:
                     "vehicle_colour": e.vehicle_colour, "case_ref": e.case_ref,
                     "owner_name": e.owner_name, "source_db": e.source_db,
                 } for e in entries]
+            # Rebuilt with the cache, never separately: an index describing a
+            # watchlist that has already changed would silently stop
+            # considering entries that were just added.
+            self._watchlist_index = WatchlistIndex(self._watchlist_cache)
             self._watchlist_loaded_at = time.time()
         return self._watchlist_cache
 
@@ -304,7 +309,14 @@ class Pipeline:
             "vehicle_class": det.vehicle_class,
             "colour": det.colour,
         }
-        for entry in self._watchlist():
+        # Refresh the cache, then score only the entries whose plate shares a
+        # character window with this read. Full scoring still decides each
+        # candidate, so partial and confusion-folded matching is unchanged;
+        # this only avoids scoring entries that could not match. At 10,000
+        # entries that is the difference between 10,000 comparisons per
+        # detection and a few dozen, on the thread that also persists rows.
+        self._watchlist()
+        for entry in self._watchlist_index.candidates(det.plate_text):
             result = score_match(candidate, entry)
             if not result.is_alert:
                 continue
@@ -376,6 +388,11 @@ class Pipeline:
             "scheduling": self.supervisor.scheduling(),
             "traffic": self.engine.trackers.stats(),
             "zone_events": self.stats["zone_events"],
+            "watchlist_index": self._watchlist_index.stats(),
+            # Cameras the engine has stopped inferring on because their feed
+            # went black. Surfaced rather than silent: a control room must be
+            # able to see that a camera is no longer being looked at.
+            "dark_cameras": self.engine.dark_cameras(),
             "persistence": self.stats,
             "cameras": self.supervisor.health(),
         }
