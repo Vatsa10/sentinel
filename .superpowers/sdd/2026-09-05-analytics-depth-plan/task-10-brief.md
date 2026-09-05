@@ -12,6 +12,24 @@ Tier C is only if time remains and must not expand scope.
 
 ### Tier A — must fix (correctness, honesty, security)
 
+**A0. The scene-clock attempt budget is never consumed (Task 6 round-5
+carry-over, load-bearing).** In `InferenceEngine._anchor_clock`,
+`self._clock_attempts[cam] = 0` runs on *every* successful overlay read,
+including one that then contradicts the pending candidate. Measured: a
+camera fed 200 mutually-contradicting readings produced 200 OCR calls, ended
+with `_clock_attempts == 0`, and never gave up. On the live (opportunistic)
+path there is no spacing gate, only the queue-slack check, so a jittery or
+partially-occluded overlay can OCR on every slack frame indefinitely — the
+exact starvation the cap exists to prevent (its comment cites 83% frames
+dropped without it). Fix: reset the attempt counter only on a **corroborated**
+anchor, and count contradictions against the budget so a camera that never
+agrees with itself gives up within `CLOCK_ATTEMPT_LIMIT` (live) /
+`INDEX_CLOCK_ATTEMPT_LIMIT` (exhaustive). Keep the existing behaviour that a
+re-anchor after `CLOCK_REANCHOR_AFTER_S` gets a fresh budget. Self-check in
+`inference._self_check`: 200 contradicting reads on the live path must stop
+issuing OCR calls after the limit, and a later agreeing pair must still be
+able to anchor once the re-anchor window opens.
+
 **A1. Purge or null the pre-corroboration scene times.** ~11,000 `Detection`
 rows carry `scene_time` values written before corroborated anchoring landed,
 including provably wrong spans (`2025-06-14`, `2026-06-24`, `2028-06-13`).
@@ -79,6 +97,36 @@ tile label.
 **B5. `candidates()` order stability.** `WatchlistIndex.candidates` documents
 "Order is stable" while iterating a `set` of window keys. Sort the keys.
 
+**B6. FP16 inference, two flags.** Pass `half=True` on every
+`self._vehicle_model.predict(...)` call in `inference.py` when
+`config.DEVICE == "cuda"`, and call `.half()` on the ReID backbone in
+`reid.py` (cast the input tensor to match). No INT8, no TensorRT — detection
+is not the bottleneck (13 ms/frame measured; OCR, writes and escalation were),
+and TensorRT on sm_120 is a day's risk for a number that does not move the
+demo. Verify: `inference` and `reid` self-checks still pass; a 30-second live
+run on 5 cameras still shows 0% dropped; report before/after `infer_ms`.
+
+**B7. HLD capacity numbers, say which is which.** `docs/high-level-design.md`
+§7–8 cite ~6 ms/frame and 150–200 cameras per node at tier-1. Add one
+paragraph distinguishing *tier-1 scanning capacity* (that figure) from
+*full-pipeline capacity* under admission control — detection + ReID + OCR +
+zones at 0% frame loss, measured at roughly 8 simultaneously escalated busy
+junctions on an RTX 5050. Both are measured; they answer different questions,
+and the scale story must not let a reader multiply the wrong one.
+
+**B8. Duplicated block in `netra/pipeline.py`.** `ATTRIBUTE_BROADCAST_BOUND_S`
+is defined twice (with its comment), and the attribute-worker `__init__`
+block (`_attr_queue`, `_attr_stop`, `_attr_thread`, `_attr_last`,
+`attribute_stats` + comment) is duplicated verbatim. Behaviourally harmless;
+remove the first copy of each. Verify the attribute self-check and a live
+`/api/pipeline/status` still show the worker stats.
+
+**B9. Single-word descriptions as retrieval keys.** Descriptions like
+`"yellow"` enter the BM25 `vehicle` corpus and tie arbitrarily. Gate indexing
+on at least two populated structured fields or a description of ≥ 2 tokens;
+pin in `retrieval._self_check` that a one-word description is not indexed
+and a two-token one is.
+
 ### Tier C — only if time remains
 
 **C1.** Traffic tab auto-poll every 5 s while visible.
@@ -86,6 +134,9 @@ tile label.
 case.
 **C3.** `core/timing.py` gets its own `_self_check()` pinning
 scene-time-over-wall-time preference (currently pinned nowhere).
+**C4.** `index_run3.start` was committed to the repo root by the
+auto-committer. `git rm` it and add `*.start` to `.gitignore` (`*.log` is
+already there — verify, do not duplicate).
 
 ### Explicitly not in scope — ruled, do not touch
 

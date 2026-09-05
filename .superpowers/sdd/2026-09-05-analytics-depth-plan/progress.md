@@ -304,3 +304,52 @@ Task 10 (issues sweep) brief written from the 27 deferred/carried ledger
   items, triaged A (must: uncorroborated scene_time isolation + purge tool,
   plate vote persistence, console snapshot under auth, tracker-restart class
   breakdown) / B (should) / C (if time). Gated on Task 9 closing.
+History rewrite: the Task 9 implementer rebased the auto-committer's sweep
+  (32e93a1) away. Earlier ledger SHAs from 808fdef onward are stale; the
+  commits exist under new hashes (round-4 corroboration is now acaa072).
+  Content verified intact via self-checks. The uncommitted A0/C4 edits to
+  task-10-brief.md were lost in that reset and have been re-applied.
+Task 9: landed as c189737 (sweep) + 200d315 + c89d4d1. Report present. Live
+  check: 5 cameras ~95s, 0 dropped frames, attributes queued 14 / processed
+  14 / dropped 0, model load 9.9s, 453 MiB, 908-985 ms per crop warm.
+  Review package generated over acaa072..c89d4d1.
+Session restart: previous Claude Code process exited with the Task 9 reviewer
+  mid-run (no result). Task 9 implementer had already landed (c89d4d1) and
+  reported. Recovery per ledger + git: HEAD c89d4d1, tree clean, all
+  self-checks pass. Task 9 review re-dispatched fresh.
+Task 10 brief: added B6 (FP16 via half=True on YOLO predict and .half() on
+  the ReID backbone; TensorRT/INT8 explicitly declined - detection is not the
+  bottleneck and sm_120 TensorRT is a day's risk) and B7 (HLD must distinguish
+  tier-1 scanning capacity, 150-200 cams/node, from full-pipeline capacity
+  under admission control, ~8 escalated busy junctions at 0% loss).
+  Ruling: Cloudflare tunnel on the local 5050 is the deployment route when the
+  user asks for it; deferred per their "skip deployment for now".
+Task 9: review spec OK, quality Approved, 0 Critical / 0 Important / 3 Minor.
+  Tiering verified airtight (inference.py untouched; alert-path extraction
+  after persist+broadcast+notify; queue maxsize=2 with 5 submits -> 3 dropped,
+  0.0000s blocking). Parser honesty verified incl. monochrome mask. ReID third
+  signal bounded +0.03/-0.05, applied only after threshold/sort/ambiguity on
+  raw scores. Retrieval 5/5 exact vehicle resolutions from live DB, facts from
+  SQL. Live: 5 cameras ~100s, dropped 0, attributes 8/8, queue drained.
+Task 9: complete (commits acaa072..c89d4d1, review clean)
+Task 9: minor (carried to Task 10 B8): pipeline.py has ATTRIBUTE_BROADCAST_
+  BOUND_S and the whole attribute-worker __init__ block duplicated verbatim
+  (bad patch application). Harmless but dead code in the file that most
+  needs to be readable.
+Task 9: minor (carried to Task 10 B9): single-word descriptions ("yellow")
+  enter the BM25 vehicle corpus as noise keys; add a minimum-informativeness
+  gate.
+Task 9: minor (deferred): three unescaped numeric interpolations in app.js
+  (Float confidence, two Integer PK selectors) - not exploitable.
+Task 10: dispatched. BASE c89d4d1. Brief: A0-A4 mandatory, B1-B9 expected, C1-C4 if time.
+Final review merge base pinned: ca2eac1 ('Eliminate frame loss under load', last pre-plan commit; 85b6515 no longer exists after the history rewrite).
+Task 10: landed as b995bfb (Tier A) + 04c14d6 (Tier B) + 8d8cb28 (Tier C), all
+  four C items done. 19 self-checks pass (pipeline and core.timing new);
+  run.py --check READY; 15 console endpoints 200; node --check clean; 30s live
+  runs dropped=0 after A0 and after B6. A1 dry-run: 13,271 rows would be
+  nulled, 4 corroborated rows written by the new path. B6 controlled bench
+  17.3 -> 12.1 ms/pass at TIER2_IMGSZ (uses quantize=16; half=True is
+  deprecated in this ultralytics). A3 verified 401/200 against a real keys
+  file; data/api_keys.json deleted and absent. No auto-committer interference.
+  Review package generated over c89d4d1..HEAD.
+Task 10: review dispatched. Final whole-branch package pre-generated over ca2eac1..HEAD (34 commits) - regenerate if Task 10 needs a fix round.
