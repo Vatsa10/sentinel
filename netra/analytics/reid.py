@@ -148,6 +148,14 @@ class ReIdEncoder:
         model = torchvision.models.resnet18(weights=weights)
         model.fc = torch.nn.Identity()   # keep the pooled features, drop the classifier
         model.eval().to(config.DEVICE)
+        # Half precision on the GPU only. The backbone is a feature extractor
+        # whose output is immediately L2-normalised and compared by cosine
+        # similarity at a threshold of 0.80, so fp16's fourth-decimal noise
+        # cannot move a decision that turns on the second. On CPU fp16 is
+        # emulated and slower, so it is not taken there.
+        self._half = config.DEVICE == "cuda"
+        if self._half:
+            model.half()
         self._model = model
         self._transform = weights.transforms()
         log.info("re-identification encoder ready (%d-d)", EMBED_DIM)
@@ -178,9 +186,14 @@ class ReIdEncoder:
             tensors.append(t)
 
         batch = torch.stack(tensors).to(config.DEVICE)
+        if getattr(self, "_half", False):
+            batch = batch.half()
         with self._lock, torch.no_grad():
             feats = self._model(batch)
-        feats = torch.nn.functional.normalize(feats, p=2, dim=1)
+        # Normalise in fp32: the sum of 512 squares is where half precision
+        # would actually cost something, and the embeddings are stored and
+        # compared as fp32 anyway.
+        feats = torch.nn.functional.normalize(feats.float(), p=2, dim=1)
         return feats.cpu().numpy().astype(np.float32)
 
 

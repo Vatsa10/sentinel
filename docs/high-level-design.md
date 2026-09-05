@@ -316,6 +316,21 @@ Hardware: NVIDIA RTX 5050 Laptop GPU, 8 GB, CUDA 12.8.
 | Inference queue depth | 0–5 |
 | Registry onboarding | 30 cameras probed and profiled in ~35 seconds |
 
+**Two capacity figures, answering different questions.** The ~6 ms per frame
+cited in §8 is *tier-1 scanning capacity*: a 640 px detection pass answering
+"are there vehicles here?", which is what sets how many cameras one node can
+watch at the 1 fps baseline, and gives the 150–200 cameras per node used for
+sizing. The eight-junction result above is *full-pipeline capacity* under
+admission control: detection, appearance embedding, plate localisation and OCR,
+tracking and zone evaluation, all running together at 0% frame loss on
+simultaneously escalated busy junctions. Both are measured on the same RTX
+5050, and they are not interchangeable. Tier-1 scanning says how wide a node
+can watch; full-pipeline capacity says how many of those cameras can be doing
+the expensive work at the same moment. Multiplying the scanning figure as
+though every camera were escalated would overstate a node by more than an order
+of magnitude, which is precisely why the two-tier scheduler exists: escalation
+is rationed against the second number while the first sets the footprint.
+
 ### Capacity management
 
 Reaching zero frame loss on eight busy junction cameras required treating GPU

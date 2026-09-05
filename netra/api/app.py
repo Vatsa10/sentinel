@@ -186,8 +186,26 @@ def _snapshot_lock(camera_id: str) -> threading.Lock:
 
 def _cached_snapshot(camera_id: str) -> bytes | None:
     import time as _time
+    now = _time.time()
+    # Evict on read. Nothing else ever removes an entry, so the dict is bounded
+    # by the camera set only while camera ids are stable - a churning id space
+    # (participant-supplied feeds are onboarded under generated ids) would grow
+    # it without limit, holding a full-resolution JPEG per id for the life of
+    # the process. Four TTLs is well past any possible reuse and leaves the
+    # warm path untouched.
+    cutoff = now - SNAPSHOT_TTL_S * 4
+    for stale in [k for k, (at, _) in _snapshots.items() if at < cutoff]:
+        _snapshots.pop(stale, None)
+        # The lock registry is dropped alongside, but only for a camera with
+        # no grab in flight: replacing a held lock would let the next caller
+        # start a second ffmpeg against the same camera, which is the exact
+        # thing the registry exists to prevent.
+        with _snapshot_locks_guard:
+            lock = _snapshot_locks.get(stale)
+            if lock is not None and not lock.locked():
+                _snapshot_locks.pop(stale, None)
     hit = _snapshots.get(camera_id)
-    if hit and (_time.time() - hit[0]) < SNAPSHOT_TTL_S:
+    if hit and (now - hit[0]) < SNAPSHOT_TTL_S:
         return hit[1]
     return None
 
@@ -1041,6 +1059,10 @@ def analytics_anomalies(camera_id: str | None = None,
     The current reading is the most recent completed traffic bucket for each
     camera, so it is measured the same way the baseline was - comparing a live
     partial count against full-bucket norms would manufacture false quiets.
+
+    A camera whose newest bucket is older than
+    baseline.ANOMALY_MAX_BUCKET_AGE_S is reported as `stale` and not judged:
+    that reading describes when the feed stopped, not the road now.
     """
     from netra.analytics import baseline
     from netra.core.models import TrafficStat
@@ -1059,8 +1081,12 @@ def analytics_anomalies(camera_id: str | None = None,
     found = baseline.detect_anomalies(learned, list(latest.values()),
                                       include_normal=include_normal)
     flagged = [a for a in found if a.anomalous]
+    stale = [a for a in found if a.status == "stale"]
     return {"buckets_read": sampled, "cameras_assessed": len(latest),
             "anomalies": len(flagged),
+            #: cameras whose newest bucket is too old to be a current reading
+            "stale": len(stale),
+            "max_bucket_age_s": baseline.ANOMALY_MAX_BUCKET_AGE_S,
             "assessments": [a.as_dict() for a in found]}
 
 

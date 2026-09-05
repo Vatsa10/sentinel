@@ -261,9 +261,14 @@ def _unusual(_q: str) -> dict:
     found = baseline.detect_anomalies(learned, list(latest.values()))
     flagged = [a for a in found if a.anomalous]
     thin = [a for a in found if a.status == "insufficient_data"]
+    # A camera that stopped reporting hours ago has a "most recent bucket"
+    # like any other, and judging it would present a dropped feed as a road
+    # observed empty. detect_anomalies marks those stale; they are counted and
+    # named here rather than folded in with the findings.
+    stale = [a for a in found if a.status == "stale"]
 
     data = {"buckets": len(rows), "cameras_assessed": len(latest),
-            "anomalies": len(flagged),
+            "anomalies": len(flagged), "stale": len(stale),
             "assessments": [a.as_dict() for a in found]}
     actions = [{"label": "Traffic", "view": "traffic"}]
 
@@ -274,11 +279,20 @@ def _unusual(_q: str) -> dict:
             text += (f" {len(thin)} camera(s) have fewer than "
                      f"{baseline.MIN_SAMPLES} observations of this hour, so "
                      f"they are not being judged at all yet.")
+        if stale:
+            text += (f" {len(stale)} camera(s) have not reported for over "
+                     f"{baseline.ANOMALY_MAX_BUCKET_AGE_S / 60:.0f} minutes; "
+                     f"their last readings are not current and are not "
+                     f"judged.")
         return _answer(text, data, actions)
 
     lead = "; ".join(a.explanation for a in flagged[:3])
     text = (f"{len(flagged)} of {len(latest)} cameras are outside their normal "
             f"range for this hour of the day. {lead}")
+    if stale:
+        text += (f" A further {len(stale)} camera(s) have not reported for "
+                 f"over {baseline.ANOMALY_MAX_BUCKET_AGE_S / 60:.0f} minutes "
+                 f"and are not judged at all.")
     if thin:
         text += (f" A further {len(thin)} camera(s) have too little history "
                  f"({baseline.MIN_SAMPLES} observations required) for any "

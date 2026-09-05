@@ -212,9 +212,14 @@ class WatchlistIndex:
 
     @staticmethod
     def _gather(buckets: dict, windows: set[str], extra: list) -> list[dict]:
+        # The windows arrive as a set, whose iteration order is a function of
+        # hash seeding rather than of the data. Sorting them is what makes the
+        # documented stability true: without it two runs over identical inputs
+        # could hand score_match its candidates in different orders, and two
+        # entries scoring equally would alert in a different order each time.
         seen: set[int] = set()
         out: list[dict] = []
-        for source in [buckets.get(k, ()) for k in windows] + [extra]:
+        for source in [buckets.get(k, ()) for k in sorted(windows)] + [extra]:
             for entry in source:
                 marker = id(entry)
                 if marker not in seen:
@@ -226,7 +231,9 @@ class WatchlistIndex:
         """Entries worth scoring against this observed plate.
 
         A superset of everything `score_match` could alert on. Order is stable
-        so alert ordering does not change with the prefilter's internals.
+        across processes and runs - the window keys are sorted before they are
+        walked - so alert ordering does not change with the prefilter's
+        internals or with this process's hash seed.
         """
         folded = normalise_plate(plate_text)
         if len(folded) < MIN_SCORABLE_CHARS:
@@ -522,6 +529,15 @@ def _self_check() -> None:
                 if score_match({**observed_base, "plate_text": observed},
                                entry).is_alert:
                     assert id(entry) in keep, (observed, entry["plate"])
+
+    # candidates() promises a stable order, so it must not depend on set
+    # iteration. Same index, same query, same order - checked against a second
+    # index built from the entries in a different order, which is the only
+    # thing that would shuffle the buckets' contents.
+    stable = WatchlistIndex(list(entries))
+    first = [e["plate"] for e in stable.candidates("GJ01AB1234")]
+    for _ in range(5):
+        assert [e["plate"] for e in stable.candidates("GJ01AB1234")] == first
 
     print("matching self-check passed")
 

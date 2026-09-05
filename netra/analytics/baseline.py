@@ -45,6 +45,17 @@ Z_HIGH = 3.0
 Z_ELEVATED = 2.0
 Z_LOW = -2.0
 
+#: How old a camera's most recent bucket may be before its reading stops being
+#: reported as current. Both the anomalies endpoint and the assistant take each
+#: camera's newest bucket and judge it, which is right while the camera is
+#: reporting and quietly wrong once it stops: a feed that dropped out at
+#: midnight would otherwise be presented at nine in the morning as "no traffic
+#: counted, the road may be blocked", which is a statement about our own
+#: connection dressed up as a statement about the road. Fifteen minutes is
+#: several bucket periods, so a camera that is merely between flushes is not
+#: called stale.
+ANOMALY_MAX_BUCKET_AGE_S = 900.0
+
 
 @dataclass
 class Baseline:
@@ -76,7 +87,7 @@ class Assessment:
     camera_id: str
     hour: int
     observed: int
-    status: str            # insufficient_data|quiet|low|normal|elevated|high
+    status: str            # insufficient_data|stale|quiet|low|normal|elevated|high
     z_score: float | None
     explanation: str
     baseline: Baseline | None = None
@@ -84,6 +95,9 @@ class Assessment:
 
     @property
     def anomalous(self) -> bool:
+        # `stale` is deliberately absent: it says the platform has nothing
+        # current to report about this camera, which is not a finding about
+        # the road and must never be counted as one.
         return self.status in ("quiet", "low", "elevated", "high")
 
     def as_dict(self) -> dict:
@@ -123,6 +137,20 @@ def _hour_of(row) -> int | None:
             ts = ts.astimezone(timezone.utc)
         return ts.hour
     except AttributeError:
+        return None
+
+
+def _bucket_age_s(row, now) -> float | None:
+    """Seconds between `now` and the row's bucket start, or None if untimed."""
+    ts = _field(row, "bucket_start")
+    if ts is None:
+        return None
+    from datetime import timezone
+    try:
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (now - ts).total_seconds()
+    except (AttributeError, TypeError):
         return None
 
 
@@ -240,13 +268,23 @@ def assess(baseline: Baseline | None, observed: int) -> Assessment:
 
 
 def detect_anomalies(baselines: dict[tuple[str, int], Baseline],
-                     current_stats, include_normal: bool = False
-                     ) -> list[Assessment]:
+                     current_stats, include_normal: bool = False,
+                     now=None) -> list[Assessment]:
     """Assess a set of current readings, most deviant first.
 
     `current_stats` entries carry `camera_id`, `total`, and either an `hour` or
     a `bucket_start` from which the UTC hour is taken.
+
+    A reading older than ANOMALY_MAX_BUCKET_AGE_S is reported as `stale`, with
+    the bucket's own timestamp in the explanation, rather than judged. Callers
+    pass the newest bucket per camera, which stops being a current reading the
+    moment the camera stops reporting, and the difference between "this road is
+    empty" and "we have not heard from this camera since midnight" is the whole
+    difference between a finding and a fault.
     """
+    from datetime import datetime, timezone
+    if now is None:
+        now = datetime.now(timezone.utc)
     out: list[Assessment] = []
     for row in current_stats:
         camera_id = _field(row, "camera_id")
@@ -259,6 +297,22 @@ def detect_anomalies(baselines: dict[tuple[str, int], Baseline],
             continue
         hour = int(hour)
         observed = int(_field(row, "total") or 0)
+
+        age = _bucket_age_s(row, now)
+        if age is not None and age > ANOMALY_MAX_BUCKET_AGE_S:
+            ts = _field(row, "bucket_start")
+            out.append(Assessment(
+                camera_id=camera_id, hour=hour, observed=observed,
+                status="stale", z_score=None,
+                baseline=baselines.get((camera_id, hour)),
+                explanation=(
+                    f"{camera_id} has not reported since "
+                    f"{getattr(ts, 'isoformat', lambda: ts)()} "
+                    f"({age / 60.0:.0f} minutes ago). Its last bucket counted "
+                    f"{observed}, but that is not a current reading and is not "
+                    f"judged against the norm."),
+                detail={"bucket_age_s": round(age, 1)}))
+            continue
 
         result = assess(baselines.get((camera_id, hour)), observed)
         # `assess` cannot know the camera when there is no baseline at all.
@@ -277,7 +331,7 @@ def _self_check() -> None:
     """A baseline that flags the wrong thing costs an operator's trust, and one
     that flags nothing is decoration, so both directions are pinned here. All
     rows are synthetic: no database, no network."""
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
 
     def row(cam, hour, total):
         return {"camera_id": cam, "total": total,
@@ -400,9 +454,29 @@ def _self_check() -> None:
     assert unknown[0].status == "insufficient_data"
     assert unknown[0].camera_id == "cam99"
 
-    # bucket_start is accepted in place of an explicit hour.
-    via_ts = detect_anomalies(b, [row("cam01", 9, 200)])
+    # bucket_start is accepted in place of an explicit hour. `now` is pinned
+    # to the synthetic clock: without it these rows would all be years old and
+    # correctly reported as stale.
+    fresh_now = datetime(2026, 9, 1, 9, 1, tzinfo=timezone.utc)
+    via_ts = detect_anomalies(b, [row("cam01", 9, 200)], now=fresh_now)
     assert via_ts[0].status == "high", via_ts
+
+    # A camera that stopped reporting hours ago is not a current reading. Its
+    # last bucket counted zero, which against a busy norm would otherwise be
+    # published as "the road may be blocked" - a claim about our own connection
+    # dressed as a claim about the road.
+    stale_now = fresh_now + timedelta(seconds=ANOMALY_MAX_BUCKET_AGE_S + 60)
+    stale = detect_anomalies(b, [row("cam01", 9, 0)], now=stale_now)
+    assert stale[0].status == "stale", stale
+    assert not stale[0].anomalous, stale[0]
+    assert "2026-09-01T09:00:00" in stale[0].explanation, stale[0].explanation
+    assert stale[0].as_dict()["bucket_age_s"] > ANOMALY_MAX_BUCKET_AGE_S
+
+    # One second inside the window is still current, and still judged.
+    edge_now = datetime(2026, 9, 1, 9, 0, tzinfo=timezone.utc) + timedelta(
+        seconds=ANOMALY_MAX_BUCKET_AGE_S - 1)
+    edge = detect_anomalies(b, [row("cam01", 9, 0)], now=edge_now)
+    assert edge[0].status == "quiet", edge
 
     # Naive timestamps are tolerated and read as UTC.
     naive = learn([{"camera_id": "cam04", "total": 7,

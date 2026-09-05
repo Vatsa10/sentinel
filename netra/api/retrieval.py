@@ -356,10 +356,39 @@ def _rows_from_db() -> list[tuple[str, str, str, str]]:
                   .limit(VEHICLE_INDEX_LIMIT).all()):
             marks = " ".join(str(m) for m in (v.markings or []))
             text = " ".join(x for x in (v.description, marks) if x)
-            if not text.strip():
+            if not _worth_indexing(v, text):
                 continue
             out.append(("vehicle", str(v.detection_id), v.description, text))
     return out
+
+
+#: Structured description fields that, populated, say something specific
+#: enough about one vehicle to be worth resolving a phrase to.
+_VEHICLE_FIELDS = ("body_type", "colour", "wheels", "roof_rack",
+                   "tinted_windows", "damage", "markings")
+
+
+def _worth_indexing(row, text: str) -> bool:
+    """Whether one described vehicle earns a place in the retrieval corpus.
+
+    A description of a single word - the captioner regularly produces just
+    "yellow" - is not a search key. Every yellow vehicle on the grid scores
+    identically for the query "yellow", so which detection comes back is
+    decided by the tie-break rather than by the evidence, and the assistant
+    then presents that arbitrary row as *the* answer. Either two populated
+    structured fields or a description of at least two tokens is the minimum
+    that distinguishes one vehicle from the next.
+
+    ponytail: a token count, not a measure of information. Its ceiling is that
+    "a vehicle" passes and "yellow" does not, though neither is much of a key.
+    """
+    if not text.strip():
+        return False
+    populated = sum(1 for f in _VEHICLE_FIELDS
+                    if getattr(row, f, None) not in (None, "", [], False))
+    if populated >= 2:
+        return True
+    return len((row.description or "").split()) >= 2
 
 
 def build_index(rows=None) -> EntityIndex:
@@ -532,6 +561,28 @@ def _self_check() -> None:
     # Normalisation is what makes the character fallback work at all.
     assert normalise("Junagadh-Bypass ANPR") == "junagadhbypassanpr"
     assert tokenise("GJ-AHM-014") == ["gj", "ahm", "014"]
+
+    # A one-word description is not a search key. Every yellow vehicle scores
+    # identically for "yellow", so indexing one would let the tie-break decide
+    # which detection the assistant presents as the answer.
+    class _Row:
+        body_type = colour = wheels = damage = None
+        roof_rack = tinted_windows = None
+        markings: list = []
+
+        def __init__(self, description, **kw):
+            self.description = description
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    assert not _worth_indexing(_Row("yellow"), "yellow")
+    assert not _worth_indexing(_Row(""), "")
+    assert _worth_indexing(_Row("yellow van"), "yellow van")
+    # One structured field is not enough on its own either...
+    assert not _worth_indexing(_Row("yellow", colour="yellow"), "yellow")
+    # ...but two describe a vehicle specifically enough to resolve to.
+    assert _worth_indexing(_Row("yellow", colour="yellow", body_type="van"),
+                           "yellow")
 
     print("retrieval self-check passed")
 

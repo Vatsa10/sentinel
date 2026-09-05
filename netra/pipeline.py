@@ -35,12 +35,6 @@ WRITE_INTERVAL_S = 1.0
 #: persisted and the console fetches it on demand.
 ATTRIBUTE_BROADCAST_BOUND_S = 3.0
 
-#: How long after an alert a description may still be pushed to the console as
-#: a live update. Past this the operator has already read and acted on the
-#: alert card, so an arriving caption is noise on the wire; the row is still
-#: persisted and the console fetches it on demand.
-ATTRIBUTE_BROADCAST_BOUND_S = 3.0
-
 
 class Pipeline:
     def __init__(self):
@@ -80,20 +74,6 @@ class Pipeline:
         self.engine.zone_engine = self.zone_engine
         self.engine.on_zone_event = self._handle_zone_event
         self._last_traffic_flush = 0.0
-
-        # Vision-language descriptions run on their own daemon thread behind a
-        # bounded queue that drops when full. Detection is the primary duty and
-        # a caption costs roughly a second of GPU, so this must never be able
-        # to apply back-pressure to inference or to the writer: the measured
-        # precedent is unbounded overlay OCR, which cost 71% of frames.
-        self._attr_queue: queue.Queue = queue.Queue(
-            maxsize=config.ATTRIBUTE_QUEUE_SIZE)
-        self._attr_stop = threading.Event()
-        self._attr_thread: threading.Thread | None = None
-        #: camera_id -> monotonic time of its last opportunistic description
-        self._attr_last: dict[str, float] = {}
-        self.attribute_stats = {"queued": 0, "processed": 0, "dropped": 0,
-                                "failed": 0, "broadcast": 0}
 
         # Vision-language descriptions run on their own daemon thread behind a
         # bounded queue that drops when full. Detection is the primary duty and

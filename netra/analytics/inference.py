@@ -117,6 +117,17 @@ DARK_RECHECK_FRAMES = 300
 #: microseconds - it must not become a cost of its own.
 LUMA_SAMPLE_STRIDE = 8
 
+#: Half-precision detection, on the GPU only - CPU fp16 is emulated and
+#: slower. Measured on this machine at TIER2_IMGSZ: 17.3 ms/pass at fp32
+#: against 12.1 ms at fp16. Detection is not the bottleneck here - OCR, writes
+#: and escalation are - so this is not where the demo is won; it is taken
+#: because it is free. Deliberately not INT8 and not TensorRT: INT8 would need
+#: a calibration set and a re-validation of every threshold, and TensorRT on
+#: sm_120 is a day of risk for a number that does not move the demo.
+#: Spelled as `quantize` rather than the older `half=True`, which this
+#: ultralytics forwards to exactly this with a deprecation warning.
+_PRECISION: dict = {"quantize": 16} if config.DEVICE == "cuda" else {}
+
 
 def mean_luma(image) -> float:
     """Mean brightness of a frame, measured on a strided sample.
@@ -528,7 +539,7 @@ class InferenceEngine:
             else config.TIER1_IMGSZ
 
         results = self._vehicle_model.predict(
-            img, device=config.DEVICE, verbose=False,
+            img, device=config.DEVICE, verbose=False, **_PRECISION,
             conf=config.CONF_THRESHOLD, imgsz=imgsz, classes=classes)
 
         if not results:
@@ -715,7 +726,8 @@ class InferenceEngine:
         plate_crop, plate_box = None, None
         if self._plate_model is not None:
             res = self._plate_model.predict(crop, device=config.DEVICE,
-                                            verbose=False, conf=0.25, imgsz=320)
+                                            verbose=False, **_PRECISION,
+                                            conf=0.25, imgsz=320)
             if res and res[0].boxes is not None and len(res[0].boxes) > 0:
                 best = max(res[0].boxes, key=lambda b: float(b.conf.item()))
                 px1, py1, px2, py2 = (int(v) for v in best.xyxy[0].tolist())

@@ -98,6 +98,11 @@ async function refresh() {
     card((inf.infer_ms ?? 0) + "ms", "Inference latency", "", "last batch"),
     card(st.queue_depth ?? 0, "Queue depth", drop > 20 ? "warn" : "", drop.toFixed(1) + "% frames dropped"),
     card(cams.reduce((a, c) => a + (c.loop_cuts || 0), 0), "Loop cuts handled", "", "state resets"),
+    // Counts detection-frames whose plate was replaced by their track's voted
+    // consensus - not the same quantity as the per-detection read count shown
+    // beside each plate in the Detections table, which is why it is named for
+    // what it is.
+    card(inf.plate_consensus_applied ?? 0, "Plate consensus applied", "", "frames given a voted plate"),
   ].join("");
 }
 const card = (n, l, cls = "", s = "") =>
@@ -854,10 +859,14 @@ async function loadAnomalies() {
   const a = r.assessments || [];
   const head = `<div class="faint" style="font-size:12px;margin-bottom:9px">
     ${esc(r.cameras_assessed)} camera(s) assessed against ${esc(r.buckets_read)} stored buckets ·
-    ${esc(r.anomalies)} flagged. Cameras with too little history to judge are shown muted rather
-    than hidden: hiding them would imply coverage that does not exist.</div>`;
+    ${esc(r.anomalies)} flagged${r.stale ? `, ${esc(r.stale)} not reporting` : ""}. Cameras with too
+    little history to judge, or whose last bucket is too old to be a current reading, are shown muted
+    rather than hidden: hiding them would imply coverage that does not exist.</div>`;
   $("#iAnoms").innerHTML = head + (a.length ? a.map(x => {
-    const thin = x.status === "insufficient_data";
+    // A stale camera is muted alongside an unjudged one: neither is a
+    // statement about the road, and colouring stale green would present a
+    // dropped feed as a road confirmed clear.
+    const thin = x.status === "insufficient_data" || x.status === "stale";
     const colour = thin ? "var(--faint)" : (x.anomalous ? "var(--warn)" : "var(--ok)");
     return `<div class="finding ${thin ? "muted" : ""}"
       style="border-color:${colour};background:rgba(59,130,246,.05)">
