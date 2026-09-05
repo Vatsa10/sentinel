@@ -2,6 +2,9 @@
 wheels/
 data/
 *.log
+# Marker files dropped by long-running tool invocations; one was committed
+# to the repo root by the auto-committer.
+*.start
 __pycache__/
 *.pyc
 

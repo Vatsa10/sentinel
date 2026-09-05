@@ -50,6 +50,14 @@ def protected_evidence(session_factory=None) -> set[str]:
 
     An alert or zone event an operator has not yet acknowledged is still open
     police work; its picture is the evidence.
+
+    ponytail: acknowledgement is the only signal of continuing interest, so an
+    *acknowledged* alert's crop is prunable the moment it ages out, even where
+    the case behind it is still live. Its ceiling is a case that outlasts the
+    retention window: nothing here knows about cases, and an operator who needs
+    a crop kept beyond it must export it. A case-linked hold - evidence pinned
+    for as long as its FIR is open - is the real fix, and it needs the case
+    reference to travel with the alert from eGujCop rather than being typed in.
     """
     from netra.core.models import Alert, Detection, ZoneEventRow
 

@@ -520,6 +520,14 @@ function connectWs() {
   setInterval(() => {
     if ($("#v-overview").classList.contains("active")) loadRecent();
   }, 4000);
+  // The Traffic tab is the one an operator leaves open while watching a
+  // junction, and until now it only ever showed what was there when the tab
+  // was opened. Gated on visibility, like the overview poll above: an unseen
+  // tab must not spend a database round trip every five seconds, and the
+  // history query it makes is the heaviest of the console's reads.
+  setInterval(() => {
+    if ($("#v-traffic").classList.contains("active")) loadTraffic();
+  }, 5000);
 })();
 
 /* ----------------------------------------------------------- assistant --- */
