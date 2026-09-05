@@ -353,3 +353,9 @@ Task 10: landed as b995bfb (Tier A) + 04c14d6 (Tier B) + 8d8cb28 (Tier C), all
   file; data/api_keys.json deleted and absent. No auto-committer interference.
   Review package generated over c89d4d1..HEAD.
 Task 10: review dispatched. Final whole-branch package pre-generated over ca2eac1..HEAD (34 commits) - regenerate if Task 10 needs a fix round.
+Task 10: first review killed by user mid-run after verifying A0/A1/A2/A4; re-dispatched fresh.
+Auto-committer 0e071ea: SDD scratch files only (final-review.md, task-9/10
+  review packages, ledger). No source. Killed Task 10 reviewer had left
+  data/api_keys.json from its A3 test, putting the server in enforced-auth
+  mode; removed by the controller so the demo stays open. Task 10 review
+  re-dispatched over c89d4d1..8d8cb28.
