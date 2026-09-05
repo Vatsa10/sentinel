@@ -12,6 +12,10 @@ Two constraints shape this:
     See docs/feed-recon-findings.md.
   * A hop that would require an impossible speed is rejected rather than drawn.
     A route the operator cannot trust is worse than a short one.
+  * A sighting whose scene clock was never corroborated is not placed on the
+    route at all. Its only other timestamp is our connection time, which says
+    when we dialled the recording rather than when the vehicle passed, so
+    chaining on it would draw a journey out of an artefact of our own uptime.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from datetime import datetime
 from netra.analytics.matching import normalise_plate, spacetime_plausible
 from netra.core.geo import haversine_km, time_group
 # Shared with cloned-plate detection so both modules order sightings identically.
+from netra.core.timing import scene_time as _scene_time
 from netra.core.timing import sighting_time as _sighting_time
 
 
@@ -86,6 +91,15 @@ def build_route(detections: list, query: str, min_plate_score: float = 0.6) -> R
     total_km = 0.0
 
     for det in candidates:
+        if _scene_time(det) is None:
+            # Listed, not chained: the operator should see that the sighting
+            # exists, and equally that it cannot be placed in time.
+            rejected.append({
+                "camera_id": det.camera_id,
+                "reason": "sighting has no corroborated scene clock; its time "
+                          "is not comparable with the other cameras",
+            })
+            continue
         cam = det.camera
         hop = Hop(
             camera_id=det.camera_id,
@@ -154,6 +168,7 @@ def _self_check() -> None:
             self.vehicle_class, self.colour = "car", "white"
             self.evidence_path = None
             self.scene_time, self.wall_time = at, at
+            self.scene_time_corroborated = True
             self.id = FakeDet._next[0]
             FakeDet._next[0] += 1
 
@@ -191,6 +206,16 @@ def _self_check() -> None:
     ]
     r3 = build_route(dets_partial, "GJ01AB1234")
     assert len(r3.hops) == 2, r3.hops
+
+    # A sighting whose overlay was read once and never corroborated must not
+    # join the route: its timestamp is a guess, and this grid has produced
+    # guesses two years out. It is reported as rejected rather than hidden.
+    uncorroborated = FakeDet(c14, "GJ01AB1234", t0 + timedelta(minutes=3))
+    uncorroborated.scene_time_corroborated = False
+    r4 = build_route([FakeDet(c04, "GJ01AB1234", t0), uncorroborated],
+                     "GJ01AB1234")
+    assert len(r4.hops) == 1, r4.hops
+    assert "corroborated" in r4.rejected[0]["reason"], r4.rejected
 
     print("route self-check passed")
 

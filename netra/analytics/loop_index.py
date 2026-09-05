@@ -45,6 +45,7 @@ from netra.analytics.matching import spacetime_plausible
 from netra.analytics.reid import SIMILARITY_THRESHOLD, similarity
 from netra.core.geo import TIME_GROUPS, haversine_km
 from netra.core.geo import time_group as camera_time_group
+from netra.core.timing import scene_time as _scene_time
 from netra.core.timing import sighting_time
 
 log = logging.getLogger(__name__)
@@ -291,7 +292,7 @@ def index_camera(camera_id: str, engine, max_seconds: float = 900.0,
         engine.clock_policy = previous_policy
 
     written = _persist(collected) if persist else 0
-    with_scene_time = sum(1 for d in collected if getattr(d, "scene_time", None))
+    with_scene_time = sum(1 for d in collected if _scene_time(d) is not None)
 
     return {
         "camera_id": camera_id,
@@ -450,9 +451,11 @@ def _minable(detections: list, group: str) -> tuple[list, dict]:
         if det.camera_id not in members:
             excluded["wrong_group"] += 1
             continue
-        if not getattr(det, "scene_time", None):
-            # Wall time is our connection time, not the vehicle's. A sighting
-            # with no recorded clock simply cannot be placed on a journey.
+        if _scene_time(det) is None:
+            # Wall time is our connection time, not the vehicle's, and an
+            # overlay reading no second reading ever agreed with is a guess -
+            # this grid produced spans dated 2028 that way. A sighting with no
+            # corroborated clock simply cannot be placed on a journey.
             excluded["no_scene_time"] += 1
             continue
         if not getattr(det, "embedding", None):
@@ -636,6 +639,9 @@ def _load_group_detections(group: str) -> list:
         return (db.query(Detection).options(joinedload(Detection.camera))
                 .filter(Detection.camera_id.in_(members),
                         Detection.scene_time.isnot(None),
+                        # Rows written before corroborated anchoring landed
+                        # carry times no second reading ever confirmed.
+                        Detection.scene_time_corroborated.is_(True),
                         has_embedding())
                 # Newest first for the cap, matching _minable's tail slice, so
                 # both layers keep the same end of a long index.
@@ -656,6 +662,8 @@ def exclusion_report(group: str) -> dict:
     for this group's cameras — and the three exclusion counts plus `comparable`
     sum to it, so the breakdown can be checked rather than trusted.
     """
+    from sqlalchemy import and_
+
     from netra.core.db import SessionLocal
     from netra.core.models import Detection
 
@@ -666,20 +674,26 @@ def exclusion_report(group: str) -> dict:
     with SessionLocal() as db:
         base = db.query(Detection).filter(Detection.camera_id.in_(members))
         total = base.count()
-        no_clock = base.filter(Detection.scene_time.is_(None)).count()
-        clocked = base.filter(Detection.scene_time.isnot(None))
+        usable_clock = and_(Detection.scene_time.isnot(None),
+                            Detection.scene_time_corroborated.is_(True))
+        no_clock = base.filter(~usable_clock).count()
+        clocked = base.filter(usable_clock)
         with_clock = clocked.count()
         comparable = clocked.filter(embedded).count()
     return {
         "detections_in_group": total,
         "with_scene_time": with_clock,
         "comparable": comparable,
+        #: no overlay reading at all, or one that was never corroborated:
+        #: both are equally unusable for placing a sighting in time
         "excluded_no_scene_time": no_clock,
         #: counted among the clocked rows only, so the figures reconcile:
         #: comparable + no_embedding + no_scene_time == detections_in_group
         "excluded_no_embedding": with_clock - comparable,
-        "note": ("A sighting with no scene clock cannot be placed on a "
-                 "journey: wall time records when we connected to the loop, "
+        "note": ("A sighting with no corroborated scene clock cannot be "
+                 "placed on a journey: an overlay read once and never "
+                 "confirmed is a guess, and wall time records when we "
+                 "connected to the loop, "
                  "not when the vehicle passed. Counts describe every "
                  "detection stored for these cameras."),
     }
@@ -785,6 +799,7 @@ def _self_check() -> None:
         def __init__(self, cam, at, emb, scene=True):
             self.camera, self.camera_id = cam, cam.id
             self.scene_time = at if scene else None
+            self.scene_time_corroborated = scene
             self.wall_time = at
             self.embedding = emb
             self.vehicle_class, self.colour = "car", "silver"

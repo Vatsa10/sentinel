@@ -152,6 +152,14 @@ class VehicleDetection:
     plate_bbox: list[int] | None = None
     #: real time the scene occurred, from the camera's burned-in overlay
     scene_time: object | None = None
+    #: whether the anchor that produced `scene_time` was corroborated by a
+    #: second, independent overlay reading. False means the value is a guess
+    #: and must be treated as absent by anything reasoning over elapsed time -
+    #: this grid has produced streams dated 2028 from a single misread digit.
+    scene_time_corroborated: bool = False
+    #: how many per-frame OCR reads voted for `plate_text`. One is a guess;
+    #: persisting the count is what lets an operator tell the two apart.
+    plate_votes: int | None = None
     #: assigned by the per-camera tracker; identifies one vehicle journey
     track_id: int | None = None
     embedding: list | None = field(default=None, repr=False)
@@ -216,8 +224,10 @@ class InferenceEngine:
         self._clocks: dict = {}
         #: how many overlay reads have been attempted per camera
         self._clock_attempts: dict = {}
-        #: stream time of the last overlay attempt per camera, used only by the
-        #: exhaustive policy to space its attempts across the recording
+        #: stream time of the last overlay attempt per camera. The exhaustive
+        #: policy uses it to space its attempts across the recording; both
+        #: policies use it to decide when an exhausted attempt budget has been
+        #: quiet long enough to be granted afresh.
         self._clock_last_try: dict = {}
         #: a first overlay reading, held unanchored until a second one
         #: corroborates it. See _anchor_clock.
@@ -245,7 +255,12 @@ class InferenceEngine:
 
         self.stats = {"submitted": 0, "dropped": 0, "processed": 0,
                       "vehicles": 0, "plates": 0, "embedded": 0,
-                      "clocks_anchored": 0, "plate_votes": 0,
+                      "clocks_anchored": 0,
+                      #: detection-frames on which a track's plate consensus
+                      #: replaced that frame's own read. Not the same thing as
+                      #: the per-detection plate_votes column, which records
+                      #: how many reads one consensus was drawn from.
+                      "plate_consensus_applied": 0,
                       "dark_cameras": 0, "dark_frames_skipped": 0,
                       "infer_ms": 0.0}
 
@@ -360,7 +375,22 @@ class InferenceEngine:
         limit = INDEX_CLOCK_ATTEMPT_LIMIT if exhaustive else CLOCK_ATTEMPT_LIMIT
         attempts = self._clock_attempts.get(cam, 0)
         if attempts >= limit:
-            return
+            # The budget is exhausted. Give up for now, but not forever: the
+            # same reason a corroborated anchor is re-read after
+            # CLOCK_REANCHOR_AFTER_S applies to a camera that never anchored
+            # at all. An overlay unreadable at dusk may be perfectly legible
+            # once the streetlights come up, so a camera that has been silent
+            # for a re-anchor window gets one fresh budget, not a retry on
+            # every frame. The pending half-reading is dropped with it: a
+            # reading from a quarter of an hour ago is not a corroborating
+            # partner for one taken now.
+            last_try = self._clock_last_try.get(cam)
+            if (last_try is not None
+                    and frame.pts_ms - last_try < CLOCK_REANCHOR_AFTER_S * 1000.0):
+                return
+            attempts = 0
+            self._clock_attempts[cam] = 0
+            self._clock_pending.pop(cam, None)
 
         if exhaustive:
             # An offline pass over a finite recording has nothing to starve and
@@ -372,7 +402,6 @@ class InferenceEngine:
             last_try = self._clock_last_try.get(cam)
             if last_try is not None and frame.pts_ms - last_try < spacing:
                 return
-            self._clock_last_try[cam] = frame.pts_ms
         # Anchoring costs roughly a second of OCR per attempt. Detection is the
         # primary duty and must not queue behind it, so on the live path scene
         # time is enriched opportunistically: attempted only while the pipeline
@@ -382,6 +411,7 @@ class InferenceEngine:
             return
 
         self._clock_attempts[cam] = attempts + 1
+        self._clock_last_try[cam] = frame.pts_ms
         from netra.analytics.scene_clock import read_scene_time
         try:
             anchor = read_scene_time(self._ocr, frame.image, frame.pts_ms, cam)
@@ -400,15 +430,23 @@ class InferenceEngine:
             # than averaged: the average of a right answer and a wrong one is
             # simply a third wrong answer.
             #
-            # The attempt budget is not spent by a *successful* read, because
-            # its purpose is to stop retrying cameras with no legible overlay,
-            # not to stop a legible one corroborating itself.
-            self._clock_attempts[cam] = 0
+            # The attempt budget is spent by every read, legible or not, and
+            # is refunded only by a *corroborated* anchor. Resetting it on any
+            # successful read - as this once did - made the cap unreachable
+            # for exactly the camera it exists to protect: a jittery or
+            # half-occluded overlay that reads differently every time never
+            # agrees with itself, so it never anchors, and on the live path
+            # there is no spacing gate to slow it down. Measured: 200
+            # mutually-contradicting readings produced 200 OCR calls and left
+            # the counter at zero. A contradiction is evidence that this
+            # camera's overlay cannot be trusted, so it must cost the same as
+            # an illegible one.
             pending = self._clock_pending.get(cam)
             if pending is None:
                 self._clock_pending[cam] = anchor
                 log.debug("%s overlay read %s; awaiting corroboration",
                           cam, anchor.scene_time.isoformat())
+                self._note_clock_exhausted(cam, limit, existing)
                 return
             drift = abs((anchor.scene_time
                          - pending.at(anchor.pts_ms)).total_seconds())
@@ -421,24 +459,42 @@ class InferenceEngine:
                 # older is now known to be unreliable, the newer merely
                 # unconfirmed.
                 self._clock_pending[cam] = anchor
+                self._note_clock_exhausted(cam, limit, existing)
                 return
             self._clock_pending.pop(cam, None)
             self._clocks[cam] = anchor
+            # Corroborated: the overlay is legible and self-consistent, so the
+            # budget has done its job and is returned in full for the next
+            # re-anchor.
+            self._clock_attempts[cam] = 0
             self.stats["clocks_anchored"] = len(self._clocks)
             log.info("%s scene clock corroborated to %s (two readings %.1fs "
                      "apart agreeing to %.1fs)", cam,
                      anchor.scene_time.isoformat(),
                      (anchor.pts_ms - pending.pts_ms) / 1000.0, drift)
-        elif self._clock_attempts[cam] >= limit:
-            # A failed re-anchor leaves the existing anchor alone: an anchor
-            # carrying some drift still times sightings far better than none.
-            # The attempt still counts, so a camera whose overlay has become
-            # unreadable (night, rain, a moved caption) stops retrying instead
-            # of burning OCR on every frame for the rest of the connection.
-            log.info("%s has no legible timestamp overlay after %d attempts; "
-                     "%s", cam, limit,
-                     "keeping the existing anchor despite its age" if existing
-                     else "sightings on this camera carry no scene time")
+        else:
+            self._note_clock_exhausted(cam, limit, existing)
+
+    def _note_clock_exhausted(self, cam: str, limit: int, existing) -> None:
+        """Log that a camera has spent its whole anchoring budget.
+
+        Called from every path that consumes an attempt, and silent until the
+        last one, so it says so exactly once per budget rather than on every
+        frame thereafter.
+
+        A failed re-anchor leaves the existing anchor alone: an anchor carrying
+        some drift still times sightings far better than none. The attempts
+        still count, so a camera whose overlay has become unreadable - night,
+        rain, a moved caption, or one that simply never reads the same number
+        twice - stops retrying instead of burning OCR on every frame for the
+        rest of the connection.
+        """
+        if self._clock_attempts.get(cam, 0) < limit:
+            return
+        log.info("%s produced no corroborated timestamp overlay in %d "
+                 "attempts; %s", cam, limit,
+                 "keeping the existing anchor despite its age" if existing
+                 else "sightings on this camera carry no scene time")
 
     def _process(self, frame) -> None:
         t0 = time.time()
@@ -454,6 +510,12 @@ class InferenceEngine:
         self._anchor_clock(frame)
         anchor = self._clocks.get(frame.camera_id)
         scene_time = anchor.at(frame.pts_ms) if anchor else None
+        # Only a corroborated anchor ever reaches self._clocks, so every scene
+        # time this engine produces is corroborated. The flag is carried
+        # explicitly all the same: rows written before corroboration landed are
+        # still in the store, and the consumers must be able to tell them apart
+        # from these without knowing which build wrote them.
+        corroborated = scene_time is not None
 
         classes = None if capability == "person" else list(config.VEHICLE_CLASSES)
         if capability == "person":
@@ -492,6 +554,7 @@ class InferenceEngine:
                 confidence=conf, bbox=[x1, y1, x2, y2],
                 colour=estimate_colour(crop) if cls_id != 0 else None,
                 scene_time=scene_time,
+                scene_time_corroborated=corroborated,
                 track_id=None,
                 evidence=crop)
             detections.append(det)
@@ -635,7 +698,8 @@ class InferenceEngine:
             det.plate_text = text
             det.plate_conf = conf
             det.plate_chars = len(text)
-            self.stats["plate_votes"] += 1
+            det.plate_votes = voters
+            self.stats["plate_consensus_applied"] += 1
 
         # The tracker expires stale tracks internally; without this the voter
         # would hold reads for vehicles that left the frame long ago.
@@ -672,6 +736,9 @@ class InferenceEngine:
         det.plate_text = text
         det.plate_conf = conf
         det.plate_chars = len(text)
+        # A lone read is recorded as exactly that: one vote. The voter
+        # overwrites this with the real count if the track reaches a consensus.
+        det.plate_votes = 1
         det.plate_bbox = plate_box
         self.stats["plates"] += 1
 
@@ -804,8 +871,70 @@ def _self_check() -> None:
         # A loop cut voids the pending reading along with everything else.
         clock.reset_camera_state("AGREE")
         assert "AGREE" not in clock._clock_pending and "AGREE" not in clock._clocks
+
+        # The attempt budget must bound contradictions as well as illegible
+        # frames. A camera whose overlay never reads the same number twice is
+        # exactly the one the cap exists for: on the live path there is no
+        # spacing gate, only the queue-slack check, so an unbounded retry
+        # OCRs on every slack frame forever. Feed 200 mutually-contradicting
+        # readings and count the reads that actually reached the reader.
+        calls: list = []
+        _sc.read_scene_time = lambda ocr, img, pts, cam: (
+            calls.append(cam)
+            or ClockAnchor(cam, base + timedelta(hours=len(calls)), pts, 0.8))
+        jitter = InferenceEngine(on_detection=lambda d: None)
+        jitter._ocr = object()
+        assert jitter.clock_policy == CLOCK_OPPORTUNISTIC
+        for k in range(200):
+            jitter._anchor_clock(_Frame("JITTER", k * 1000.0))
+        assert len(calls) <= CLOCK_ATTEMPT_LIMIT, len(calls)
+        assert "JITTER" not in jitter._clocks, "contradictions must not anchor"
+
+        # ...but giving up is not permanent. Once a re-anchor window of stream
+        # time has passed with no attempt, one fresh budget is granted, and an
+        # agreeing pair within it anchors normally.
+        spent = len(calls)
+        readings["JITTER"] = [base, base + timedelta(seconds=30)]
+        _sc.read_scene_time = lambda ocr, img, pts, cam: ClockAnchor(
+            cam, readings[cam].pop(0), pts, 0.8) if readings.get(cam) else None
+        later = 200_000.0 + CLOCK_REANCHOR_AFTER_S * 1000.0
+        jitter._anchor_clock(_Frame("JITTER", later))
+        jitter._anchor_clock(_Frame("JITTER", later + 30000.0))
+        assert jitter._clocks["JITTER"].scene_time == base + timedelta(seconds=30)
+        # A corroborated anchor returns the budget in full for the next one.
+        assert jitter._clock_attempts["JITTER"] == 0
+        assert spent <= CLOCK_ATTEMPT_LIMIT
+
+        # A detection carries whether its anchor was corroborated, because the
+        # store still holds rows written before corroboration existed and the
+        # elapsed-time consumers must be able to tell them apart.
+        assert VehicleDetection(camera_id="X", pts_ms=0.0, wall_time=0.0,
+                                vehicle_class="car", confidence=0.9,
+                                bbox=[0, 0, 1, 1]).scene_time_corroborated is False
     finally:
         _sc.read_scene_time = real_reader
+
+    # Plate vote counts reach the detection. A consensus drawn from seven reads
+    # and a single unrepeated guess are shown to an operator as the same string
+    # unless the count travels with it, so the wiring is pinned here rather
+    # than left to be noticed missing in the console.
+    class _Tracker:
+        tracks: dict = {1: object()}
+
+    voter_engine = InferenceEngine.__new__(InferenceEngine)
+    voter_engine._plate_voters = {}
+    voter_engine.stats = {"plate_consensus_applied": 0}
+    voted = VehicleDetection(camera_id="CAMV", pts_ms=0.0, wall_time=0.0,
+                             vehicle_class="car", confidence=0.9,
+                             bbox=[0, 0, 1, 1], plate_text="GJ01AB1234",
+                             plate_conf=0.8, plate_votes=1, track_id=1)
+    frame_v = _Frame("CAMV", 0.0)
+    for k in range(7):
+        voted.plate_text, voted.plate_conf = "GJ01AB1234", 0.8
+        frame_v.pts_ms = k * 100.0
+        voter_engine._vote_plates(frame_v, _Tracker(), [voted])
+    assert voted.plate_votes == 7, voted.plate_votes
+    assert voter_engine.stats["plate_consensus_applied"] == 6, voter_engine.stats
 
     print("inference self-check passed")
 

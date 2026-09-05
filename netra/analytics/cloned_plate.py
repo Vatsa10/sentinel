@@ -29,6 +29,7 @@ from datetime import datetime
 from netra.analytics.matching import (MAX_PLAUSIBLE_KMH, normalise_plate,
                                       spacetime_plausible)
 from netra.core.geo import haversine_km, time_group
+from netra.core.timing import scene_time as _scene_time
 from netra.core.timing import sighting_time
 
 # Plate confidence assumed when a detection carries none. Deliberately middling:
@@ -130,7 +131,12 @@ def find_clones(detections: list, min_confidence: float = 0.6) -> list[CloneFind
         # clone either: "AB12" is shared by thousands of legitimate plates.
         if len(plate) < 6:
             continue
-        if sighting_time(det) is None:
+        if _scene_time(det) is None:
+            # A clone finding is entirely a claim about elapsed time between
+            # two cameras. Wall time is our connection time, and an
+            # uncorroborated overlay reading is a guess that has been two years
+            # out on this grid - either would manufacture impossible speeds
+            # out of nothing. No clock, no claim.
             continue
         group = time_group(det.camera_id)
         if group is None:
@@ -230,6 +236,7 @@ def _self_check() -> None:
             self.plate_text, self.plate_conf = plate, conf
             self.evidence_path = None
             self.scene_time, self.wall_time = at, at
+            self.scene_time_corroborated = True
             self.id = FakeDet._next[0]
             FakeDet._next[0] += 1
 
@@ -332,6 +339,13 @@ def _self_check() -> None:
     # Distinct plates are never cross-compared.
     assert find_clones([FakeDet(c04, "GJ01AB1234", t0),
                         FakeDet(c14, "GJ09ZZ8888", t0 + timedelta(seconds=2))]) == []
+
+    # An uncorroborated scene time cannot evidence a clone. Its only other
+    # timestamp is our connection time, which would put every sighting on a
+    # replayed loop within seconds of every other and flag the whole grid.
+    unclocked = FakeDet(c14, "GJ01AB1234", t0 + timedelta(seconds=2))
+    unclocked.scene_time_corroborated = False
+    assert find_clones([FakeDet(c04, "GJ01AB1234", t0), unclocked]) == []
 
     print("cloned_plate self-check passed")
 

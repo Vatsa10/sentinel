@@ -284,9 +284,16 @@ def list_detections(camera_id: str | None = None, plate: str | None = None,
             "colour": d.colour, "plate_text": d.plate_text,
             "plate_conf": round(d.plate_conf, 3) if d.plate_conf else None,
             "plate_chars": d.plate_chars,
+            #: how many OCR reads agreed on plate_text. One is a lone guess,
+            #: and the console shows the count so the two are not read alike.
+            "plate_votes": d.plate_votes,
             "evidence": d.evidence_path, "bbox": d.bbox,
             "track_id": d.track_id,
             "scene_time": d.scene_time.isoformat() if d.scene_time else None,
+            #: false means the scene time was anchored on a single overlay
+            #: reading nothing ever confirmed; no elapsed-time claim is made
+            #: from those rows. See netra/core/timing.py.
+            "scene_time_corroborated": bool(d.scene_time_corroborated),
             "attributes": described.get(d.id),
         } for d in rows]
     return {"total": total, "count": len(items), "items": items}

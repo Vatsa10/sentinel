@@ -1,7 +1,30 @@
 /* NETRA operator console. */
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
-const api = async (p, o) => (await fetch(p, o)).json();
+/* API key. Empty by default and empty in the demo, where no data/api_keys.json
+   exists and the server runs open; the header is simply sent blank and every
+   endpoint behaves as it always has. Where an operator has configured keys,
+   this is what lets the console reach the protected endpoints — including the
+   zone editor's still, which an <img src> alone cannot fetch because it has no
+   way to carry a header. */
+const API_KEY_STORE = "NETRA_API_KEY";
+const apiKey = () => { try { return localStorage.getItem(API_KEY_STORE) || ""; }
+                       catch (e) { return ""; } };
+const authHeaders = (extra) => Object.assign({ "X-API-Key": apiKey() }, extra || {});
+const api = async (p, o) => {
+  const opts = Object.assign({}, o);
+  opts.headers = authHeaders(opts.headers);
+  return (await fetch(p, opts)).json();
+};
+document.addEventListener("DOMContentLoaded", () => {
+  const box = document.getElementById("apiKey");
+  if (!box) return;
+  box.value = apiKey();
+  box.onchange = () => {
+    try { localStorage.setItem(API_KEY_STORE, box.value.trim()); }
+    catch (e) { toast("This browser will not persist the key for this session."); }
+  };
+});
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -246,12 +269,17 @@ async function loadDetections() {
     <td>${esc(x.camera_name || x.camera_id)}</td>
     <td>${esc(x.vehicle_class)}</td><td class="dim">${esc(x.colour || "—")}</td>
     <td class="mono">${x.plate_text ? esc(x.plate_text) : '<span class="faint">—</span>'}
-      ${x.plate_chars ? `<span class="faint" style="font-size:10.5px">· ${esc(x.plate_chars)} chars</span>` : ""}</td>
+      ${x.plate_chars ? `<span class="faint" style="font-size:10.5px">· ${esc(x.plate_chars)} chars</span>` : ""}
+      ${x.plate_votes ? `<span class="faint" style="font-size:10.5px"
+        title="OCR reads of this tracked vehicle that agreed on this plate. One read is a single guess, not a consensus."
+        >· ${esc(x.plate_votes)} read${x.plate_votes === 1 ? "" : "s"}</span>` : ""}</td>
     <td class="dim">${x.plate_conf ?? "—"}</td>
     <td class="mono faint">${x.track_id != null ? esc(x.track_id) : "—"}</td>
-    <td class="mono faint">${x.scene_time
+    <td class="mono faint">${x.scene_time && x.scene_time_corroborated
       ? esc(x.scene_time.replace("T", " ").slice(0, 19))
-      : '<span title="no clock recovered from the overlay">—</span>'}</td>
+      : (x.scene_time
+        ? `<span title="read once from the overlay and never confirmed by a second reading, so it is not used for any timing claim">${esc(x.scene_time.replace("T", " ").slice(0, 19))} <b style="color:var(--warn)">?</b></span>`
+        : '<span title="no clock recovered from the overlay">—</span>')}</td>
     <td data-desc-holder>${x.evidence ? `<img src="${esc(x.evidence)}" style="height:34px;border-radius:4px">` : ""}
       ${attrHtml(x.attributes)}${describeBtn(x.id, !!x.attributes)}</td></tr>`).join("");
 }
@@ -329,14 +357,14 @@ async function loadWatchlist() {
     <td><button onclick="delWl(${e.id})">Remove</button></td></tr>`).join("");
 }
 window.delWl = async (id) => {
-  await fetch("/api/watchlist/" + id, { method: "DELETE" });
+  await fetch("/api/watchlist/" + id, { method: "DELETE", headers: authHeaders() });
   loadWatchlist();
 };
 $("#wAdd").onclick = async () => {
   const plate = $("#wPlate").value.trim().toUpperCase();
   if (!plate) return;
   await fetch("/api/watchlist", {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({
       plate, category: $("#wCat").value, severity: $("#wSev").value,
       vehicle_colour: $("#wColour").value || null,
@@ -348,7 +376,7 @@ $("#wAdd").onclick = async () => {
   loadWatchlist();
 };
 $("#wSeed").onclick = async () => {
-  await fetch("/api/watchlist/seed", { method: "POST" });
+  await fetch("/api/watchlist/seed", { method: "POST", headers: authHeaders() });
   loadWatchlist();
   toast("Sample watchlist loaded.");
 };
@@ -644,11 +672,29 @@ $("#zLoad").onclick = async () => {
   const btn = $("#zLoad");
   btn.disabled = true; btn.textContent = "Grabbing frame…";
   const img = $("#zImg");
-  img.onload = () => { $("#zWrap").style.display = "inline-block"; drawZone(); };
-  img.onerror = () => toast("Could not grab a still from " + esc(cam) +
-    " — the camera may be down or the feed unreachable.");
-  img.src = `/api/cameras/${encodeURIComponent(cam)}/snapshot?t=${Date.now()}`;
-  try { await img.decode(); } catch (e) { /* onerror has already reported it */ }
+  // Fetched rather than set as an <img src>: the snapshot endpoint is behind
+  // `require`, and an <img> has no way to carry X-API-Key, so with keys
+  // configured the still 401'd while the rest of the console worked. The blob
+  // is handed to the <img> as an object URL instead. The previous one is
+  // revoked because the zone editor is reloaded repeatedly while an operator
+  // draws, and each blob would otherwise be held for the life of the page.
+  try {
+    const r = await fetch(`/api/cameras/${encodeURIComponent(cam)}/snapshot?t=${Date.now()}`,
+                          { headers: authHeaders() });
+    if (!r.ok) throw new Error(r.status === 401 || r.status === 403
+      ? "not authorised — set an API key in the header"
+      : "HTTP " + r.status);
+    const url = URL.createObjectURL(await r.blob());
+    if (img.dataset.blobUrl) URL.revokeObjectURL(img.dataset.blobUrl);
+    img.dataset.blobUrl = url;
+    img.src = url;
+    await img.decode();
+    $("#zWrap").style.display = "inline-block";
+    drawZone();
+  } catch (e) {
+    toast("Could not grab a still from " + esc(cam) + " — " + esc(e.message) +
+      ". The camera may be down or the feed unreachable.");
+  }
   btn.disabled = false; btn.textContent = "Load still frame";
 };
 
@@ -677,7 +723,7 @@ $("#zSave").onclick = async () => {
     severity: $("#zSev").value, dwell_s: parseFloat($("#zDwell").value) || 30,
   };
   const r = await fetch("/api/zones", {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST", headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(body),
   });
   const out = await r.json().catch(() => ({}));
@@ -688,7 +734,7 @@ $("#zSave").onclick = async () => {
 };
 
 window.delZone = async (id) => {
-  await fetch("/api/zones/" + id, { method: "DELETE" });
+  await fetch("/api/zones/" + id, { method: "DELETE", headers: authHeaders() });
   loadZones();
 };
 

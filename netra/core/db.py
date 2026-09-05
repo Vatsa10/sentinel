@@ -26,6 +26,13 @@ _ADDED_COLUMNS = [
     ("traffic_stats", "loops_seen", "INTEGER DEFAULT 0"),
     ("mined_journeys", "min_similarity", "REAL DEFAULT 0.84"),
     ("mined_journeys", "truncated", "BOOLEAN DEFAULT 0"),
+    # Defaults false, which is the honest reading of every row already in an
+    # operator's store: those scene times were anchored on a single overlay
+    # reading and are not evidence of when anything happened.
+    ("detections", "scene_time_corroborated", "BOOLEAN DEFAULT 0"),
+    # Nullable rather than defaulted to 1: an existing row's plate was read an
+    # unknown number of times, and claiming one vote would be inventing a fact.
+    ("detections", "plate_votes", "INTEGER"),
 ]
 
 

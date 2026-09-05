@@ -131,6 +131,14 @@ button.mini{padding:2px 7px;font-size:10.5px;font-weight:500;border-radius:4px}
   <div class="spacer"></div>
   <div class="pill"><span class="dot" id="wsDot"></span><span id="wsTxt">connecting</span></div>
   <div class="pill" id="pipePill"><span class="dot" id="pipeDot"></span><span id="pipeTxt">pipeline idle</span></div>
+  <!-- Blank in the demo, where no data/api_keys.json exists and the server
+       runs open. It is here so an operator who has configured keys can reach
+       the protected endpoints — the zone editor's still in particular, which
+       is fetched with this header rather than loaded as a plain image src. -->
+  <input id="apiKey" type="password" placeholder="API key (optional)"
+         autocomplete="off" title="Sent as X-API-Key. Leave blank when the server runs open."
+         style="width:150px;padding:5px 8px;background:var(--bg);color:var(--ink);
+                border:1px solid var(--line);border-radius:6px;font-size:12px">
   <button id="btnStart" class="primary">Start pipeline</button>
   <button id="btnStop">Stop</button>
 </header>

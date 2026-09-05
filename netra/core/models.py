@@ -77,6 +77,14 @@ class Detection(Base):
     wall_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, index=True)
     # timestamp burned into the video by the source camera, when parsed
     scene_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Whether that timestamp came from an anchor two independent overlay
+    # readings agreed on. False on every row written before corroborated
+    # anchoring existed, and those rows include provably wrong spans dated
+    # 2025-06-14, 2026-06-24 and 2028-06-13 - so anything reasoning over
+    # elapsed time must treat an uncorroborated scene_time as absent rather
+    # than as evidence. See netra/core/timing.py.
+    scene_time_corroborated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0")
 
     vehicle_class: Mapped[str] = mapped_column(String(16))
     confidence: Mapped[float] = mapped_column(Float)
@@ -88,6 +96,9 @@ class Detection(Base):
     plate_text: Mapped[str | None] = mapped_column(String(32), index=True)
     plate_conf: Mapped[float | None] = mapped_column(Float)
     plate_chars: Mapped[int | None] = mapped_column(Integer)  # chars actually recovered
+    # How many per-frame OCR reads voted for plate_text. 1 is a lone guess;
+    # a higher count is the only thing distinguishing it from a consensus.
+    plate_votes: Mapped[int | None] = mapped_column(Integer)
     plate_bbox: Mapped[list | None] = mapped_column(JSON)
 
     evidence_path: Mapped[str | None] = mapped_column(String(256))

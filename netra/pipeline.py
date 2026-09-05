@@ -244,6 +244,35 @@ class Pipeline:
                          "reasons": {"zone": {"score": 1.0,
                                               "detail": event.detail}}})
 
+    def _bucket_deltas(self, camera_id: str, cumulative: int,
+                       counts: dict) -> tuple[int, dict]:
+        """Traffic during this bucket, from the tracker's cumulative counters.
+
+        Both the total and the class breakdown are differenced against the
+        previous flush, and - this is the part that went wrong - against the
+        *same* previous flush. A tracker recreated mid-run restarts its
+        counters, so a restart shows up as a cumulative smaller than the one
+        last seen, and the whole of it is taken as this bucket's traffic rather
+        than persisting a negative count.
+
+        The class snapshot has to be reset on exactly that condition. Taking
+        the whole cumulative as the total while still differencing the classes
+        against the larger pre-restart snapshot left every class delta at or
+        below zero, so the bucket carried a total with an empty breakdown -
+        a row an analyst can only read as traffic of unknown composition.
+        """
+        previous = self._traffic_last_total.get(camera_id)
+        restarted = previous is not None and cumulative < previous
+        delta = (cumulative if previous is None or restarted
+                 else cumulative - previous)
+        self._traffic_last_total[camera_id] = cumulative
+
+        before = {} if restarted else self._traffic_last_counts.get(camera_id, {})
+        by_class = {k: v - before.get(k, 0) for k, v in counts.items()
+                    if v - before.get(k, 0) > 0}
+        self._traffic_last_counts[camera_id] = dict(counts)
+        return delta, by_class
+
     def flush_traffic_stats(self, bucket_seconds: int = 60) -> int:
         """Snapshot per-camera traffic counters into a time bucket.
 
@@ -264,22 +293,8 @@ class Pipeline:
             for stats in self.engine.trackers.stats():
                 camera_id = stats["camera_id"]
                 cumulative = stats["total_counted"]
-                previous = self._traffic_last_total.get(camera_id)
-                # A tracker recreated mid-run restarts its counter; treat the
-                # whole of a smaller cumulative as this bucket's traffic rather
-                # than persisting a negative count.
-                delta = cumulative if previous is None or cumulative < previous \
-                    else cumulative - previous
-                self._traffic_last_total[camera_id] = cumulative
-
-                # The class breakdown is cumulative for the same reason, and
-                # is differenced the same way: a bucket whose classes summed to
-                # more than its total would be visibly incoherent to an analyst.
-                counts = stats["counts_by_class"]
-                before = self._traffic_last_counts.get(camera_id, {})
-                by_class = {k: v - before.get(k, 0) for k, v in counts.items()
-                            if v - before.get(k, 0) > 0}
-                self._traffic_last_counts[camera_id] = dict(counts)
+                delta, by_class = self._bucket_deltas(
+                    camera_id, cumulative, stats["counts_by_class"])
 
                 db.add(TrafficStat(
                     camera_id=camera_id, bucket_start=now,
@@ -360,6 +375,8 @@ class Pipeline:
                 plate_chars=det.plate_chars,
                 plate_bbox=det.plate_bbox,
                 scene_time=det.scene_time,
+                scene_time_corroborated=det.scene_time_corroborated,
+                plate_votes=det.plate_votes,
                 track_id=det.track_id,
                 embedding=det.embedding,
                 evidence_path=evidence_path,
@@ -668,3 +685,47 @@ def store_attributes(detection_id: int, result, source: str) -> dict:
 
 
 PIPELINE = Pipeline()
+
+
+def _self_check() -> None:
+    """Pin the traffic-bucket differencing, restart included.
+
+    Nothing here touches the database, the GPU or a thread: the arithmetic is
+    the part that has been wrong twice, and it is checkable on its own.
+    """
+    p = Pipeline.__new__(Pipeline)
+    p._traffic_last_total, p._traffic_last_counts = {}, {}
+
+    # First bucket: nothing to difference against, so the whole cumulative is
+    # this bucket's traffic and the breakdown is the whole breakdown.
+    delta, by_class = p._bucket_deltas("cam01", 10, {"car": 7, "truck": 3})
+    assert delta == 10 and by_class == {"car": 7, "truck": 3}, (delta, by_class)
+
+    # Steady state: only the increment since the last flush.
+    delta, by_class = p._bucket_deltas("cam01", 16, {"car": 11, "truck": 5})
+    assert delta == 6 and by_class == {"car": 4, "truck": 2}, (delta, by_class)
+
+    # A bucket in which nothing passed is still coherent, not negative.
+    delta, by_class = p._bucket_deltas("cam01", 16, {"car": 11, "truck": 5})
+    assert delta == 0 and by_class == {}, (delta, by_class)
+
+    # Tracker restart: the counter drops. The whole of the new cumulative is
+    # this bucket's traffic, and the breakdown must be reset with it - a total
+    # of 4 against an empty breakdown was the bug.
+    delta, by_class = p._bucket_deltas("cam01", 4, {"car": 3, "bus": 1})
+    assert delta == 4, delta
+    assert by_class == {"car": 3, "bus": 1}, by_class
+    assert by_class, "a restart bucket with detections must carry a breakdown"
+    assert sum(by_class.values()) <= delta, (by_class, delta)
+
+    # And the flush after a restart differences against the post-restart
+    # snapshot, not the pre-restart one.
+    delta, by_class = p._bucket_deltas("cam01", 9, {"car": 6, "bus": 3})
+    assert delta == 5 and by_class == {"car": 3, "bus": 2}, (delta, by_class)
+    assert sum(by_class.values()) <= delta, (by_class, delta)
+
+    print("pipeline self-check passed")
+
+
+if __name__ == "__main__":
+    _self_check()
