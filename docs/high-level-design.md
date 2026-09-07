@@ -648,8 +648,9 @@ production posture it is built to match.
 For the submission demo the two halves of the platform are hosted separately.
 The console is a static Next.js export served from Vercel's CDN; the backend
 (FastAPI, inference, and all camera state) stays on the GPU host, reached
-through a named Cloudflare tunnel that terminates TLS and forwards to the
-local FastAPI port. No video, detection or credential data is copied onto
+through a Cloudflare tunnel (a quick tunnel for the demonstration; TLS
+terminates at Cloudflare and traffic is forwarded to the local FastAPI
+port). No video, detection or credential data is copied onto
 Vercel — the CDN only ever serves the compiled JavaScript, CSS and static
 assets of the console itself.
 
