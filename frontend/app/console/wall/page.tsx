@@ -78,7 +78,7 @@ export default function VideoWallPage() {
                 key={l.n}
                 size="sm"
                 variant={layout === l.n ? "default" : "ghost"}
-                className="h-9 sm:h-7"
+                className="h-11 md:h-9"
                 aria-label={`${l.n}-tile layout`}
                 onClick={() => setLayout(l.n)}
               >

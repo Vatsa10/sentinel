@@ -7,12 +7,12 @@ import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/s
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-/** The 8 time-aligned Ahmedabad + Junagadh cameras (brief, task B4 step 2). */
-export const TIME_ALIGNED_PRESET = [
-  "cam01", "cam02", "cam03", "cam04", "cam05",
-  "cam13", "cam14", "cam15",
-  "cam08", "cam09", "cam10", "cam11",
-];
+/** Ahmedabad half of the time-aligned preset (brief, task B4 step 2). */
+export const AHMEDABAD_PRESET = ["cam01", "cam02", "cam03", "cam04", "cam05", "cam13", "cam14", "cam15"];
+/** Junagadh half of the time-aligned preset (brief, task B4 step 2). */
+export const JUNAGADH_PRESET = ["cam08", "cam09", "cam10", "cam11"];
+/** Both groups together — kept for callers (e.g. the wall's default) that want the full set. */
+export const TIME_ALIGNED_PRESET = [...AHMEDABAD_PRESET, ...JUNAGADH_PRESET];
 
 export function CameraPicker({
   cameras,
@@ -74,15 +74,35 @@ export function CameraPicker({
               className="pl-8"
             />
           </div>
-          <Button
-            size="sm"
-            variant="secondary"
-            className="h-11 sm:h-8"
-            onClick={() => onAddMany(TIME_ALIGNED_PRESET)}
-          >
-            <Sparkles className="size-4" />
-            Add the 8 time-aligned Ahmedabad+Junagadh cams
-          </Button>
+          <div className="flex flex-col gap-1.5">
+            <Button
+              size="sm"
+              variant="secondary"
+              className="h-11 sm:h-8"
+              onClick={() => onAddMany(AHMEDABAD_PRESET)}
+            >
+              <Sparkles className="size-4" />
+              Ahmedabad group ({AHMEDABAD_PRESET.length})
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="h-11 sm:h-8"
+              onClick={() => onAddMany(JUNAGADH_PRESET)}
+            >
+              <Sparkles className="size-4" />
+              Junagadh group ({JUNAGADH_PRESET.length})
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="h-11 sm:h-8"
+              onClick={() => onAddMany(TIME_ALIGNED_PRESET)}
+            >
+              <Sparkles className="size-4" />
+              Both groups ({TIME_ALIGNED_PRESET.length})
+            </Button>
+          </div>
           <div className="flex flex-wrap gap-1.5">
             {groups.map((g) => (
               <button

@@ -63,15 +63,16 @@ export function CameraTile({
     };
   }, [mode, cam.id]);
 
-  // MJPEG closes on unmount because the <img> is removed from the DOM;
-  // clearing src forces the connection closed immediately rather than
-  // waiting for GC.
+  // MJPEG closes on unmount because the <img> is removed from the DOM; also
+  // clear its src whenever `mode` changes away from an <img>-rendering mode
+  // (live/still) — e.g. switching to "smooth" — so the open connection is
+  // forced closed immediately rather than waiting on the DOM diff/GC.
   useEffect(() => {
     const img = imgRef.current;
     return () => {
       if (img) img.src = "";
     };
-  }, []);
+  }, [mode]);
 
   const src =
     mode === "live"
