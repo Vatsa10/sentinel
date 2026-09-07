@@ -1,13 +1,15 @@
 "use client";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { RefreshCw, Radio, Crosshair } from "lucide-react";
-import { apiUrl } from "@/lib/api";
+import { toast } from "sonner";
+import { RefreshCw, Radio, Crosshair, Trash2 } from "lucide-react";
+import { api, apiUrl, ApiError } from "@/lib/api";
 import type { Camera } from "@/lib/types";
 import type { CamHealthRow } from "@/lib/health";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Gate } from "@/components/Gate";
 import { STATE_TEXT } from "@/lib/health";
 
 const WALL_KEY = "NETRA_WALL";
@@ -17,14 +19,37 @@ export function CameraDrawer({
   health,
   open,
   onOpenChange,
+  onDeleted,
 }: {
   camera: Camera | null;
   health: CamHealthRow | undefined;
   open: boolean;
   onOpenChange: (v: boolean) => void;
+  onDeleted?: () => void;
 }) {
   const router = useRouter();
   const [nonce, setNonce] = useState(0);
+  const [deleting, setDeleting] = useState(false);
+
+  async function removeCamera() {
+    if (!camera) return;
+    if (!confirm(`Remove camera ${camera.id}? This cannot be undone.`)) return;
+    setDeleting(true);
+    try {
+      await api(`/api/cameras/${camera.id}`, { method: "DELETE" });
+      toast.success(`Camera ${camera.id} removed.`);
+      onOpenChange(false);
+      onDeleted?.();
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        toast.error("Camera has detections; disable it instead");
+      } else {
+        toast.error(e instanceof ApiError ? e.message : "Delete failed");
+      }
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   if (!camera) return null;
 
@@ -97,6 +122,11 @@ export function CameraDrawer({
           <Button variant="secondary" onClick={() => router.push(`/console/vehicles?camera=${camera.id}`)}>
             <Crosshair className="size-4" /> Trace here
           </Button>
+          <Gate min="admin" reason="Removing a camera requires an admin key">
+            <Button variant="destructive" onClick={removeCamera} disabled={deleting}>
+              <Trash2 className="size-4" /> Remove camera
+            </Button>
+          </Gate>
         </div>
       </SheetContent>
     </Sheet>

@@ -126,6 +126,7 @@ function MapPageInner() {
         health={selectedCamera ? healthMap.get(selectedCamera.id) : undefined}
         open={!!selectedCamera}
         onOpenChange={(v) => { if (!v) setSelectedId(null); }}
+        onDeleted={() => { setSelectedId(null); qc.invalidateQueries({ queryKey: ["cameras"] }); }}
       />
 
       <OnboardDrawer
