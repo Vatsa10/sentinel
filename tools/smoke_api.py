@@ -34,13 +34,22 @@ CHECKS = [  # (method, path, role, expected)
     ("POST", "/api/notify/test", "operator", 200),
     ("POST", "/api/storage/prune?dry_run=true", "admin", 200),
     ("MJPEG", "/api/cameras/cam13/live.mjpg", None, 200),
+    ("POST", "/api/cameras", None, {"id": "smoke-cam", "name": "Smoke Cam",
+                                     "rtsp_url": "rtsp://example.com/smoke"}, 403),
+    ("POST", "/api/cameras", "admin", {"id": "smoke-cam", "name": "Smoke Cam",
+                                        "rtsp_url": "rtsp://example.com/smoke"}, 200),
+    ("DELETE", "/api/cameras/smoke-cam", "admin", None, 200),
 ]
 
 
-def call(base, method, path, key):
-    req = urllib.request.Request(base + path, method="GET" if method == "MJPEG" else method)
+def call(base, method, path, key, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base + path, data=data,
+                                  method="GET" if method == "MJPEG" else method)
     if key:
         req.add_header("X-API-Key", key)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
     if method == "MJPEG":
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
@@ -69,12 +78,17 @@ def main():
     else:
         print("no data/api_keys.json: open mode, role checks expect 200 everywhere")
     bad = 0
-    for method, path, role, expected in CHECKS:
+    for check in CHECKS:
+        if len(check) == 5:
+            method, path, role, body, expected = check
+        else:
+            method, path, role, expected = check
+            body = None
         if role and role not in keys and not kp.exists():
             expected = 200
         if not kp.exists() and expected == 403:
             expected = 200
-        got = call(a.base, method, path, keys.get(role) if role else None)
+        got = call(a.base, method, path, keys.get(role) if role else None, body)
         mark = "ok " if got == expected else "BAD"
         bad += got != expected
         print(f"{mark} {method:4} {path:45} as {role or 'anon':8} -> {got} (want {expected})")

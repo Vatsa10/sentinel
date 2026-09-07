@@ -99,19 +99,13 @@ def require(permission: str):
 
 
 # ---------------------------------------------------------------- registry --
-@app.get("/api/cameras")
-def list_cameras(capability: str | None = None, city: str | None = None):
-    """Model 1 registry: every camera with its geography and capability profile."""
-    with SessionLocal() as db:
-        q = db.query(Camera)
-        if capability:
-            q = q.filter(Camera.capability == capability)
-        if city:
-            q = q.filter(Camera.city == city)
-        cams = q.order_by(Camera.id).all()
+def _camera_json(c: Camera, health: dict) -> dict:
+    """Serialise one Camera row the way the console/API expects it.
 
-    health = {h["camera_id"]: h for h in PIPELINE.supervisor.health()}
-    return [{
+    Shared by list_cameras and the manual/bulk registration routes so the
+    response shape (and credential redaction) never drifts between them.
+    """
+    return {
         "id": c.id, "name": c.name,
         "lat": c.lat, "lon": c.lon, "city": c.city, "district": c.district,
         "department": c.department,
@@ -124,7 +118,125 @@ def list_cameras(capability: str | None = None, city: str | None = None):
         "whep_url": c.whep_url, "hls_url": c.hls_url,
         "rtsp_url": redact_url(c.rtsp_url),
         "live": health.get(c.id, {}),
-    } for c in cams]
+    }
+
+
+@app.get("/api/cameras")
+def list_cameras(capability: str | None = None, city: str | None = None):
+    """Model 1 registry: every camera with its geography and capability profile."""
+    with SessionLocal() as db:
+        q = db.query(Camera)
+        if capability:
+            q = q.filter(Camera.capability == capability)
+        if city:
+            q = q.filter(Camera.city == city)
+        cams = q.order_by(Camera.id).all()
+
+    health = {h["camera_id"]: h for h in PIPELINE.supervisor.health()}
+    return [_camera_json(c, health) for c in cams]
+
+
+@app.post("/api/cameras")
+async def register_camera(request: Request, _p=Depends(require("onboard"))):
+    """Manually register (or update) one camera in the registry.
+
+    This only writes the `cameras` row; if PIPELINE is already running it is
+    NOT touched here — a manually added camera is picked up on the next
+    `POST /api/pipeline/start` (or process restart), same as any row added by
+    onboarding. This keeps a live pipeline from being disrupted by a
+    registration call made during a demo.
+    """
+    from netra.core.registry_input import validate_camera_payload
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON body")
+    try:
+        fields = validate_camera_payload(payload)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    with SessionLocal() as db:
+        cam = db.get(Camera, fields["id"])
+        if cam is None:
+            cam = Camera(id=fields["id"])
+            db.add(cam)
+        for k, v in fields.items():
+            setattr(cam, k, v)
+        db.commit()
+        db.refresh(cam)
+        result = _camera_json(cam, {})
+
+    _audit("registry.manual", target=fields["id"])
+    return result
+
+
+@app.post("/api/cameras/bulk")
+async def register_cameras_bulk(request: Request, _p=Depends(require("onboard"))):
+    """Bulk camera registration/import: up to 500 rows in one call.
+
+    Each row is validated and applied independently — one bad row is
+    reported in `errors` but does not abort the rest of the batch.
+    """
+    from netra.core.registry_input import validate_camera_payload
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON body")
+    rows = payload.get("cameras") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise HTTPException(400, "body must be {'cameras': [...]}")
+    if len(rows) > 500:
+        raise HTTPException(400, "at most 500 cameras per bulk call")
+
+    created, updated, errors = 0, 0, []
+    with SessionLocal() as db:
+        for i, row in enumerate(rows):
+            try:
+                fields = validate_camera_payload(row)
+            except ValueError as e:
+                errors.append({"row": i, "id": (row or {}).get("id") if isinstance(row, dict) else None,
+                               "detail": str(e)})
+                continue
+            cam = db.get(Camera, fields["id"])
+            if cam is None:
+                cam = Camera(id=fields["id"])
+                db.add(cam)
+                created += 1
+            else:
+                updated += 1
+            for k, v in fields.items():
+                setattr(cam, k, v)
+        db.commit()
+
+    _audit("registry.bulk", detail={"created": created, "updated": updated,
+                                     "errors": len(errors)})
+    return {"created": created, "updated": updated, "errors": errors}
+
+
+@app.delete("/api/cameras/{camera_id}")
+def delete_camera(camera_id: str, _p=Depends(require("onboard"))):
+    """Remove a camera from the registry (e.g. to clean up test cameras).
+
+    Refuses (409) if the camera has any detections on record, so demo/test
+    data cleanup can never silently discard real evidence.
+    """
+    with SessionLocal() as db:
+        cam = db.get(Camera, camera_id)
+        if cam is None:
+            raise HTTPException(404, "camera not found")
+        has_detections = db.query(Detection.id).filter(
+            Detection.camera_id == camera_id).first() is not None
+        if has_detections:
+            raise HTTPException(
+                409, "camera has detections on record; cannot delete")
+        db.delete(cam)
+        db.commit()
+
+    _audit("registry.delete", target=camera_id)
+    return {"deleted": camera_id}
 
 
 @app.get("/api/cameras/health")
