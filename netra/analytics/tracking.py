@@ -23,6 +23,7 @@ badly and adds state to get wrong. Revisit only if sampling rises above ~10 fps.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 
 log = logging.getLogger(__name__)
@@ -115,6 +116,11 @@ class CameraTracker:
         self.loops_seen = 0
         #: tracks discarded by the cap rather than by timeout
         self.dropped_tracks = 0
+        # update()/_expire() run on the inference thread; reset() runs from
+        # the discontinuity handler and stats() is read from an API request
+        # thread - both can run concurrently with an update() in progress, so
+        # every method that touches `self.tracks` takes this lock.
+        self._lock = threading.Lock()
 
     def reset(self) -> None:
         """Discard track state at a loop cut, where continuity is void.
@@ -127,9 +133,10 @@ class CameraTracker:
         reset here and `loops_seen` incremented, so anyone reading a count of
         "4,893 vehicles" can see whether that is one playthrough or six.
         """
-        self.tracks.clear()
-        self.counted_this_loop = 0
-        self.loops_seen += 1
+        with self._lock:
+            self.tracks.clear()
+            self.counted_this_loop = 0
+            self.loops_seen += 1
 
     def _match(self, det, pts_ms: float) -> Track | None:
         """Best existing track for this detection, or None."""
@@ -163,6 +170,10 @@ class CameraTracker:
         Each detection is given a `track_id`, and each track its dwell time and
         direction, so downstream analytics need no tracking logic of their own.
         """
+        with self._lock:
+            return self._update_locked(detections, pts_ms)
+
+    def _update_locked(self, detections: list, pts_ms: float) -> list:
         self._expire(pts_ms)
         claimed: set[int] = set()
 
@@ -221,7 +232,13 @@ class CameraTracker:
             self.dropped_tracks += excess
 
     def stats(self) -> dict:
-        active = list(self.tracks.values())
+        with self._lock:
+            active = list(self.tracks.values())
+            total_counted = self.total_count
+            counted_this_loop = self.counted_this_loop
+            loops_seen = self.loops_seen
+            dropped_tracks = self.dropped_tracks
+            counts_by_class = dict(self.counts)
         directions: dict[str, int] = {}
         for t in active:
             d = t.direction()
@@ -230,11 +247,11 @@ class CameraTracker:
         return {
             "camera_id": self.camera_id,
             "active_tracks": len(active),
-            "total_counted": self.total_count,
-            "counted_this_loop": self.counted_this_loop,
-            "loops_seen": self.loops_seen,
-            "dropped_tracks": self.dropped_tracks,
-            "counts_by_class": dict(self.counts),
+            "total_counted": total_counted,
+            "counted_this_loop": counted_this_loop,
+            "loops_seen": loops_seen,
+            "dropped_tracks": dropped_tracks,
+            "counts_by_class": counts_by_class,
             "directions": directions,
             "mean_dwell_s": round(
                 sum(t.dwell_s for t in active) / len(active), 1) if active else 0.0,
@@ -246,18 +263,27 @@ class TrackerRegistry:
 
     def __init__(self):
         self.trackers: dict[str, CameraTracker] = {}
+        #: guards the dict itself (camera creation/lookup); each CameraTracker
+        #: guards its own state independently.
+        self._lock = threading.Lock()
 
     def get(self, camera_id: str) -> CameraTracker:
-        if camera_id not in self.trackers:
-            self.trackers[camera_id] = CameraTracker(camera_id)
-        return self.trackers[camera_id]
+        with self._lock:
+            tracker = self.trackers.get(camera_id)
+            if tracker is None:
+                tracker = self.trackers[camera_id] = CameraTracker(camera_id)
+            return tracker
 
     def reset(self, camera_id: str) -> None:
-        if camera_id in self.trackers:
-            self.trackers[camera_id].reset()
+        with self._lock:
+            tracker = self.trackers.get(camera_id)
+        if tracker is not None:
+            tracker.reset()
 
     def stats(self) -> list[dict]:
-        return [t.stats() for t in self.trackers.values()]
+        with self._lock:
+            trackers = list(self.trackers.values())
+        return [t.stats() for t in trackers]
 
 
 def _self_check() -> None:
@@ -364,6 +390,39 @@ def _self_check() -> None:
     st = t10.stats()
     assert st["total_counted"] == 2 and st["counted_this_loop"] == 1, st
     assert st["loops_seen"] == 1, st
+
+    # Concurrent update() and stats() must never raise: stats() is read from
+    # an API request thread while update() runs continuously on inference.
+    import threading as _threading
+    import time as _time
+    stress = CameraTracker("camstress")
+    stop = _threading.Event()
+    errors = []
+
+    def _updater():
+        pts = 0.0
+        while not stop.is_set():
+            pts += 200.0
+            stress.update([Det([int(pts) % 900, 0, int(pts) % 900 + 50, 50])], pts)
+
+    def _reader():
+        while not stop.is_set():
+            try:
+                stress.stats()
+                stress.reset()
+            except Exception as e:
+                errors.append(e)
+                break
+
+    threads = [_threading.Thread(target=_updater),
+              _threading.Thread(target=_reader)]
+    for th in threads:
+        th.start()
+    _time.sleep(0.5)
+    stop.set()
+    for th in threads:
+        th.join(timeout=2)
+    assert not errors, errors
 
     print("tracking self-check passed")
 

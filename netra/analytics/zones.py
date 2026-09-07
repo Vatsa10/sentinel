@@ -20,6 +20,7 @@ carrying five different resolutions.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -109,16 +110,26 @@ class ZoneEngine:
         #: (zone_id, track_id) -> which side of a crossing line it was last on
         self._sides: dict = {}
         self.events_raised = 0
+        # evaluate() runs on the inference thread; reset_camera() is called
+        # from the discontinuity handler, which can run concurrently with it.
+        # Both mutate _fired/_sides, so both need the same lock - without it
+        # a reset iterating _fired while evaluate() adds to it can raise
+        # "set changed size during iteration".
+        self._lock = threading.Lock()
 
     def set_zones(self, camera_id: str, zones: list[Zone]) -> None:
         self.zones[camera_id] = [z for z in zones if z.active]
 
     def reset_camera(self, camera_id: str) -> None:
         """Forget per-track state after a loop cut; track ids restart."""
-        for key in [k for k in self._fired if k[0].startswith(f"{camera_id}:")]:
-            self._fired.discard(key)
-        for key in [k for k in self._sides if k[0].startswith(f"{camera_id}:")]:
-            self._sides.pop(key, None)
+        prefix = f"{camera_id}:"
+        with self._lock:
+            fired_keys = [k for k in self._fired if k[0].startswith(prefix)]
+            for key in fired_keys:
+                self._fired.discard(key)
+            side_keys = [k for k in self._sides if k[0].startswith(prefix)]
+            for key in side_keys:
+                self._sides.pop(key, None)
 
     def evaluate(self, camera_id: str, tracks: list, frame_size) -> list[ZoneEvent]:
         """Check every active track on this camera against its zones."""
@@ -130,6 +141,16 @@ class ZoneEngine:
         events: list[ZoneEvent] = []
         now = datetime.now(timezone.utc)
 
+        with self._lock:
+            events = self._evaluate_locked(camera_id, zones, tracks, width,
+                                           height, now)
+        self.events_raised += len(events)
+        return events
+
+    def _evaluate_locked(self, camera_id, zones, tracks, width, height,
+                         now) -> list[ZoneEvent]:
+        """The actual rule checks. Caller holds `self._lock`."""
+        events: list[ZoneEvent] = []
         for zone in zones:
             pts = zone.to_pixels(width, height)
             for track in tracks:
@@ -178,7 +199,6 @@ class ZoneEngine:
                                     f"towards side {side}"),
                             at=now, direction=track.direction()))
 
-        self.events_raised += len(events)
         return events
 
 
@@ -251,6 +271,47 @@ def _self_check() -> None:
     # A loop cut clears per-track state, since track ids restart from 1.
     engine.reset_camera("cam01")
     assert len(engine.evaluate("cam01", [inside], (1000, 1000))) == 1
+
+    # Concurrent evaluate() and reset_camera() must never raise: the
+    # discontinuity handler can fire on a different thread from inference
+    # while a frame is mid-evaluation.
+    import threading as _threading
+    import time as _time
+    stress = ZoneEngine()
+    stress_zone = Zone(zone_id="camX:z1", camera_id="camX", name="Z",
+                       rule="intrusion",
+                       points=[[0, 0], [1, 0], [1, 1], [0, 1]])
+    stress.set_zones("camX", [stress_zone])
+    stop = _threading.Event()
+    errors = []
+
+    def _evaluator():
+        tid = 0
+        while not stop.is_set():
+            tid += 1
+            try:
+                stress.evaluate("camX", [FakeTrack(tid, [(50, 50)])], (100, 100))
+            except Exception as e:
+                errors.append(e)
+                break
+
+    def _resetter():
+        while not stop.is_set():
+            try:
+                stress.reset_camera("camX")
+            except Exception as e:
+                errors.append(e)
+                break
+
+    threads = [_threading.Thread(target=_evaluator),
+              _threading.Thread(target=_resetter)]
+    for th in threads:
+        th.start()
+    _time.sleep(0.5)
+    stop.set()
+    for th in threads:
+        th.join(timeout=2)
+    assert not errors, errors
 
     print("zones self-check passed")
 

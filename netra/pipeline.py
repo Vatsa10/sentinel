@@ -61,6 +61,11 @@ class Pipeline:
         self._writer: threading.Thread | None = None
         self.stats = {"written": 0, "write_dropped": 0, "zone_events": 0,
                       "traffic_buckets": 0}
+        # Both stats counters above are incremented from more than one
+        # thread (inference enqueues detections and zone events; the writer
+        # thread also increments "written"/"zone_events"), so increments go
+        # through this lock rather than risking a lost update under a race.
+        self._stats_lock = threading.Lock()
 
         # Counters per camera at the last traffic flush, so each bucket can
         # record the traffic during it rather than the running total.
@@ -88,6 +93,10 @@ class Pipeline:
         self._attr_last: dict[str, float] = {}
         self.attribute_stats = {"queued": 0, "processed": 0, "dropped": 0,
                                 "failed": 0, "broadcast": 0}
+        #: attribute_stats is written from the inference/writer thread
+        #: (queued/dropped) and the attribute worker thread (the rest); one
+        #: lock for the whole dict avoids a lost increment under a race.
+        self._attr_stats_lock = threading.Lock()
 
     # -- lifecycle -----------------------------------------------------------
     def start(self, camera_ids: list[str] | None = None,
@@ -168,16 +177,34 @@ class Pipeline:
         self.engine.reset_camera_state(camera_id)
 
     def _handle_zone_event(self, event, frame) -> None:
-        """Persist a zone trigger and push it to consoles as an alert.
+        """Hand a zone trigger to the writer thread. Must not touch disk or
+        the database.
+
+        This runs on the inference thread, same constraint as
+        `_handle_detection`: the imwrite plus its own DB transaction used to
+        run here inline, which is exactly the per-item disk/DB cost that
+        starves inference on a busy camera. The frame is copied because the
+        inference thread reuses/overwrites its buffers as soon as this
+        callback returns.
+        """
+        try:
+            self._write_queue.put_nowait(("zone", event, frame.image.copy()))
+        except queue.Full:
+            with self._stats_lock:
+                self.stats["write_dropped"] += 1
+
+    def _persist_zone_event(self, event, image) -> None:
+        """The actual zone-event work: evidence write, DB row, broadcast,
+        notify. Runs on the writer thread only.
 
         Zone rules are how a camera earns its keep when plate recognition is
         impossible, which on this grid is most of them.
         """
         evidence_path = None
         try:
-            fname = (f"zone_{event.camera_id}_{int(frame.wall_time * 1000)}"
+            fname = (f"zone_{event.camera_id}_{int(time.time() * 1000)}"
                      f"_{event.track_id}.jpg")
-            cv2.imwrite(str(config.EVIDENCE / fname), frame.image)
+            cv2.imwrite(str(config.EVIDENCE / fname), image)
             evidence_path = f"/evidence/{fname}"
         except Exception:
             log.exception("could not write zone evidence frame")
@@ -208,7 +235,8 @@ class Pipeline:
                 "at": row.at.isoformat(),
             }
 
-        self.stats["zone_events"] += 1
+        with self._stats_lock:
+            self.stats["zone_events"] += 1
         log.warning("ZONE %s on %s: %s", event.rule, event.camera_id, event.detail)
         self._broadcast(payload)
         # After the broadcast, for the same reason as on the alert path. A zone
@@ -287,7 +315,8 @@ class Pipeline:
                     mean_dwell_s=stats["mean_dwell_s"]))
                 written += 1
             db.commit()
-        self.stats["traffic_buckets"] += written
+        with self._stats_lock:
+            self.stats["traffic_buckets"] += written
         return written
 
     def _handle_detection(self, det) -> None:
@@ -301,7 +330,8 @@ class Pipeline:
         try:
             self._write_queue.put_nowait(det)
         except queue.Full:
-            self.stats["write_dropped"] += 1
+            with self._stats_lock:
+                self.stats["write_dropped"] += 1
 
     def _writer_loop(self) -> None:
         """Persist detections in batches, off the inference thread."""
@@ -330,8 +360,21 @@ class Pipeline:
             last_flush = time.time()
 
     def _flush(self, batch: list) -> None:
+        # The write queue carries two kinds of item: a plain detection, and a
+        # ("zone", event, image) tuple enqueued by _handle_zone_event. Both
+        # are drained by the same writer thread so a zone event never
+        # competes with inference for disk/DB time, but they are persisted
+        # through different paths.
         rows, dets = [], []
         for det in batch:
+            if isinstance(det, tuple) and det and det[0] == "zone":
+                _, event, image = det
+                try:
+                    self._persist_zone_event(event, image)
+                except Exception:
+                    log.exception("failed to persist a zone event for %s",
+                                  event.camera_id)
+                continue
             evidence_path = None
             if det.evidence is not None and det.evidence.size > 0:
                 fname = (f"{det.camera_id}_{int(det.wall_time * 1000)}"
@@ -363,11 +406,14 @@ class Pipeline:
             ))
             dets.append(det)
 
+        if not rows:
+            return
         with SessionLocal() as db:
             db.add_all(rows)
             db.commit()
             ids = [r.id for r in rows]
-        self.stats["written"] += len(rows)
+        with self._stats_lock:
+            self.stats["written"] += len(rows)
 
         # Watchlist checking needs the persisted id, so it follows the flush.
         for detection_id, det in zip(ids, dets):
@@ -429,9 +475,11 @@ class Pipeline:
         except queue.Full:
             # Dropping is the designed behaviour, but silent dropping is not:
             # an operator seeing no descriptions deserves to find the count.
-            self.attribute_stats["dropped"] += 1
+            with self._attr_stats_lock:
+                self.attribute_stats["dropped"] += 1
             return False
-        self.attribute_stats["queued"] += 1
+        with self._attr_stats_lock:
+            self.attribute_stats["queued"] += 1
         return True
 
     def _attribute_loop(self) -> None:
@@ -444,7 +492,8 @@ class Pipeline:
             try:
                 self._describe_job(job)
             except Exception:
-                self.attribute_stats["failed"] += 1
+                with self._attr_stats_lock:
+                    self.attribute_stats["failed"] += 1
                 log.exception("attribute extraction failed for detection %s",
                               job.get("detection_id"))
 
@@ -453,15 +502,18 @@ class Pipeline:
 
         path = evidence_file(job["evidence_path"])
         if path is None:
-            self.attribute_stats["failed"] += 1
+            with self._attr_stats_lock:
+                self.attribute_stats["failed"] += 1
             return
         result = attrs.describe_image_file(path)
-        self.attribute_stats["processed"] += 1
+        with self._attr_stats_lock:
+            self.attribute_stats["processed"] += 1
         if not result.raw_caption:
             # The extractor degraded rather than described. Nothing is stored:
             # a row saying "unknown" would be indistinguishable from a caption
             # that genuinely found nothing to say.
-            self.attribute_stats["failed"] += 1
+            with self._attr_stats_lock:
+                self.attribute_stats["failed"] += 1
             return
 
         if job["detection_id"] is not None:
@@ -472,7 +524,8 @@ class Pipeline:
         # console fetches it from the stored row instead.
         if job.get("alert") is not None and \
                 time.monotonic() - job["at"] <= ATTRIBUTE_BROADCAST_BOUND_S:
-            self.attribute_stats["broadcast"] += 1
+            with self._attr_stats_lock:
+                self.attribute_stats["broadcast"] += 1
             self._broadcast({"kind": "attributes", **job["alert"],
                              "detection_id": job["detection_id"],
                              "description": result.description,
