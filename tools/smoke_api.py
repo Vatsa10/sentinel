@@ -22,7 +22,7 @@ CHECKS = [  # (method, path, role, expected)
     ("GET", "/api/analytics/baselines", None, 200),
     ("GET", "/api/analytics/anomalies", None, 200),
     ("GET", "/api/analytics/cloned-plates", None, 200),
-    ("GET", "/api/analytics/journeys", None, 200),
+    ("GET", "/api/analytics/journeys?group=ahmedabad-13jun", None, 200),
     ("GET", "/api/storage", None, 200),
     ("GET", "/api/audit", None, 200),
     ("GET", "/api/notify/config", None, 200),
