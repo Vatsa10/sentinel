@@ -1,16 +1,15 @@
 "use client";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Network, Copy, AlertTriangle } from "lucide-react";
+import { Network, Copy } from "lucide-react";
 import { api } from "@/lib/api";
 import type { AnomaliesResponse, ClonedPlatesResponse, JourneysResponse } from "@/lib/types";
 import { JourneyCard } from "@/components/JourneyCard";
 import { ClonePairCard } from "@/components/ClonePairCard";
+import { AnomalyTable } from "@/components/AnomalyTable";
 import { EmptyState } from "@/components/EmptyState";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 // netra/core/geo.py TIME_GROUPS
 const TIME_GROUPS = ["ahmedabad-13jun", "junagadh-13jun"];
@@ -91,43 +90,7 @@ export default function IntelligencePage() {
         </TabsContent>
 
         <TabsContent value="anomalies" className="flex flex-col gap-3 pt-3">
-          {!anomalies || anomalies.assessments.length === 0 ? (
-            <EmptyState icon={AlertTriangle} title="No anomaly data" body="Baselines need more history before anything can be judged." />
-          ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Camera</TableHead>
-                  <TableHead>Hour</TableHead>
-                  <TableHead>Observed</TableHead>
-                  <TableHead>Expected</TableHead>
-                  <TableHead>Z</TableHead>
-                  <TableHead>Status</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {anomalies.assessments.map((a, i) => (
-                  <TableRow key={`${a.camera_id}-${a.hour}-${i}`} className={a.anomalous ? "bg-warn/5" : undefined}>
-                    <TableCell className="mono">{a.camera_id}</TableCell>
-                    <TableCell className="mono">{a.hour}:00</TableCell>
-                    <TableCell className="mono">{a.observed}</TableCell>
-                    <TableCell className="mono">{a.baseline ? `${a.baseline.mean.toFixed(1)} ± ${a.baseline.effective_stdev.toFixed(1)}` : "—"}</TableCell>
-                    <TableCell className="mono">{a.z_score != null ? a.z_score.toFixed(2) : "—"}</TableCell>
-                    <TableCell>
-                      {a.status === "stale" ? (
-                        <Tooltip>
-                          <TooltipTrigger render={<span tabIndex={0} className="text-muted" />}>stale</TooltipTrigger>
-                          <TooltipContent>baseline too old to judge</TooltipContent>
-                        </Tooltip>
-                      ) : (
-                        <span className={a.anomalous ? "text-warn" : "text-muted"}>{a.status}</span>
-                      )}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          )}
+          <AnomalyTable data={anomalies} />
         </TabsContent>
       </Tabs>
     </div>

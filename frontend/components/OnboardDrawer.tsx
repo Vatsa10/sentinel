@@ -17,6 +17,42 @@ const CSV_COLUMNS = ["id", "name", "department", "city", "district", "lat", "lon
 
 interface BulkResult { created: number; updated: number; errors: { row: number; id: string | null; detail: string }[] }
 
+/**
+ * Small RFC-4180-ish CSV parser: handles double-quoted fields (including
+ * embedded commas and newlines) and escaped quotes (""), which a naive
+ * `line.split(",")` breaks on. Blank trailing lines are dropped.
+ */
+function parseCsvTable(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else {
+        field += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ",") {
+      row.push(field); field = "";
+    } else if (c === "\n" || c === "\r") {
+      if (c === "\r" && text[i + 1] === "\n") i++;
+      row.push(field); field = "";
+      if (row.some((f) => f.trim() !== "")) rows.push(row);
+      row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field !== "" || row.length > 0) { row.push(field); if (row.some((f) => f.trim() !== "")) rows.push(row); }
+  return rows;
+}
+
 function validateManual(f: {
   id: string; name: string; lat: string; lon: string; url: string;
 }): string | null {
@@ -90,13 +126,12 @@ export function OnboardDrawer({ open, onOpenChange, onDone }: {
   }
 
   function parseCsv(text: string) {
-    const lines = text.trim().split(/\r?\n/).filter((l) => l.trim());
-    if (lines.length === 0) { setCsvRows([]); return; }
-    const header = lines[0].split(",").map((h) => h.trim());
-    const rows = lines.slice(1).map((line) => {
-      const cells = line.split(",").map((c) => c.trim());
+    const table = parseCsvTable(text);
+    if (table.length === 0) { setCsvRows([]); return; }
+    const header = table[0].map((h) => h.trim());
+    const rows = table.slice(1).map((cells) => {
       const row: Record<string, string> = {};
-      header.forEach((h, i) => { row[h] = cells[i] ?? ""; });
+      header.forEach((h, i) => { row[h] = (cells[i] ?? "").trim(); });
       return row;
     });
     setCsvRows(rows);
@@ -200,6 +235,7 @@ export function OnboardDrawer({ open, onOpenChange, onDone }: {
               value={csvText}
               onChange={(e) => { setCsvText(e.target.value); parseCsv(e.target.value); }}
             />
+            <p className="text-[11px] text-muted">Quoted fields supported; one camera per line.</p>
             {csvRows.length > 0 && (
               <div className="mono max-h-32 overflow-auto rounded-ctl border border-border bg-surface-2 p-2 text-[11px]">
                 {csvRows.slice(0, 5).map((r, i) => (

@@ -38,6 +38,22 @@ export function CountsChart({
     return `${data.length} buckets, ${total} total ${label}, peak ${max}.`;
   }, [data, label]);
 
+  // Stacked-area trick for a true [expectedLow, expectedHigh] corridor: an
+  // invisible base area up to expectedLow, then a visible band whose height
+  // is (expectedHigh - expectedLow) stacked on top of it.
+  const chartData = useMemo(
+    () =>
+      data.map((d) => ({
+        ...d,
+        bandHeight:
+          d.expectedLow != null && d.expectedHigh != null
+            ? Math.max(0, d.expectedHigh - d.expectedLow)
+            : null,
+      })),
+    [data]
+  );
+  const hasBand = data.some((d) => d.expectedLow != null && d.expectedHigh != null);
+
   return (
     <div
       role="img"
@@ -45,7 +61,7 @@ export function CountsChart({
       className="h-64 w-full"
     >
       <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+        <AreaChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
           <defs>
             <linearGradient id="countsFill" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0%" stopColor="#5b8def" stopOpacity={0.25} />
@@ -64,16 +80,29 @@ export function CountsChart({
             labelStyle={{ color: "#e5e9f0" }}
           />
           <Legend wrapperStyle={{ fontSize: 11 }} />
-          {data.some((d) => d.expectedHigh != null) && (
-            <Area
-              type="monotone"
-              dataKey="expectedHigh"
-              name="expected (baseline)"
-              stroke="none"
-              fill="#8a97ad"
-              fillOpacity={0.12}
-              isAnimationActive={animate}
-            />
+          {hasBand && (
+            <>
+              <Area
+                type="monotone"
+                dataKey="expectedLow"
+                stackId="band"
+                name="expected low"
+                legendType="none"
+                stroke="none"
+                fill="transparent"
+                isAnimationActive={animate}
+              />
+              <Area
+                type="monotone"
+                dataKey="bandHeight"
+                stackId="band"
+                name="Baseline band (mean ± z)"
+                stroke="none"
+                fill="#8a97ad"
+                fillOpacity={0.2}
+                isAnimationActive={animate}
+              />
+            </>
           )}
           <Area
             type="monotone"

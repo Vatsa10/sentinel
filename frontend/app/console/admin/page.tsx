@@ -250,7 +250,7 @@ export default function AdminPage() {
             <a href={apiUrl("/docs")} target="_blank" rel="noreferrer" className="flex items-center gap-1 text-accent hover:underline">
               <ExternalLink className="size-3.5" /> OpenAPI docs
             </a>
-            <a href="https://github.com" target="_blank" rel="noreferrer" className="flex items-center gap-1 text-accent hover:underline">
+            <a href="https://github.com/Vatsa10/sentinel" target="_blank" rel="noreferrer" className="flex items-center gap-1 text-accent hover:underline">
               <ExternalLink className="size-3.5" /> Repository
             </a>
           </div>
