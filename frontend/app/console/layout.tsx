@@ -5,6 +5,7 @@ import { api, ApiError } from "@/lib/api";
 import { LiveProvider } from "@/lib/live";
 import { Shell } from "@/components/Shell";
 import { Unreachable } from "@/components/Unreachable";
+import { BackendOverrideDialog } from "@/components/BackendOverrideDialog";
 
 export default function ConsoleLayout({ children }: { children: React.ReactNode }) {
   const failsRef = useRef(0);
@@ -34,6 +35,7 @@ export default function ConsoleLayout({ children }: { children: React.ReactNode 
 
   return (
     <LiveProvider>
+      <BackendOverrideDialog />
       <Shell>{children}</Shell>
     </LiveProvider>
   );

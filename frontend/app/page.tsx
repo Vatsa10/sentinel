@@ -10,10 +10,12 @@ import { Scale } from "@/components/landing/Scale";
 import { Security } from "@/components/landing/Security";
 import { Cta } from "@/components/landing/Cta";
 import { Footer } from "@/components/landing/Footer";
+import { BackendOverrideDialog } from "@/components/BackendOverrideDialog";
 
 export default function Home() {
   return (
     <>
+      <BackendOverrideDialog />
       <Nav />
       <main>
         <Hero />

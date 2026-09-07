@@ -20,10 +20,14 @@ function emitAuthError(status: 401 | 403) {
   authErrorListeners.forEach((cb) => cb(status));
 }
 
+/**
+ * Pure getter — never writes. A `?api=` query param is only ever a *proposed*
+ * override (see lib/apiOverride.ts); accepting one and sending it the stored
+ * `X-API-Key` requires an explicit user confirmation, so reading the base
+ * must not have the side effect of storing it.
+ */
 export function apiBase(): string {
   if (typeof window !== "undefined") {
-    const q = new URLSearchParams(window.location.search).get("api");
-    if (q) { try { localStorage.setItem(BASE, q.replace(/\/$/, "")); } catch {} }
     try { const s = localStorage.getItem(BASE); if (s) return s; } catch {}
   }
   return (process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080").replace(/\/$/, "");
