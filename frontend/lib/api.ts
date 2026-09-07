@@ -3,6 +3,23 @@ export class ApiError extends Error {
 }
 const KEY = "NETRA_API_KEY", BASE = "NETRA_API_BASE";
 
+/**
+ * Tiny pub/sub so `api()` can announce a 401/403 from anywhere in the app
+ * without importing lib/auth.tsx (which imports this module). AuthProvider
+ * subscribes and turns these into a toast + a reopened sign-in dialog
+ * (spec §4.6) so a stale/revoked key surfaces immediately, not just on the
+ * sign-in form's own failed attempt.
+ */
+type AuthErrorListener = (status: 401 | 403) => void;
+const authErrorListeners = new Set<AuthErrorListener>();
+export function onAuthError(cb: AuthErrorListener): () => void {
+  authErrorListeners.add(cb);
+  return () => { authErrorListeners.delete(cb); };
+}
+function emitAuthError(status: 401 | 403) {
+  authErrorListeners.forEach((cb) => cb(status));
+}
+
 export function apiBase(): string {
   if (typeof window !== "undefined") {
     const q = new URLSearchParams(window.location.search).get("api");
@@ -28,6 +45,12 @@ export async function api<T>(path: string, init: RequestInit & { json?: unknown 
   if (!res.ok) {
     let msg = res.statusText;
     try { const j = await res.json(); msg = j.detail ?? j.error ?? msg; } catch {}
+    // /api/auth/whoami's own 401s are handled locally by AuthProvider.refresh()
+    // and SignInDialog's submit handler; emitting here would loop the dialog
+    // back open the instant a viewer's anonymous whoami check runs.
+    if ((res.status === 401 || res.status === 403) && !path.startsWith("/api/auth/whoami")) {
+      emitAuthError(res.status);
+    }
     throw new ApiError(res.status, String(msg));
   }
   const ct = res.headers.get("content-type") ?? "";

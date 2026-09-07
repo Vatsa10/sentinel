@@ -198,9 +198,15 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
             </Button>
           </SignInDialog>
         ) : (
-          <Button size="sm" variant="outline" onClick={signOut}>
-            Sign out
-          </Button>
+          <>
+            {/* No trigger here: mounted so a 401/403 elsewhere can still
+                reopen it (AuthProvider controls `open`), even though the
+                signed-in top bar shows Sign out instead of a Sign in button. */}
+            <SignInDialog />
+            <Button size="sm" variant="outline" onClick={signOut}>
+              Sign out
+            </Button>
+          </>
         )}
       </div>
     </header>
