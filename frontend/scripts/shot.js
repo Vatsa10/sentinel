@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const { chromium } = require("playwright");
 const path = process.argv[2];
 const url = process.argv[3];
