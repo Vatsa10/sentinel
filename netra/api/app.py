@@ -35,6 +35,16 @@ log = logging.getLogger("netra.api")
 app = FastAPI(title="NETRA", version="1.0",
               description="Networked Evidence, Tracking & Recognition for Analytics")
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_methods=["*"],
+    allow_headers=["X-API-Key", "Content-Type"],
+    allow_credentials=False,
+)
+
 WEB_DIR = config.ROOT / "netra" / "web"
 
 
@@ -600,12 +610,25 @@ def audit_log(limit: int = Query(100, le=500)):
                  "target": r.target, "detail": r.detail} for r in rows]
 
 
+@app.get("/api/auth/whoami")
+def whoami(_p=Depends(require("read"))):
+    return {"role": _p.role, "name": _p.name, "enabled": auth.enabled()}
+
+
 # -------------------------------------------------------------------- web --
 app.mount("/evidence", StaticFiles(directory=str(config.EVIDENCE)), name="evidence")
 
+from fastapi.responses import RedirectResponse
 
-@app.get("/", response_class=HTMLResponse)
-def console():
+@app.get("/", include_in_schema=False)
+def root():
+    if config.FRONTEND_URL:
+        return RedirectResponse(config.FRONTEND_URL, status_code=302)
+    return RedirectResponse("/legacy/", status_code=302)
+
+
+@app.get("/legacy/", response_class=HTMLResponse, include_in_schema=False)
+def legacy_console():
     index = WEB_DIR / "index.html"
     if not index.exists():
         return HTMLResponse("<h1>NETRA</h1><p>Console not built.</p>")

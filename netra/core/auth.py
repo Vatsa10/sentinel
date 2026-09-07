@@ -53,6 +53,10 @@ class Principal:
 
 ANONYMOUS = Principal(name="anonymous", role="admin", fingerprint="open-mode")
 
+#: Enforced mode caller with no key. Read-only; the screening committee opens
+#: the console without a credential and signs in only to change things.
+ANONYMOUS_VIEWER = Principal(name="anonymous", role="viewer", fingerprint="anon")
+
 
 def _fingerprint(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:12]
@@ -83,12 +87,12 @@ def enabled() -> bool:
 
 
 def resolve(api_key: str | None) -> Principal | None:
-    """Identify the caller. None means the key was supplied but is not valid."""
+    """Identify the caller. None means a key was supplied but is not valid."""
     keys = load_keys()
     if not keys:
         return ANONYMOUS          # open mode
     if not api_key:
-        return None
+        return ANONYMOUS_VIEWER   # enforced mode, read-only without a key
     meta = keys.get(api_key)
     if not meta:
         return None
@@ -132,6 +136,20 @@ def _self_check() -> None:
 
     # An unknown role grants nothing at all, rather than defaulting upward.
     assert not Principal("x", "nonsense", "x").may("read")
+
+    # Enforced mode: no key is a viewer, wrong key is refused.
+    import tempfile, pathlib
+    tmp = pathlib.Path(tempfile.mkdtemp()) / "keys.json"
+    tmp.write_text(json.dumps({"k1": {"name": "op", "role": "operator"}}))
+    global KEYS_PATH
+    saved, KEYS_PATH = KEYS_PATH, tmp
+    try:
+        assert resolve(None).role == "viewer", "no key must be anonymous viewer"
+        assert resolve("bogus") is None, "unknown key must be refused"
+        assert resolve("k1").role == "operator"
+    finally:
+        KEYS_PATH = saved
+    print("auth self-check ok")
 
     print("auth self-check passed")
 

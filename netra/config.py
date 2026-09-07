@@ -30,6 +30,14 @@ MODELS = DATA / "models"
 for _d in (DATA, EVIDENCE, MODELS):
     _d.mkdir(parents=True, exist_ok=True)
 
+# --- Hosted console access ----------------------------------------------------
+# Browser origins allowed to call the API (the Vercel console). Comma list.
+CORS_ORIGINS = [o.strip() for o in
+                os.getenv("NETRA_CORS_ORIGINS", "http://localhost:3000").split(",")
+                if o.strip()]
+# Where the hosted console lives; root "/" redirects there when set.
+FRONTEND_URL = os.getenv("NETRA_FRONTEND_URL", "")
+
 # --- Sentinel grid -----------------------------------------------------------
 GRID_HOST = os.getenv("NETRA_GRID_HOST", "103.250.160.189")
 CDN_HOST = os.getenv("NETRA_CDN_HOST", "https://cctv.corp8.cloud")
