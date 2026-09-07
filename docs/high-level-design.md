@@ -635,6 +635,117 @@ orchestration probes. The platform runs on-premise by design: police video does
 not leave the State network, and the same image is what runs at a regional edge
 node.
 
+For the demonstrable configuration used for this submission — a hosted console
+reaching a GPU host over a tunnel — see `docs/deploy.md`, which covers
+prerequisites, environment variables and the exact commands. §16 describes
+that configuration's architecture and access control; §15 above states the
+production posture it is built to match.
+
+---
+
+## 16. Hosted console, tunnel and access control
+
+For the submission demo the two halves of the platform are hosted separately.
+The console is a static Next.js export served from Vercel's CDN; the backend
+(FastAPI, inference, and all camera state) stays on the GPU host, reached
+through a named Cloudflare tunnel that terminates TLS and forwards to the
+local FastAPI port. No video, detection or credential data is copied onto
+Vercel — the CDN only ever serves the compiled JavaScript, CSS and static
+assets of the console itself.
+
+```
+ Judge's browser
+      |
+      | HTTPS (console)          HTTPS (API, WS, MJPEG, HLS)
+      v                                 v
+ Vercel CDN                      cloudflared tunnel
+ (Next.js static export)               |
+                                        v
+                              FastAPI on GPU host
+                              (netra backend, port 8080)
+                                        |
+                          RTSP  --------+-------- data/ (keys, watchlist,
+                       (camera grid)                 evidence, sqlite)
+```
+
+**Why the split.** The GPU must stay where the video enters — RTSP decode,
+inference and evidence capture are tied to that one host, and moving them
+defeats the point of an on-premise design. The console has no such
+constraint: it is a rebuildable CDN artefact, and serving it from Vercel
+gives judges a fast, TLS-terminated URL without opening anything on the
+police network beyond one outbound tunnel. The same frontend code runs
+unchanged against `docs/deploy.md`'s on-premise reverse proxy, so none of
+this is demo-only glue.
+
+**Streaming modes.** Each camera tile picks a mode depending on what the
+viewer needs:
+
+| Mode | Endpoint | Frame rate | Bandwidth | Notes |
+|---|---|---|---|---|
+| MJPEG overlay | `/api/cameras/{id}/live.mjpg` | ≤ 6 fps | ~0.3 Mbit/s per tile | Boxes, ids and plates burned in; frames are encoded only while a subscriber is attached, so an idle tile costs nothing on the inference thread |
+| HLS relay | on-demand ffmpeg segment relay | 25 fps | 1–3 Mbit/s | Full-rate video without overlays, for the rare case a judge wants to inspect raw footage; capped at 4 concurrent relays, each reaped after 60 s of no viewer; a HEVC source is transcoded to H.264 for browser compatibility, which is the more expensive of the two paths |
+
+The MJPEG default keeps the grid view cheap enough to run many tiles at once
+without competing with detection for GPU or CPU time; HLS is reserved for
+focused, one-camera inspection.
+
+**RBAC UX.** A judge opening the console is an anonymous viewer — no sign-in
+prompt, no credential requirement, matching `auth.py`'s principle that a
+demonstration must never require setup. `GET /api/auth/whoami` tells the
+console which principal it is and what it may do. Signing in with an API key
+(stored only in `localStorage`, never in the bundle) elevates the session to
+one of three roles:
+
+| Role | Permissions |
+|---|---|
+| viewer | read cameras, detections, alerts, traces |
+| operator | viewer, plus acknowledge alerts and maintain the watchlist |
+| admin | operator, plus onboard cameras and control the pipeline |
+
+Every acknowledgement, watchlist change or pipeline action writes an audit
+row keyed by role and a short key fingerprint — never the key itself. The
+audit log is the record a screening committee can inspect after the fact to
+see who changed what.
+
+**CORS.** The backend allows only the origins listed in
+`NETRA_CORS_ORIGINS` (the deployed console's URL, plus `localhost:3000` for
+local development) to call it from a browser. Requests from any other origin
+are refused at the browser's own enforcement, before they reach application
+code.
+
+**What never reaches the browser.** RTSP credentials are redacted from every
+camera API response; API keys live only in `localStorage`, set by the
+sign-in form, and are never embedded in the static bundle; and there is no
+central video store to leak from — footage is decoded and re-encoded on the
+GPU host per request and never persisted beyond evidence snapshots and short
+HLS segments.
+
+**Sequence — a judge exercising the whole path:**
+
+```
+Judge          Console (Vercel)      Tunnel        Backend (GPU host)
+ |  open URL         |                  |                  |
+ |------------------>|  GET /whoami     |                  |
+ |                    |----------------------------------->|
+ |                    |<----------------------------------- anonymous/viewer
+ |  tiles render      |  subscribe MJPEG for each tile      |
+ |                    |----------------------------------->|
+ |                    |<----------------------------------- frames (≤6 fps)
+ |                    |  WebSocket: alert event              |
+ |                    |<----------------------------------- alert
+ |  clicks "sign in", |                                     |
+ |  enters key        |  X-API-Key on next request          |
+ |  acknowledges alert|----------------------------------->|
+ |                    |<----------------------------------- 200, audit row written
+```
+
+**Production path.** The named-tunnel arrangement above and the on-premise
+reverse-proxy arrangement in §15 run identical backend and frontend code —
+only the network path between them differs. A district or state rollout
+would use the on-premise proxy (or a district-issued domain terminating TLS
+at the edge node) and drop the tunnel entirely; nothing in the console or the
+API needs to change to make that switch.
+
 ---
 
 ## Appendices
