@@ -130,6 +130,11 @@ body { background: var(--color-bg); color: var(--color-text); font-family: var(-
 :focus-visible { outline: 3px solid color-mix(in srgb, var(--color-accent) 70%, transparent); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
 
+@keyframes fade-up { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.animate-fade-up { animation: fade-up 250ms ease-out both; }
+@keyframes dot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+.animate-dot-pulse { animation: dot-pulse 1.8s ease-in-out infinite; }
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
