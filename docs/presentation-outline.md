@@ -93,6 +93,8 @@ Every alert shows the operator which signals fired and at what confidence.
 
 ## Slide 6 — Architecture
 
+img: console-overview.png
+
 *(Insert the diagram from `docs/high-level-design.md` §3.1)*
 
 - **Registry (Model 1)** — identity, geography, and capability discovered by probing
@@ -143,7 +145,7 @@ Hardware: single RTX 5050 laptop GPU, 8 GB.
 |---|---|
 | Inference latency | **~6 ms** per 1080p frame |
 | Throughput | **~52 fps** |
-| Live run | 6/6 cameras, **5,846 vehicles** detected and embedded in 2 minutes |
+| Live run | 8/8 cameras, **4,893 vehicles** detected and embedded in ~2 minutes |
 | Frames dropped | **0** |
 | Registry onboarding | 30 cameras probed and profiled in ~35 s |
 
@@ -152,6 +154,8 @@ Tier-1 across all 30 cameras needs ~30 fps against ~52 fps measured.
 ---
 
 ## Slide 10 — Demonstration: Government feed
+
+img: vehicles-trace.png
 
 Live, on the Sentinel grid:
 
@@ -166,6 +170,8 @@ Live, on the Sentinel grid:
 
 ## Slide 11 — Demonstration: own feed
 
+img: alerts-critical.png
+
 Full plate recognition where plate geometry permits it:
 
 1. Video onboarded through the same adapter as a live camera
@@ -174,12 +180,14 @@ Full plate recognition where plate geometry permits it:
 4. **Real-time alert at 0.95 confidence** with full reasoning and evidence image
 5. Route reconstruction with timestamped movement history
 
-Measured on the validation run: 329 vehicles, 44 plates, 5 alerts, correct
-severity and case reference on every one.
+Measured on the own-feed validation run: 329 vehicles, 44 plates, 5 alerts,
+correct severity and case reference on every one.
 
 ---
 
 ## Slide 12 — Beyond the mandatory requirements
+
+img: wall.png
 
 | Capability | Why it matters |
 |---|---|
@@ -197,7 +205,7 @@ severity and case reference on every one.
 
 - **Edge inference** — regional nodes ship metadata, not video
 - **Sizing** — ~150–200 cameras per RTX 5050-class GPU at tier-1; ~400–550 nodes statewide, fewer with datacentre accelerators
-- **Storage** — detection rows and evidence crops, tens of kilobytes, against gigabytes per camera per day for continuous recording
+- **Storage** — detection rows and evidence crops, tens of kilobytes, vs. gigabytes/camera/day for continuous recording
 - **Central tier** — stateless APIs, PostgreSQL/PostGIS partitioned by time and district
 - **Onboarding** — adding a department is a catalogue import, not an integration project
 - **Failure domain** — a node outage affects one district
@@ -205,6 +213,8 @@ severity and case reference on every one.
 ---
 
 ## Slide 14 — Security, privacy and accountability
+
+img: admin-roles.png
 
 - No centralised video recording. Evidence crops only, tied to a detection.
 - Role-based access with department-scoped camera visibility
@@ -215,11 +225,25 @@ severity and case reference on every one.
 
 ---
 
-## Slide 15 — What we are not claiming
+## Slide 15 — Hosted demo & access
+
+img: landing-hero.png
+
+- Hosted console: **<<VERCEL_URL>>**
+- If the hosted link is unreachable, a quick-tunnel URL is provided at demo time as a fallback
+- Operator key is supplied in the submission form — do not commit credentials
+- Same build as the on-premise deployment; no functional difference for the demo
+
+*Speaker note: say the hosted link is a convenience for reviewers — the production
+deployment target for Gujarat Police remains on-premise, per the security slide.*
+
+---
+
+## Slide 16 — What we are not claiming
 
 *Speaker note: this slide wins trust. Deliver it confidently, not apologetically.*
 
-- Plate recognition is **not achievable** on the wide-area night cameras of this grid, by any system. We measured it and we say so.
+- Plate recognition is **not achievable** on the wide-area night cameras of this grid, by any system — we measured it.
 - Appearance matching produces **ranked candidates for operator confirmation**, not identification.
 - Camera coordinates are junction-level approximations; no geography was supplied.
 - Scaling figures are extrapolated from measured single-node throughput and would be confirmed by a district pilot.
@@ -229,12 +253,12 @@ investigating officer.
 
 ---
 
-## Slide 16 — Close
+## Slide 17 — Close
 
 **What NETRA delivers today, measured on your grid:**
 
-30 cameras onboarded and profiled · 5,846 vehicles detected in 2 minutes ·
-0 frames dropped · 7 faulty cameras identified automatically ·
+30 cameras onboarded and profiled · 4,893 vehicles detected in ~2 minutes ·
+0 frames dropped · 6 degraded cameras flagged automatically, 2 indoor-only ·
 end-to-end ANPR to alert verified · cross-camera tracing without plates
 
 **Built by a solo student researcher.**

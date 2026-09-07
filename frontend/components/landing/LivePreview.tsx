@@ -1,23 +1,28 @@
 "use client";
+import dynamic from "next/dynamic";
 import { useQuery } from "@tanstack/react-query";
-import { api } from "@/lib/api";
-import { CameraTile } from "@/components/CameraTile";
-import { MiniMap } from "@/components/MiniMap";
+import { api, apiUrl } from "@/lib/api";
+import { mergeHealth } from "@/lib/health";
+import type { Camera } from "@/lib/types";
 
-type CameraHealth = { id: string; state: "online" | "degraded" | "offline" | "not-started" };
+const MiniMap = dynamic(() => import("@/components/MiniMap"), {
+  ssr: false,
+  loading: () => <div className="h-64 w-full animate-pulse rounded-card border border-border bg-surface" />,
+});
 
-function usePreviewCamera() {
+function usePreviewCameras() {
   const { data } = useQuery({
-    queryKey: ["landing-camera-health"],
-    queryFn: () => api<CameraHealth[]>("/api/cameras/health"),
+    queryKey: ["landing-cameras"],
+    queryFn: () => api<Camera[]>("/api/cameras"),
     retry: 0,
   });
-  const online = data?.find((c) => c.state === "online");
-  return online?.id ?? "cam13";
+  return data ?? [];
 }
 
 export function LivePreview() {
-  const cameraId = usePreviewCamera();
+  const cameras = usePreviewCameras();
+  const rows = mergeHealth(cameras, null, null);
+  const online = rows.find((c) => c.state === "online") ?? rows[0];
 
   return (
     <section className="mx-auto max-w-6xl px-6 py-16">
@@ -25,8 +30,21 @@ export function LivePreview() {
         This is live, not a mockup.
       </h2>
       <div className="mt-8 grid gap-6 sm:grid-cols-2">
-        <CameraTile cameraId={cameraId} className="h-72 w-full rounded-card border border-border object-cover" />
-        <MiniMap className="h-72 w-full overflow-hidden rounded-card border border-border" />
+        <div className="h-72 w-full overflow-hidden rounded-card border border-border bg-black">
+          {online ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={apiUrl(`/api/cameras/${online.camera_id}/live.mjpg`)}
+              alt={`Live feed: ${online.name}`}
+              className="h-full w-full object-cover"
+            />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center text-sm text-muted">
+              Connecting…
+            </div>
+          )}
+        </div>
+        <MiniMap cameras={rows} />
       </div>
     </section>
   );

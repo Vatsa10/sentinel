@@ -24,6 +24,8 @@ from netra.api.hls import HLS, HLS_DIR
 from netra.analytics.loop_index import has_embedding
 from netra.analytics.route import build_route
 from netra.core import auth
+from netra.core import notify as notify_mod
+from netra.core.notify import NOTIFIER
 from netra.core.db import SessionLocal, init_db
 from netra.core.geo import TIME_GROUPS, time_group
 from netra.api.health import camera_health, redact_url
@@ -97,19 +99,13 @@ def require(permission: str):
 
 
 # ---------------------------------------------------------------- registry --
-@app.get("/api/cameras")
-def list_cameras(capability: str | None = None, city: str | None = None):
-    """Model 1 registry: every camera with its geography and capability profile."""
-    with SessionLocal() as db:
-        q = db.query(Camera)
-        if capability:
-            q = q.filter(Camera.capability == capability)
-        if city:
-            q = q.filter(Camera.city == city)
-        cams = q.order_by(Camera.id).all()
+def _camera_json(c: Camera, health: dict) -> dict:
+    """Serialise one Camera row the way the console/API expects it.
 
-    health = {h["camera_id"]: h for h in PIPELINE.supervisor.health()}
-    return [{
+    Shared by list_cameras and the manual/bulk registration routes so the
+    response shape (and credential redaction) never drifts between them.
+    """
+    return {
         "id": c.id, "name": c.name,
         "lat": c.lat, "lon": c.lon, "city": c.city, "district": c.district,
         "department": c.department,
@@ -122,7 +118,159 @@ def list_cameras(capability: str | None = None, city: str | None = None):
         "whep_url": c.whep_url, "hls_url": c.hls_url,
         "rtsp_url": redact_url(c.rtsp_url),
         "live": health.get(c.id, {}),
-    } for c in cams]
+    }
+
+
+@app.get("/api/cameras")
+def list_cameras(capability: str | None = None, city: str | None = None):
+    """Model 1 registry: every camera with its geography and capability profile."""
+    with SessionLocal() as db:
+        q = db.query(Camera)
+        if capability:
+            q = q.filter(Camera.capability == capability)
+        if city:
+            q = q.filter(Camera.city == city)
+        cams = q.order_by(Camera.id).all()
+
+    health = {h["camera_id"]: h for h in PIPELINE.supervisor.health()}
+    return [_camera_json(c, health) for c in cams]
+
+
+def _apply_camera_fields(cam: Camera, fields: dict, is_new: bool) -> None:
+    """Apply validated fields onto a Camera row.
+
+    `fields` holds only keys the caller actually supplied (see
+    `validate_camera_payload`), so an update never touches a field it did
+    not mention — a probe-detected value like `codec` or `health` survives
+    an update payload that doesn't repeat it. CREATE_DEFAULTS is applied
+    only for a brand-new row, and only for fields still missing.
+    """
+    from netra.core.registry_input import CREATE_DEFAULTS
+
+    for k, v in fields.items():
+        setattr(cam, k, v)
+    if is_new:
+        for k, v in CREATE_DEFAULTS.items():
+            if k not in fields:
+                setattr(cam, k, v)
+
+
+@app.post("/api/cameras")
+async def register_camera(request: Request, _p=Depends(require("onboard"))):
+    """Manually register (or update) one camera in the registry.
+
+    This only writes the `cameras` row; if PIPELINE is already running it is
+    NOT touched here — a manually added camera is picked up on the next
+    `POST /api/pipeline/start` (or process restart), same as any row added by
+    onboarding. This keeps a live pipeline from being disrupted by a
+    registration call made during a demo.
+
+    An update payload only ever changes the fields it supplies: omitting
+    `codec`, `health`, etc. leaves whatever onboarding/profiling already
+    detected untouched.
+    """
+    from netra.core.registry_input import validate_camera_payload
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON body")
+    try:
+        fields = validate_camera_payload(payload)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    with SessionLocal() as db:
+        cam = db.get(Camera, fields["id"])
+        is_new = cam is None
+        if is_new:
+            cam = Camera(id=fields["id"])
+            db.add(cam)
+        _apply_camera_fields(cam, fields, is_new)
+        db.commit()
+        db.refresh(cam)
+        result = _camera_json(cam, {})
+
+    _audit("registry.manual", target=fields["id"])
+    return result
+
+
+@app.post("/api/cameras/bulk")
+async def register_cameras_bulk(request: Request, _p=Depends(require("onboard"))):
+    """Bulk camera registration/import: up to 500 rows in one call.
+
+    Each row is validated and applied independently — one bad row (either a
+    validation failure or a DB-level failure on that row alone) is reported
+    in `errors` but does not abort the rest of the batch: every row is
+    applied inside its own SAVEPOINT, so a failure on one row rolls back
+    only that row.
+    """
+    from netra.core.registry_input import validate_camera_payload
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(400, "invalid JSON body")
+    rows = payload.get("cameras") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise HTTPException(400, "body must be {'cameras': [...]}")
+    if len(rows) > 500:
+        raise HTTPException(400, "at most 500 cameras per bulk call")
+
+    created, updated, errors = 0, 0, []
+    with SessionLocal() as db:
+        for i, row in enumerate(rows):
+            try:
+                fields = validate_camera_payload(row)
+            except ValueError as e:
+                errors.append({"row": i, "id": (row or {}).get("id") if isinstance(row, dict) else None,
+                               "detail": str(e)})
+                continue
+            try:
+                with db.begin_nested():
+                    cam = db.get(Camera, fields["id"])
+                    is_new = cam is None
+                    if is_new:
+                        cam = Camera(id=fields["id"])
+                        db.add(cam)
+                    _apply_camera_fields(cam, fields, is_new)
+                    db.flush()
+            except Exception as e:
+                errors.append({"row": i, "id": fields.get("id"),
+                               "detail": str(e)[:200]})
+                continue
+            if is_new:
+                created += 1
+            else:
+                updated += 1
+        db.commit()
+
+    _audit("registry.bulk", detail={"created": created, "updated": updated,
+                                     "errors": len(errors)})
+    return {"created": created, "updated": updated, "errors": errors}
+
+
+@app.delete("/api/cameras/{camera_id}")
+def delete_camera(camera_id: str, _p=Depends(require("onboard"))):
+    """Remove a camera from the registry (e.g. to clean up test cameras).
+
+    Refuses (409) if the camera has any detections on record, so demo/test
+    data cleanup can never silently discard real evidence.
+    """
+    with SessionLocal() as db:
+        cam = db.get(Camera, camera_id)
+        if cam is None:
+            raise HTTPException(404, "camera not found")
+        has_detections = db.query(Detection.id).filter(
+            Detection.camera_id == camera_id).first() is not None
+        if has_detections:
+            raise HTTPException(
+                409, "camera has detections on record; cannot delete")
+        db.delete(cam)
+        db.commit()
+
+    _audit("registry.delete", target=camera_id)
+    return {"deleted": camera_id}
 
 
 @app.get("/api/cameras/health")
@@ -347,6 +495,10 @@ async def camera_live_mjpeg(camera_id: str, request: Request,
                 await asyncio.sleep(interval)
         finally:
             LIVE_FRAMES.unsubscribe(camera_id)
+
+    return StreamingResponse(
+        gen(), media_type="multipart/x-mixed-replace; boundary=netraframe",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 # --------------------------------------------------------------- HLS relay --
@@ -646,6 +798,18 @@ def acknowledge(alert_id: int, _p=Depends(require("acknowledge"))):
         db.commit()
     _audit("alert.acknowledge", target=str(alert_id))
     return {"acknowledged": alert_id}
+
+
+@app.get("/api/notify/config")
+def notify_config(_p=Depends(require("read"))):
+    return notify_mod.masked(NOTIFIER.cfg)
+
+
+@app.post("/api/notify/test")
+def notify_test(_p=Depends(require("acknowledge"))):
+    result = notify_mod.send_test(NOTIFIER)
+    _audit("notify.test", target="-", detail=result)
+    return result
 
 
 @app.websocket("/ws/alerts")
@@ -1385,13 +1549,19 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
 
 
 @app.get("/api/report", response_class=HTMLResponse)
-def output_report(hours: int = Query(24, ge=1, le=720)):
+def output_report(hours: int = Query(24, ge=1, le=720),
+                  plate: str | None = Query(None),
+                  cameras: str | None = Query(None)):
     """Operational output report, printable to PDF from the browser.
 
     This is the output report the submission asks for: detected vehicles and
     plates with timestamps, watchlist matches with their reasoning, zone
     events, per-camera activity, and the cameras measured as unable to deliver.
+
+    `plate` filters plate reads by substring; `cameras` is a comma-separated
+    list of camera IDs to restrict the plate table to.
     """
     from netra.api.report import build_report
-    _audit("report.generate", detail={"hours": hours})
-    return HTMLResponse(build_report(hours=hours))
+    cam_list = [c.strip() for c in cameras.split(",") if c.strip()] if cameras else None
+    _audit("report.generate", detail={"hours": hours, "plate": plate, "cameras": cam_list})
+    return HTMLResponse(build_report(hours=hours, plate=plate, cameras=cam_list))

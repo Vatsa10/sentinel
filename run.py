@@ -61,6 +61,13 @@ def check() -> int:
         finally:
             s.close()
 
+    from netra.core import auth as _auth
+    from netra import config
+    print(f"  api keys   {'enforced' if _auth.enabled() else 'OPEN MODE (run tools/make_keys.py before hosting)'}")
+    print(f"  cors       {', '.join(config.CORS_ORIGINS)}")
+    print(f"  frontend   {config.FRONTEND_URL or '(unset: / serves /legacy/)'}")
+    print("  tunnel     cloudflared tunnel --url http://localhost:8080")
+
     print("-" * 52)
     print("READY" if ok else "PROBLEMS FOUND")
     return 0 if ok else 1

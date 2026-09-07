@@ -16,11 +16,16 @@ import { Label } from "@/components/ui/label";
 import { useAuth } from "@/lib/auth";
 import { ApiError } from "@/lib/api";
 
-export function SignInDialog({ children }: { children: React.ReactElement }) {
-  const { signIn } = useAuth();
+/**
+ * `children`, when given, is rendered as the Dialog's own trigger button.
+ * Open state always lives in AuthProvider (`authDialogOpen`) rather than
+ * local state, so a 401/403 from anywhere in the app can reopen this dialog
+ * even when no trigger for it happens to be on screen (spec §4.6).
+ */
+export function SignInDialog({ children }: { children?: React.ReactElement }) {
+  const { signIn, authDialogOpen: open, setAuthDialogOpen: setOpen } = useAuth();
   const [key, setKey] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const submit = async () => {
@@ -53,7 +58,7 @@ export function SignInDialog({ children }: { children: React.ReactElement }) {
         }
       }}
     >
-      <DialogTrigger render={children} />
+      {children && <DialogTrigger render={children} />}
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Sign in</DialogTitle>

@@ -312,6 +312,16 @@ export interface JourneysResponse {
   note: string;
 }
 
+/** GET /api/detections/stats (app.py:396). */
+export interface DetectionStats {
+  total_detections: number;
+  with_plate: number;
+  plate_rate_pct: number;
+  by_class: Record<string, number>;
+  top_cameras: Record<string, number>;
+  total_alerts: number;
+}
+
 /** GET /api/pipeline/status (app.py:560, netra/pipeline.py:587). */
 export interface PipelineStatus {
   running: boolean;

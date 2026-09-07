@@ -1,37 +1,50 @@
 "use client";
-import { MapContainer, TileLayer } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
+import { TileLayer } from "react-leaflet";
 
-/** Gujarat-centred dark OSM basemap, shared by MiniMap and the console map views. */
-const GUJARAT_CENTER: [number, number] = [22.6, 71.6];
+/**
+ * Shared Leaflet setup for MapView, MiniMap and RouteMap.
+ *
+ * ponytail: CartoDB's dark tiles now render an "API KEY REQUIRED" watermark,
+ * so every map uses plain OpenStreetMap tiles and gets its dark look from a
+ * CSS filter on the tile pane instead (scoped to `.netra-map` so it never
+ * touches anything else on the page).
+ */
+export const DARK_TILE_FILTER_CLASS = "netra-map";
 
-export function LeafletBase({
-  children,
-  center = GUJARAT_CENTER,
-  zoom = 6,
-  className,
-}: {
-  children?: React.ReactNode;
-  center?: [number, number];
-  zoom?: number;
-  className?: string;
-}) {
+export function DarkTiles() {
   return (
-    <MapContainer
-      center={center}
-      zoom={zoom}
-      scrollWheelZoom={false}
-      dragging={false}
-      zoomControl={false}
-      attributionControl={false}
-      className={className ?? "h-full w-full"}
-      style={{ background: "#0e1830" }}
-    >
-      <TileLayer
-        url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-        // ponytail: CARTO dark basemap tiles — no API key required, matches the ops-room theme.
-      />
-      {children}
-    </MapContainer>
+    <TileLayer
+      url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+      attribution="&copy; OpenStreetMap contributors"
+    />
+  );
+}
+
+/** Marker colour by health/capability state, shared across every map. */
+export const STATE_HEX: Record<string, string> = {
+  online: "#22c55e",
+  ok: "#22c55e",
+  degraded: "#f59e0b",
+  offline: "#ef4444",
+  bad: "#ef4444",
+  "not-started": "#22304f",
+  anpr: "#38bdf8",
+  vehicle: "#8fa1c2",
+};
+
+export function stateColour(state: string | null | undefined): string {
+  if (!state) return STATE_HEX["not-started"];
+  return STATE_HEX[state] ?? "#8fa1c2";
+}
+
+/** Inline style block: put once per map container. Scoped to `.netra-map`. */
+export function MapDarkStyle() {
+  return (
+    <style>{`
+      .${DARK_TILE_FILTER_CLASS} .leaflet-tile-pane {
+        filter: invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.6);
+      }
+    `}</style>
   );
 }
