@@ -136,6 +136,25 @@ def list_cameras(capability: str | None = None, city: str | None = None):
     return [_camera_json(c, health) for c in cams]
 
 
+def _apply_camera_fields(cam: Camera, fields: dict, is_new: bool) -> None:
+    """Apply validated fields onto a Camera row.
+
+    `fields` holds only keys the caller actually supplied (see
+    `validate_camera_payload`), so an update never touches a field it did
+    not mention — a probe-detected value like `codec` or `health` survives
+    an update payload that doesn't repeat it. CREATE_DEFAULTS is applied
+    only for a brand-new row, and only for fields still missing.
+    """
+    from netra.core.registry_input import CREATE_DEFAULTS
+
+    for k, v in fields.items():
+        setattr(cam, k, v)
+    if is_new:
+        for k, v in CREATE_DEFAULTS.items():
+            if k not in fields:
+                setattr(cam, k, v)
+
+
 @app.post("/api/cameras")
 async def register_camera(request: Request, _p=Depends(require("onboard"))):
     """Manually register (or update) one camera in the registry.
@@ -145,6 +164,10 @@ async def register_camera(request: Request, _p=Depends(require("onboard"))):
     `POST /api/pipeline/start` (or process restart), same as any row added by
     onboarding. This keeps a live pipeline from being disrupted by a
     registration call made during a demo.
+
+    An update payload only ever changes the fields it supplies: omitting
+    `codec`, `health`, etc. leaves whatever onboarding/profiling already
+    detected untouched.
     """
     from netra.core.registry_input import validate_camera_payload
 
@@ -159,11 +182,11 @@ async def register_camera(request: Request, _p=Depends(require("onboard"))):
 
     with SessionLocal() as db:
         cam = db.get(Camera, fields["id"])
-        if cam is None:
+        is_new = cam is None
+        if is_new:
             cam = Camera(id=fields["id"])
             db.add(cam)
-        for k, v in fields.items():
-            setattr(cam, k, v)
+        _apply_camera_fields(cam, fields, is_new)
         db.commit()
         db.refresh(cam)
         result = _camera_json(cam, {})
@@ -176,8 +199,11 @@ async def register_camera(request: Request, _p=Depends(require("onboard"))):
 async def register_cameras_bulk(request: Request, _p=Depends(require("onboard"))):
     """Bulk camera registration/import: up to 500 rows in one call.
 
-    Each row is validated and applied independently — one bad row is
-    reported in `errors` but does not abort the rest of the batch.
+    Each row is validated and applied independently — one bad row (either a
+    validation failure or a DB-level failure on that row alone) is reported
+    in `errors` but does not abort the rest of the batch: every row is
+    applied inside its own SAVEPOINT, so a failure on one row rolls back
+    only that row.
     """
     from netra.core.registry_input import validate_camera_payload
 
@@ -200,15 +226,23 @@ async def register_cameras_bulk(request: Request, _p=Depends(require("onboard"))
                 errors.append({"row": i, "id": (row or {}).get("id") if isinstance(row, dict) else None,
                                "detail": str(e)})
                 continue
-            cam = db.get(Camera, fields["id"])
-            if cam is None:
-                cam = Camera(id=fields["id"])
-                db.add(cam)
+            try:
+                with db.begin_nested():
+                    cam = db.get(Camera, fields["id"])
+                    is_new = cam is None
+                    if is_new:
+                        cam = Camera(id=fields["id"])
+                        db.add(cam)
+                    _apply_camera_fields(cam, fields, is_new)
+                    db.flush()
+            except Exception as e:
+                errors.append({"row": i, "id": fields.get("id"),
+                               "detail": str(e)[:200]})
+                continue
+            if is_new:
                 created += 1
             else:
                 updated += 1
-            for k, v in fields.items():
-                setattr(cam, k, v)
         db.commit()
 
     _audit("registry.bulk", detail={"created": created, "updated": updated,

@@ -38,6 +38,13 @@ CHECKS = [  # (method, path, role, expected)
                                      "rtsp_url": "rtsp://example.com/smoke"}, 403),
     ("POST", "/api/cameras", "admin", {"id": "smoke-cam", "name": "Smoke Cam",
                                         "rtsp_url": "rtsp://example.com/smoke"}, 200),
+    ("DELETE", "/api/cameras/smoke-cam", None, 403),
+    # In enforced mode the anon delete above is rejected and smoke-cam still
+    # exists; in open mode (anon == admin) it already deleted smoke-cam, so
+    # this re-creates it before the final admin-delete assertion below —
+    # keeping that check meaningful (200, not a stale 404) in both modes.
+    ("POST", "/api/cameras", "admin", {"id": "smoke-cam", "name": "Smoke Cam",
+                                        "rtsp_url": "rtsp://example.com/smoke"}, 200),
     ("DELETE", "/api/cameras/smoke-cam", "admin", None, 200),
 ]
 

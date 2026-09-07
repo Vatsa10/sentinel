@@ -13,15 +13,42 @@ URL_SCHEMES = ("rtsp://", "rtsps://", "http://", "https://")
 # capabilities produced by netra/core/registry.py's onboarding/profiling.
 VALID_CAPABILITIES = {"anpr", "vehicle", "person", "degraded", "unknown"}
 
+# Defaults applied only when the caller (netra/api/app.py) is creating a new
+# row and the field was not supplied. validate_camera_payload never applies
+# these itself, so an update payload that omits a field never resets it.
+CREATE_DEFAULTS = {
+    "capability": "vehicle",
+    "department": "Home Department",
+    "enabled": True,
+}
+
+_STRING_FIELDS = ("id", "name", "city", "district", "department",
+                   "rtsp_url", "hls_url")
+
 
 def validate_camera_payload(payload: dict) -> dict:
-    """Validate and normalise one camera row for manual/bulk registration.
+    """Validate one camera row for manual/bulk registration.
 
-    Returns a dict of column values ready to assign onto a `Camera` row.
+    Returns a dict containing ONLY the keys that were actually present (and
+    non-empty-string) in `payload`, normalised/validated. It never fills in
+    defaults for missing optional fields (capability/department/enabled
+    included) and never emits fields such as `codec` or `health` unless the
+    caller supplied them — an update payload that omits `codec` must leave
+    a camera's detected codec untouched, and the same goes for any other
+    field a probe/profile step (not a human) is the real source of truth
+    for. Callers decide field defaults for a brand-new row themselves (see
+    CREATE_DEFAULTS).
+
     Raises ValueError with a human-readable message on any invalid field.
     """
     if not isinstance(payload, dict):
         raise ValueError("camera payload must be an object")
+
+    payload = dict(payload)
+    for key in _STRING_FIELDS:
+        v = payload.get(key)
+        if isinstance(v, str):
+            payload[key] = v.strip()
 
     cam_id = payload.get("id")
     if not cam_id or not isinstance(cam_id, str) or not ID_RE.match(cam_id):
@@ -32,63 +59,57 @@ def validate_camera_payload(payload: dict) -> dict:
     if not name or not isinstance(name, str):
         raise ValueError("name is required")
 
+    out: dict = {"id": cam_id, "name": name}
+
     def _float_opt(key, lo, hi):
-        v = payload.get(key)
-        if v is None:
-            return None
+        if key not in payload or payload[key] is None:
+            return
+        v = payload[key]
         try:
             v = float(v)
         except (TypeError, ValueError):
             raise ValueError(f"{key} must be a number")
         if not (lo <= v <= hi):
             raise ValueError(f"{key} must be between {lo} and {hi}")
-        return v
+        out[key] = v
 
-    lat = _float_opt("lat", -90, 90)
-    lon = _float_opt("lon", -180, 180)
+    _float_opt("lat", -90, 90)
+    _float_opt("lon", -180, 180)
 
     rtsp_url = payload.get("rtsp_url") or None
     hls_url = payload.get("hls_url") or None
     if not rtsp_url and not hls_url:
         raise ValueError("at least one of rtsp_url/hls_url is required")
     for key, url in (("rtsp_url", rtsp_url), ("hls_url", hls_url)):
-        if url and not url.startswith(URL_SCHEMES):
+        if url:
+            if not url.startswith(URL_SCHEMES):
+                raise ValueError(
+                    f"{key} must start with one of {URL_SCHEMES}")
+            out[key] = url
+
+    if "capability" in payload and payload["capability"] is not None:
+        capability = payload["capability"]
+        if capability not in VALID_CAPABILITIES:
             raise ValueError(
-                f"{key} must start with one of {URL_SCHEMES}")
+                f"capability must be one of {sorted(VALID_CAPABILITIES)}")
+        out["capability"] = capability
 
-    capability = payload.get("capability") or "vehicle"
-    if capability not in VALID_CAPABILITIES:
-        raise ValueError(
-            f"capability must be one of {sorted(VALID_CAPABILITIES)}")
-
-    width = payload.get("width")
-    height = payload.get("height")
-    for key, v in (("width", width), ("height", height)):
-        if v is not None:
+    for key in ("width", "height"):
+        if key in payload and payload[key] is not None:
             try:
-                int(v)
+                out[key] = int(payload[key])
             except (TypeError, ValueError):
                 raise ValueError(f"{key} must be an integer")
 
-    return {
-        "id": cam_id,
-        "name": name,
-        "lat": lat,
-        "lon": lon,
-        "city": payload.get("city") or None,
-        "district": payload.get("district") or None,
-        "department": payload.get("department") or "Home Department",
-        "codec": payload.get("codec") or None,
-        "width": int(width) if width is not None else None,
-        "height": int(height) if height is not None else None,
-        "declared_fps": payload.get("declared_fps") or None,
-        "rtsp_url": rtsp_url,
-        "whep_url": payload.get("whep_url") or None,
-        "hls_url": hls_url,
-        "capability": capability,
-        "health": payload.get("health") or "unknown",
-        "enabled": bool(payload.get("enabled", True)),
-    }
+    for key in ("city", "district", "department", "codec", "declared_fps",
+                "whep_url", "health"):
+        if key in payload and payload[key] not in (None, ""):
+            out[key] = payload[key]
+
+    if "enabled" in payload and payload["enabled"] is not None:
+        out["enabled"] = bool(payload["enabled"])
+
+    return out
 
 
 def _self_check() -> None:
@@ -101,9 +122,26 @@ def _self_check() -> None:
     }
     out = validate_camera_payload(good)
     assert out["id"] == "cam-test1"
-    assert out["capability"] == "vehicle"
-    assert out["department"] == "Home Department"
-    assert out["enabled"] is True
+    assert "capability" not in out, "no default should be injected by validate"
+    assert "department" not in out
+    assert "enabled" not in out
+    assert "codec" not in out
+    assert "health" not in out
+
+    # An update payload that omits codec must not mention codec at all.
+    update = {"id": "cam-test1", "name": "Test Camera",
+              "rtsp_url": "rtsp://example.com/stream"}
+    out2 = validate_camera_payload(update)
+    assert "codec" not in out2, "update without codec must not clear it"
+
+    with_codec = dict(good, codec="h264")
+    out3 = validate_camera_payload(with_codec)
+    assert out3["codec"] == "h264"
+
+    # whitespace stripping
+    padded = dict(good, id=" cam-test1 ".strip(), name="  Test Camera  ")
+    out4 = validate_camera_payload(padded)
+    assert out4["name"] == "Test Camera"
 
     bad_id = dict(good, id="a")
     try:
