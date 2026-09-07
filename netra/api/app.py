@@ -74,18 +74,23 @@ def _shutdown() -> None:
 
 
 def _audit(action: str, target: str | None = None, detail: dict | None = None,
-           actor: str = "operator") -> None:
+           principal: "auth.Principal | None" = None) -> None:
+    actor = (f"{principal.name}/{principal.role}/{principal.fingerprint}"
+             if principal is not None else "unknown")
     with SessionLocal() as db:
         db.add(AuditLog(actor=actor, action=action, target=target, detail=detail))
         db.commit()
 
 
 def require(permission: str):
-    """Dependency enforcing one permission on an endpoint.
+    """Dependency enforcing one permission on every route it is attached to.
 
-    In open mode (no API keys configured) every caller is admin, so a
-    demonstration needs no credential setup. Configuring any key switches the
-    whole surface to enforced access.
+    Resolves the caller from the X-API-Key header and rejects (401) an
+    invalid key or (403) a caller whose role lacks the permission. In open
+    mode (no API keys configured) every caller resolves to admin, so a
+    demonstration needs no credential setup; in enforced mode a caller with
+    no key resolves to a read-only anonymous viewer rather than being
+    rejected outright, so the console still opens without a credential.
     """
     def _check(x_api_key: str | None = Header(default=None)) -> auth.Principal:
         principal = auth.resolve(x_api_key)
@@ -122,7 +127,8 @@ def _camera_json(c: Camera, health: dict) -> dict:
 
 
 @app.get("/api/cameras")
-def list_cameras(capability: str | None = None, city: str | None = None):
+def list_cameras(capability: str | None = None, city: str | None = None,
+                 _p=Depends(require("read"))):
     """Model 1 registry: every camera with its geography and capability profile."""
     with SessionLocal() as db:
         q = db.query(Camera)
@@ -191,7 +197,7 @@ async def register_camera(request: Request, _p=Depends(require("onboard"))):
         db.refresh(cam)
         result = _camera_json(cam, {})
 
-    _audit("registry.manual", target=fields["id"])
+    _audit("registry.manual", target=fields["id"], principal=_p)
     return result
 
 
@@ -246,7 +252,7 @@ async def register_cameras_bulk(request: Request, _p=Depends(require("onboard"))
         db.commit()
 
     _audit("registry.bulk", detail={"created": created, "updated": updated,
-                                     "errors": len(errors)})
+                                     "errors": len(errors)}, principal=_p)
     return {"created": created, "updated": updated, "errors": errors}
 
 
@@ -269,7 +275,7 @@ def delete_camera(camera_id: str, _p=Depends(require("onboard"))):
         db.delete(cam)
         db.commit()
 
-    _audit("registry.delete", target=camera_id)
+    _audit("registry.delete", target=camera_id, principal=_p)
     return {"deleted": camera_id}
 
 
@@ -288,12 +294,13 @@ def onboard(probe: bool = True, _p=Depends(require("onboard"))):
     """Re-run registry onboarding: fetch catalogue, probe, profile, persist."""
     from netra.core.registry import onboard_all
     cams = onboard_all(probe=probe)
-    _audit("registry.onboard", detail={"count": len(cams), "probe": probe})
+    _audit("registry.onboard", detail={"count": len(cams), "probe": probe},
+           principal=_p)
     return {"onboarded": len(cams)}
 
 
 @app.get("/api/cameras/gap-analysis")
-def gap_analysis():
+def gap_analysis(_p=Depends(require("read"))):
     """Coverage and infrastructure report derived from measured camera state.
 
     This is the Model 1 gap analysis. Every figure below is measured from the
@@ -539,17 +546,14 @@ def hls_status(camera_id: str, _p=Depends(require("read"))):
     HLS.touch(camera_id)          # the player polls this while it plays
     return HLS.status(camera_id)
 
-    return StreamingResponse(
-        gen(), media_type="multipart/x-mixed-replace; boundary=netraframe",
-        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
-
 
 # -------------------------------------------------------------- detections --
 @app.get("/api/detections")
 def list_detections(camera_id: str | None = None, plate: str | None = None,
                     vehicle_class: str | None = None, colour: str | None = None,
                     since_minutes: int | None = None,
-                    limit: int = Query(100, le=1000), offset: int = 0):
+                    limit: int = Query(100, le=1000), offset: int = 0,
+                    _p=Depends(require("read"))):
     with SessionLocal() as db:
         q = db.query(Detection).options(joinedload(Detection.camera))
         if camera_id:
@@ -627,7 +631,7 @@ def _attributes_for(detection_ids: list[int], db) -> dict:
 
 @app.post("/api/detections/{detection_id}/describe")
 def describe_detection(detection_id: int, refresh: bool = False,
-                       _p=Depends(require("read"))):
+                       _p=Depends(require("acknowledge"))):
     """Describe one vehicle in words, on request.
 
     The operator-request tier. Extraction is expensive enough that the pipeline
@@ -664,7 +668,7 @@ def describe_detection(detection_id: int, refresh: bool = False,
 
     store_attributes(detection_id, result, "operator")
     _audit("detection.describe", target=str(detection_id),
-           detail={"confidence": result.confidence})
+           detail={"confidence": result.confidence}, principal=_p)
     with SessionLocal() as db:
         row = db.query(VehicleAttributeRow).filter(
             VehicleAttributeRow.detection_id == detection_id).one()
@@ -673,7 +677,7 @@ def describe_detection(detection_id: int, refresh: bool = False,
 
 
 @app.get("/api/detections/stats")
-def detection_stats():
+def detection_stats(_p=Depends(require("read"))):
     with SessionLocal() as db:
         total = db.query(func.count(Detection.id)).scalar() or 0
         with_plate = db.query(func.count(Detection.id)).filter(
@@ -693,19 +697,38 @@ def detection_stats():
 
 # ------------------------------------------------------------------ route --
 @app.get("/api/route")
-def vehicle_route(plate: str = Query(..., min_length=3)):
-    """Trace one vehicle across the integrated network."""
+def vehicle_route(plate: str = Query(..., min_length=3),
+                  hours: int = Query(72, ge=1, le=24 * 30),
+                  limit: int = Query(20000, le=50000),
+                  _p=Depends(require("read"))):
+    """Trace one vehicle across the integrated network.
+
+    Bounded to the last `hours` (default 72) and at most `limit` rows, so a
+    common plate substring on a long-running deployment cannot force a full
+    table scan on every search. `truncated` is set when the cap was hit, so
+    the caller knows the trace may be incomplete rather than exhaustive.
+
+    Not audited: a search is a read, not a mutation, and every plate search
+    an operator runs is not the kind of action an audit trail is for.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     with SessionLocal() as db:
-        rows = (db.query(Detection).options(joinedload(Detection.camera))
-                .filter(Detection.plate_text.isnot(None)).all())
+        q = (db.query(Detection).options(joinedload(Detection.camera))
+             .filter(Detection.plate_text.isnot(None),
+                     Detection.wall_time >= cutoff)
+             .order_by(Detection.wall_time.desc()).limit(limit + 1))
+        rows = q.all()
+        truncated = len(rows) > limit
+        rows = rows[:limit]
         route = build_route(rows, plate)
-    _audit("route.query", target=plate, detail={"hops": len(route.hops)})
-    return route.to_dict()
+    result = route.to_dict()
+    result["truncated"] = truncated
+    return result
 
 
 # -------------------------------------------------------------- watchlist --
 @app.get("/api/watchlist")
-def list_watchlist():
+def list_watchlist(_p=Depends(require("read"))):
     with SessionLocal() as db:
         rows = db.query(WatchlistEntry).order_by(WatchlistEntry.id.desc()).all()
         return [{
@@ -737,7 +760,7 @@ async def add_watchlist(request: Request, _p=Depends(require("watchlist"))):
         db.add(entry)
         db.commit()
         db.refresh(entry)
-        _audit("watchlist.add", target=entry.plate)
+        _audit("watchlist.add", target=entry.plate, principal=_p)
         return {"id": entry.id, "plate": entry.plate}
 
 
@@ -749,13 +772,14 @@ def delete_watchlist(entry_id: int, _p=Depends(require("watchlist"))):
             raise HTTPException(404, "not found")
         db.delete(e)
         db.commit()
-    _audit("watchlist.delete", target=str(entry_id))
+    _audit("watchlist.delete", target=str(entry_id), principal=_p)
     return {"deleted": entry_id}
 
 
 # ----------------------------------------------------------------- alerts --
 @app.get("/api/alerts")
-def list_alerts(limit: int = Query(50, le=500), acknowledged: bool | None = None):
+def list_alerts(limit: int = Query(50, le=500), acknowledged: bool | None = None,
+                _p=Depends(require("read"))):
     with SessionLocal() as db:
         q = db.query(Alert)
         if acknowledged is not None:
@@ -796,7 +820,7 @@ def acknowledge(alert_id: int, _p=Depends(require("acknowledge"))):
             raise HTTPException(404, "not found")
         a.acknowledged = True
         db.commit()
-    _audit("alert.acknowledge", target=str(alert_id))
+    _audit("alert.acknowledge", target=str(alert_id), principal=_p)
     return {"acknowledged": alert_id}
 
 
@@ -808,7 +832,7 @@ def notify_config(_p=Depends(require("read"))):
 @app.post("/api/notify/test")
 def notify_test(_p=Depends(require("acknowledge"))):
     result = notify_mod.send_test(NOTIFIER)
-    _audit("notify.test", target="-", detail=result)
+    _audit("notify.test", target="-", detail=result, principal=_p)
     return result
 
 
@@ -837,31 +861,43 @@ async def alert_socket(ws: WebSocket):
 def pipeline_start(cameras: str | None = None, _p=Depends(require("pipeline"))):
     ids = cameras.split(",") if cameras else None
     PIPELINE.start(ids)
-    _audit("pipeline.start", detail={"cameras": ids})
+    _audit("pipeline.start", detail={"cameras": ids}, principal=_p)
     return PIPELINE.status()
 
 
 @app.post("/api/pipeline/stop")
 def pipeline_stop(_p=Depends(require("pipeline"))):
     PIPELINE.stop()
-    _audit("pipeline.stop")
+    _audit("pipeline.stop", principal=_p)
     return {"running": False}
 
 
 @app.get("/api/pipeline/status")
-def pipeline_status():
+def pipeline_status(_p=Depends(require("read"))):
     return PIPELINE.status()
 
 
 # ----------------------------------------------------------------- export --
 @app.get("/api/export/detections.csv")
-def export_detections(plate: str | None = None):
-    """Output report: detections with timestamps, as the brief requires."""
+def export_detections(plate: str | None = None,
+                      hours: int = Query(72, ge=1, le=24 * 30),
+                      limit: int = Query(20000, le=50000),
+                      _p=Depends(require("read"))):
+    """Output report: detections with timestamps, as the brief requires.
+
+    Bounded to the last `hours` (default 72) and at most `limit` rows; when
+    the cap is hit a trailing comment row notes the truncation so the export
+    is never mistaken for exhaustive.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     with SessionLocal() as db:
-        q = db.query(Detection).options(joinedload(Detection.camera))
+        q = (db.query(Detection).options(joinedload(Detection.camera))
+             .filter(Detection.wall_time >= cutoff))
         if plate:
             q = q.filter(Detection.plate_text.ilike(f"%{plate}%"))
-        rows = q.order_by(Detection.wall_time).all()
+        rows = q.order_by(Detection.wall_time).limit(limit + 1).all()
+        truncated = len(rows) > limit
+        rows = rows[:limit]
 
         buf = io.StringIO()
         w = csv.writer(buf)
@@ -877,6 +913,9 @@ def export_detections(plate: str | None = None):
                         d.vehicle_class, d.colour or "", d.plate_text or "",
                         round(d.plate_conf, 3) if d.plate_conf else "",
                         round(d.confidence, 3), d.evidence_path or ""])
+        if truncated:
+            w.writerow([f"# truncated at {limit} rows within the last "
+                        f"{hours}h; narrow the query for a complete export"])
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]), media_type="text/csv",
@@ -884,7 +923,7 @@ def export_detections(plate: str | None = None):
 
 
 @app.get("/api/audit")
-def audit_log(limit: int = Query(100, le=500)):
+def audit_log(limit: int = Query(100, le=500), _p=Depends(require("manage"))):
     with SessionLocal() as db:
         rows = db.query(AuditLog).order_by(AuditLog.at.desc()).limit(limit).all()
         return [{"at": r.at.isoformat(), "actor": r.actor, "action": r.action,
@@ -957,14 +996,15 @@ def seed_watchlist(_p=Depends(require("watchlist"))):
                 case_ref=case, source_db=src))
             added += 1
         db.commit()
-    _audit("watchlist.seed", detail={"added": added})
+    _audit("watchlist.seed", detail={"added": added}, principal=_p)
     return {"added": added}
 
 
 # ------------------------------------------------- cross-camera appearance --
 @app.get("/api/vehicles/{detection_id}/similar")
 def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
-                     min_similarity: float = 0.80):
+                     min_similarity: float = 0.80,
+                     _p=Depends(require("read"))):
     """Find the same vehicle on other cameras by appearance.
 
     This is the answer to "trace this vehicle" when no plate is readable, which
@@ -1070,7 +1110,7 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
         }
 
     _audit("vehicle.similar", target=str(detection_id),
-           detail={"matches": len(matches)})
+           detail={"matches": len(matches)}, principal=_p)
     return {
         "query": origin,
         "matches": matches,
@@ -1086,13 +1126,15 @@ def similar_vehicles(detection_id: int, limit: int = Query(25, le=100),
 
 
 @app.get("/api/vehicles/{detection_id}/track")
-def appearance_track(detection_id: int, min_similarity: float = 0.82):
+def appearance_track(detection_id: int, min_similarity: float = 0.82,
+                     _p=Depends(require("read"))):
     """Build a movement path for a vehicle using appearance alone.
 
     Same output shape as /api/route so the console renders either identically,
     whether the vehicle was followed by plate or by appearance.
     """
-    data = similar_vehicles(detection_id, limit=100, min_similarity=min_similarity)
+    data = similar_vehicles(detection_id, limit=100, min_similarity=min_similarity,
+                            _p=_p)
     hops = [data["query"]] + [m for m in data["matches"]
                               if m["plausible"] and m["same_time_group"]]
     hops.sort(key=lambda h: h["at"])
@@ -1148,7 +1190,7 @@ async def register_own_feed(request: Request, _p=Depends(require("onboard"))):
         db.merge(cam)
         db.commit()
 
-    _audit("camera.own_feed", target=cam_id, detail={"path": path})
+    _audit("camera.own_feed", target=cam_id, detail={"path": path}, principal=_p)
     return {"camera_id": cam_id, "name": cam.name, "path": path,
             "capability": cam.capability}
 
@@ -1166,13 +1208,13 @@ def start_own_feed(camera_id: str, loop: bool = True, _p=Depends(require("pipeli
 
     spec = SourceSpec(camera_id=camera_id, kind="file", uri=path, loop=loop)
     PIPELINE.start([camera_id], {camera_id: spec})
-    _audit("pipeline.start_own_feed", target=camera_id)
+    _audit("pipeline.start_own_feed", target=camera_id, principal=_p)
     return PIPELINE.status()
 
 
 # ------------------------------------------------------------- assistant --
 @app.post("/api/assistant")
-async def assistant(request: Request):
+async def assistant(request: Request, _p=Depends(require("read"))):
     """Answer an operational question from live platform state."""
     from netra.api.assistant import ask
     try:
@@ -1183,13 +1225,13 @@ async def assistant(request: Request):
         raise HTTPException(400, "request body must be a JSON object")
     question = (body.get("question") or "").strip()
     result = ask(question)
-    _audit("assistant.ask", target=question[:120])
+    _audit("assistant.ask", target=question[:120], principal=_p)
     return result
 
 
 # ------------------------------------------------------------------ zones --
 @app.get("/api/zones")
-def list_zones(camera_id: str | None = None):
+def list_zones(camera_id: str | None = None, _p=Depends(require("read"))):
     """Spatial rules configured on cameras."""
     from netra.core.models import ZoneRule
     with SessionLocal() as db:
@@ -1238,7 +1280,7 @@ async def create_zone(request: Request, _p=Depends(require("onboard"))):
         zone_id = z.id
 
     PIPELINE.reload_zone_rules()
-    _audit("zone.create", target=f"{body['camera_id']}:{zone_id}")
+    _audit("zone.create", target=f"{body['camera_id']}:{zone_id}", principal=_p)
     return {"id": zone_id, "camera_id": body["camera_id"], "rule": rule}
 
 
@@ -1252,12 +1294,13 @@ def delete_zone(zone_id: int, _p=Depends(require("onboard"))):
         db.delete(z)
         db.commit()
     PIPELINE.reload_zone_rules()
-    _audit("zone.delete", target=str(zone_id))
+    _audit("zone.delete", target=str(zone_id), principal=_p)
     return {"deleted": zone_id}
 
 
 @app.get("/api/zones/events")
-def zone_events(limit: int = Query(100, le=500), camera_id: str | None = None):
+def zone_events(limit: int = Query(100, le=500), camera_id: str | None = None,
+                _p=Depends(require("read"))):
     from netra.core.models import ZoneEventRow, ZoneRule
     with SessionLocal() as db:
         q = db.query(ZoneEventRow)
@@ -1282,7 +1325,7 @@ def zone_events(limit: int = Query(100, le=500), camera_id: str | None = None):
 
 # -------------------------------------------------------- traffic analytics --
 @app.get("/api/traffic/live")
-def traffic_live():
+def traffic_live(_p=Depends(require("read"))):
     """Current per-camera counts, class mix, direction split and dwell."""
     return {"cameras": PIPELINE.engine.trackers.stats(),
             "zone_events": PIPELINE.stats.get("zone_events", 0)}
@@ -1292,12 +1335,13 @@ def traffic_live():
 def traffic_snapshot(_p=Depends(require("pipeline"))):
     """Write the current counters into a time bucket for trend reporting."""
     written = PIPELINE.flush_traffic_stats()
-    _audit("traffic.snapshot", detail={"cameras": written})
+    _audit("traffic.snapshot", detail={"cameras": written}, principal=_p)
     return {"buckets_written": written}
 
 
 @app.get("/api/traffic/history")
-def traffic_history(camera_id: str | None = None, limit: int = Query(200, le=1000)):
+def traffic_history(camera_id: str | None = None, limit: int = Query(200, le=1000),
+                    _p=Depends(require("read"))):
     from netra.core.models import TrafficStat
     with SessionLocal() as db:
         q = db.query(TrafficStat)
@@ -1418,14 +1462,18 @@ def storage_prune(dry_run: bool = False, _p=Depends(require("manage"))):
                                     "bytes_freed": evidence["bytes_freed"],
                                     "rows_deleted": detections["deleted"],
                                     "retained_protected":
-                                        evidence["retained_protected"]})
+                                        evidence["retained_protected"]},
+           principal=_p)
     return {"evidence": evidence, "detections": detections,
             "storage": retention.storage_report()}
 
 
 @app.get("/api/analytics/cloned-plates")
 def cloned_plates(min_confidence: float = Query(0.6, ge=0.0, le=0.99),
-                  limit: int = Query(50, ge=1, le=500)):
+                  limit: int = Query(50, ge=1, le=500),
+                  hours: int = Query(72, ge=1, le=24 * 30),
+                  scan_limit: int = Query(20000, le=50000),
+                  _p=Depends(require("read"))):
     """Registration numbers seen in two places one vehicle could not have reached.
 
     Read-only analysis over stored detections; every finding carries the
@@ -1433,15 +1481,23 @@ def cloned_plates(min_confidence: float = Query(0.6, ge=0.0, le=0.99),
     the claim rather than take it on trust.
     """
     from netra.analytics.cloned_plate import find_clones
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     with SessionLocal() as db:
-        rows = (db.query(Detection).options(joinedload(Detection.camera))
-                .filter(Detection.plate_text.isnot(None)).all())
+        q = (db.query(Detection).options(joinedload(Detection.camera))
+             .filter(Detection.plate_text.isnot(None),
+                     Detection.wall_time >= cutoff)
+             .order_by(Detection.wall_time.desc()).limit(scan_limit + 1))
+        rows = q.all()
+        truncated = len(rows) > scan_limit
+        rows = rows[:scan_limit]
         findings = find_clones(rows, min_confidence=min_confidence)
-    _audit("analytics.cloned_plates", detail={"findings": len(findings)})
+    _audit("analytics.cloned_plates", detail={"findings": len(findings)},
+           principal=_p)
     return {
         "findings": [f.to_dict() for f in findings[:limit]],
         "count": len(findings),
         "min_confidence": min_confidence,
+        "truncated": truncated,
         "note": ("Findings are inferred from OCR reads on wide-area cameras and "
                  "are never certain. Only sightings sharing a recording session "
                  "are compared."),
@@ -1513,7 +1569,7 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
     last_mined = _journeys_mined_at.get(group)
 
     _audit("analytics.journeys", target=group,
-           detail={"journeys": len(rows), "mined": mined})
+           detail={"journeys": len(rows), "mined": mined}, principal=_p)
     return {
         "group": group,
         "cameras": TIME_GROUPS[group],
@@ -1551,7 +1607,8 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
 @app.get("/api/report", response_class=HTMLResponse)
 def output_report(hours: int = Query(24, ge=1, le=720),
                   plate: str | None = Query(None),
-                  cameras: str | None = Query(None)):
+                  cameras: str | None = Query(None),
+                  _p=Depends(require("read"))):
     """Operational output report, printable to PDF from the browser.
 
     This is the output report the submission asks for: detected vehicles and
@@ -1563,5 +1620,6 @@ def output_report(hours: int = Query(24, ge=1, le=720),
     """
     from netra.api.report import build_report
     cam_list = [c.strip() for c in cameras.split(",") if c.strip()] if cameras else None
-    _audit("report.generate", detail={"hours": hours, "plate": plate, "cameras": cam_list})
+    _audit("report.generate", detail={"hours": hours, "plate": plate, "cameras": cam_list},
+           principal=_p)
     return HTMLResponse(build_report(hours=hours, plate=plate, cameras=cam_list))

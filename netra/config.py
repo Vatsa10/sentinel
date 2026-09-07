@@ -38,6 +38,11 @@ CORS_ORIGINS = [o.strip() for o in
 # Where the hosted console lives; root "/" redirects there when set.
 FRONTEND_URL = os.getenv("NETRA_FRONTEND_URL", "")
 
+# Set truthy when the backend is being exposed to the internet (e.g. through
+# a tunnel). run.py refuses to start under this flag unless API keys are
+# already configured - a public deployment must never be able to boot open.
+PUBLIC = os.getenv("NETRA_PUBLIC", "").strip().lower() not in ("", "0", "false", "no")
+
 # --- Sentinel grid -----------------------------------------------------------
 GRID_HOST = os.getenv("NETRA_GRID_HOST", "103.250.160.189")
 CDN_HOST = os.getenv("NETRA_CDN_HOST", "https://cctv.corp8.cloud")

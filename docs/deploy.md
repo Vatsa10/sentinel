@@ -40,6 +40,7 @@ a `.env` file (not committed) if your process manager loads one.
 | `NETRA_EMAIL_TO` | Comma-separated recipient list for alert emails. | unset |
 | `NETRA_WEBHOOK_URL` | Optional webhook (e.g. a Slack incoming webhook) that receives a POST for each qualifying alert. | unset |
 | `NETRA_HLS_MAX_CONCURRENT` | Ceiling on concurrent ffmpeg HLS transcodes, to protect the inference GPU/CPU budget. | `4` |
+| `NETRA_PUBLIC` | Set to `1` whenever the backend is reachable from the internet (a tunnel is running). `run.py` refuses to start under this flag unless `data/api_keys.json` already exists, so a public deployment can never boot open. | unset |
 
 ### Gmail app passwords
 
@@ -73,11 +74,16 @@ virtual environment activated:
    `data/submission-credentials.md` (the hand-out for judges/operators).
    Both are gitignored — never commit them.
 
-2. **Start the backend** on the port the frontend expects:
+2. **Start the backend** on the port the frontend expects, with `NETRA_PUBLIC`
+   set since the tunnel in the next step makes it internet-reachable:
 
    ```
-   python run.py --port 8080
+   NETRA_PUBLIC=1 python run.py --port 8080
    ```
+
+   With `NETRA_PUBLIC=1` and no `data/api_keys.json`, `run.py` prints an
+   error and exits rather than starting open to the internet — generate keys
+   with `tools/make_keys.py` (step 1) first.
 
 3. **Open a tunnel** to that port in a second terminal:
 
@@ -147,7 +153,8 @@ Run through this in order, ideally 15–20 minutes before the demo starts:
 3. `GET /api/pipeline/status` shows all expected cameras active, no
    unexpected `stopped`/`error` states.
 4. `data/api_keys.json` exists and `python run.py --check` reports
-   `api keys enforced`.
+   `api keys enforced`, and (with `NETRA_PUBLIC=1` set) `public   yes` rather
+   than the check reporting the public/no-keys error.
 5. `data/submission-credentials.md` is present and matches the keys just
    generated — this is the hand-out for judges.
 6. `cloudflared tunnel --url http://localhost:8080` is running and its URL

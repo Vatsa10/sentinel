@@ -67,6 +67,12 @@ def check() -> int:
     print(f"  cors       {', '.join(config.CORS_ORIGINS)}")
     print(f"  frontend   {config.FRONTEND_URL or '(unset: / serves /legacy/)'}")
     print("  tunnel     cloudflared tunnel --url http://localhost:8080")
+    if config.PUBLIC and not _auth.enabled():
+        print("  public     NETRA_PUBLIC=1 but no API keys configured - "
+              "run.py would refuse to start")
+        ok = False
+    else:
+        print(f"  public     {'yes' if config.PUBLIC else 'no'}")
 
     print("-" * 52)
     print("READY" if ok else "PROBLEMS FOUND")
@@ -99,6 +105,13 @@ def main() -> int:
         print("Send as an X-API-Key header. "
               "Keep this file out of version control.")
         return 0
+
+    from netra import config
+    from netra.core import auth
+    if config.PUBLIC and not auth.enabled():
+        print("\033[91mERROR: NETRA_PUBLIC requires data/api_keys.json; "
+              "run python tools/make_keys.py\033[0m", file=sys.stderr)
+        return 2
 
     from netra.core.db import init_db
     init_db()
