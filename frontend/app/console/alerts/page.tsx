@@ -13,11 +13,25 @@ import { useLive } from "@/lib/live";
 import type { Alert, Camera } from "@/lib/types";
 import { Gate } from "@/components/Gate";
 import { EmptyState } from "@/components/EmptyState";
-import { TimeBadge } from "@/components/TimeBadge";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { ago } from "@/lib/time";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+
+/** Alerts and zone events carry a wall-clock ingest time, not scene/stream time —
+ * render it plainly rather than borrowing TimeBadge's scene-time semantics. */
+function RecordedAt({ at }: { at: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger render={<span tabIndex={0} className="mono text-xs text-muted" />}>
+        {ago(at)}
+      </TooltipTrigger>
+      <TooltipContent>Recorded {new Date(at).toLocaleString("en-IN", { hour12: false })}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 const SEVERITY: Record<string, { icon: typeof AlertOctagon; cls: string }> = {
   critical: { icon: AlertOctagon, cls: "text-bad bg-bad/10 border-bad/40" },
@@ -84,9 +98,44 @@ export default function AlertsPage() {
     refetchInterval: 10000,
   });
 
+  type Row = Alert & { isNew?: boolean };
+
+  const merged = useMemo(() => {
+    const byId = new Map<string, Row>();
+    (data ?? []).forEach((a) => byId.set(String(a.id), a));
+    // Live prepend: socket alerts (kind !== "attributes"/"zone") arrive ahead of the
+    // next 10s poll. Dedupe by alert id; skip anything the poll already has.
+    liveAlerts.forEach((m) => {
+      if (m.kind === "attributes" || m.kind === "zone") return;
+      if (m.alert_id == null) return;
+      const id = String(m.alert_id);
+      if (byId.has(id)) return;
+      byId.set(id, {
+        id: Number(id),
+        at: (m.at as string) ?? new Date().toISOString(),
+        camera_id: (m.camera_id as string) ?? "?",
+        camera_name: null, lat: null, lon: null,
+        score: (m.score as number) ?? 0,
+        match_type: (m.match_type as string) ?? "?",
+        reasons: (m.reasons as Alert["reasons"]) ?? {},
+        severity: (m.severity as string) ?? "medium",
+        acknowledged: false,
+        plate_observed: (m.plate_observed as string) ?? (m.plate as string) ?? null,
+        plate_watchlist: (m.plate_watchlist as string) ?? null,
+        category: null, case_ref: null,
+        evidence: (m.evidence as string) ?? null,
+        detection_id: null, attributes: null,
+        isNew: true,
+      });
+    });
+    // Newest first, bounded to 200 so a burst of live events can't grow this unbounded.
+    return Array.from(byId.values())
+      .sort((a, b) => (a.at < b.at ? 1 : -1))
+      .slice(0, 200);
+  }, [data, liveAlerts]);
+
   const rows = useMemo(() => {
-    const list = (data ?? []).slice();
-    return list.filter((a) => {
+    return merged.filter((a) => {
       if (severity !== "all" && a.severity !== severity) return false;
       if (cameraId !== "all" && a.camera_id !== cameraId) return false;
       if (plate) {
@@ -95,7 +144,7 @@ export default function AlertsPage() {
       }
       return true;
     });
-  }, [data, severity, cameraId, plate]);
+  }, [merged, severity, cameraId, plate]);
 
   const ack = useMutation({
     mutationFn: (id: number) => api(`/api/alerts/${id}/acknowledge`, { method: "POST" }),
@@ -167,7 +216,7 @@ export default function AlertsPage() {
                 return (
                   <Fragment key={a.id}>
                     <TableRow
-                      className="cursor-pointer hover:bg-surface-2"
+                      className={cn("cursor-pointer hover:bg-surface-2", a.isNew && "animate-in fade-in slide-in-from-top-2 duration-200")}
                       onClick={() => setExpanded(isOpen ? null : String(a.id))}
                     >
                       <TableCell>{isOpen ? <ChevronUp className="size-4" /> : <ChevronDown className="size-4" />}</TableCell>
@@ -178,7 +227,7 @@ export default function AlertsPage() {
                       </TableCell>
                       <TableCell className="mono">{a.plate_observed ?? a.plate_watchlist ?? "—"}</TableCell>
                       <TableCell className="mono">{a.camera_name ?? a.camera_id}</TableCell>
-                      <TableCell><TimeBadge det={{ pts_ms: 0, scene_time: a.at, scene_time_corroborated: true }} /></TableCell>
+                      <TableCell><RecordedAt at={a.at} /></TableCell>
                       <TableCell className="mono">{(a.score * 100).toFixed(0)}%</TableCell>
                       <TableCell>{a.acknowledged ? "Acknowledged" : "Open"}</TableCell>
                       <TableCell onClick={(e) => e.stopPropagation()}>

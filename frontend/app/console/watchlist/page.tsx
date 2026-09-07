@@ -62,8 +62,20 @@ export default function WatchlistPage() {
         action: {
           label: "Undo",
           onClick: async () => {
+            // Guard against a double-click firing this twice before the button
+            // disables (sonner doesn't remove the action on click): check-and-set
+            // synchronously before the first await.
+            if (undone) return;
             undone = true;
             try {
+              // Also guard against a duplicate that might already exist server-side
+              // (e.g. another tab restored it, or a prior click of this same
+              // handler landed) by checking the current cached list first.
+              const current = qc.getQueryData<WatchlistEntry[]>(["watchlist"]) ?? [];
+              if (current.some((e) => e.plate === entry.plate && e.active)) {
+                toast.info(`${entry.plate} is already on the watchlist`);
+                return;
+              }
               await api("/api/watchlist", {
                 method: "POST",
                 json: {
@@ -80,7 +92,7 @@ export default function WatchlistPage() {
         },
         duration: 5000,
       });
-      void id; void undone;
+      void id;
     },
     onError: (e: unknown) => { if (e instanceof ApiError) toast.error(e.message); },
   });

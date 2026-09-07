@@ -3,20 +3,25 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { RotateCcw, Trash2 } from "lucide-react";
+import { cn } from "cn";
 import { api, apiUrl, ApiError } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import type { Camera, Zone } from "@/lib/types";
 import { Gate } from "@/components/Gate";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-/** Backend rule values (netra/analytics/zones.py RULE_TYPES). */
+/** The three real backend rule values (netra/analytics/zones.py RULE_TYPES = intrusion,
+ * crossing, loitering). There is no separate direction-aware "wrong-way" rule — a
+ * crossing line counts traffic in both directions, so it's labelled honestly here
+ * rather than implying a distinction the backend doesn't make. */
 const KIND_OPTIONS: { value: string; label: string; needsLine?: boolean; params?: "dwell" | "none" }[] = [
   { value: "intrusion", label: "Intrusion (restricted area)", params: "none" },
-  { value: "loitering", label: "Loitering", params: "dwell" },
-  { value: "crossing", label: "Wrong-way line", needsLine: true, params: "none" },
-  { value: "crossing-count", label: "Count line", needsLine: true, params: "none" },
+  { value: "loitering", label: "Loitering (dwell)", params: "dwell" },
+  { value: "crossing", label: "Line crossing (count)", needsLine: true, params: "none" },
 ];
 
 type Point = [number, number];
@@ -33,9 +38,12 @@ export function ZoneEditor({ cameras }: { cameras: Camera[] }) {
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
 
+  const { can } = useAuth();
+  const isAdmin = can("admin");
   const opt = KIND_OPTIONS.find((k) => k.value === kindOpt) ?? KIND_OPTIONS[0];
-  const backendRule = kindOpt === "crossing-count" ? "crossing" : kindOpt;
+  const backendRule = opt.value;
   const needed = opt.needsLine ? 2 : 3;
+  const [closed, setClosed] = useState(false);
 
   const { data: zones } = useQuery({
     queryKey: ["zones", cameraId],
@@ -118,11 +126,13 @@ export function ZoneEditor({ cameras }: { cameras: Camera[] }) {
   useEffect(() => {
     setPoints([]);
     setSelectedZone(null);
+    setClosed(false);
   }, [cameraId]);
 
   const handleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!isAdmin) return; // drawing is an admin-only affordance; see the Gate below
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    if (!canvas || closed) return;
     if (opt.needsLine && points.length >= 2) return;
     const rect = canvas.getBoundingClientRect();
     const x = (e.clientX - rect.left) / rect.width;
@@ -130,17 +140,23 @@ export function ZoneEditor({ cameras }: { cameras: Camera[] }) {
     setPoints((p) => [...p, [x, y]]);
   };
 
+  /** Double-click / Enter only marks the polygon complete — it never saves.
+   * Saving is exclusively the gated Save button below, per the admin-only write path. */
+  const closePolygon = () => {
+    if (!isAdmin || points.length < needed) return;
+    setClosed(true);
+  };
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setPoints([]);
-      if (e.key === "Backspace") setPoints((p) => p.slice(0, -1));
-      if (e.key === "Enter" && points.length >= needed) {
-        // no-op: Save button commits
-      }
+      if (e.key === "Escape") { setPoints([]); setClosed(false); }
+      if (e.key === "Backspace") { setClosed(false); setPoints((p) => p.slice(0, -1)); }
+      if (e.key === "Enter") closePolygon();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [points.length, needed]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [points.length, needed, isAdmin, closed]);
 
   const save = useMutation({
     mutationFn: () =>
@@ -159,6 +175,7 @@ export function ZoneEditor({ cameras }: { cameras: Camera[] }) {
     onSuccess: () => {
       toast.success("Zone saved");
       setPoints([]);
+      setClosed(false);
       qc.invalidateQueries({ queryKey: ["zones", cameraId] });
     },
     onError: (e: unknown) => { if (e instanceof ApiError) toast.error(e.message); },
@@ -192,18 +209,27 @@ export function ZoneEditor({ cameras }: { cameras: Camera[] }) {
             className="hidden"
             onLoad={() => setSnapVersion((v) => v)}
           />
-          <canvas
-            ref={canvasRef}
-            width={960}
-            height={540}
-            className="h-full w-full cursor-crosshair"
-            onClick={(e) => { handleClick(e); pickZone(e); }}
-            onDoubleClick={() => { if (points.length >= needed) save.mutate(); }}
-          />
+          <Tooltip>
+            <TooltipTrigger
+              render={
+                <canvas
+                  ref={canvasRef}
+                  width={960}
+                  height={540}
+                  className={cn("h-full w-full", isAdmin ? "cursor-crosshair" : "cursor-not-allowed")}
+                  onClick={(e) => { handleClick(e); pickZone(e); }}
+                  onDoubleClick={closePolygon}
+                  tabIndex={0}
+                />
+              }
+            />
+            {!isAdmin && <TooltipContent>Sign in as admin to edit zones</TooltipContent>}
+          </Tooltip>
         </div>
         <div className="flex gap-2 text-xs text-muted">
-          <span>Click to add points</span>·<span>Double-click/Enter to close</span>·
+          <span>Click to add points</span>·<span>Double-click/Enter to close the polygon</span>·
           <span>Backspace removes last point</span>·<span>Escape cancels</span>
+          {closed && <span className="text-accent">· Polygon closed — press Save to write it</span>}
         </div>
         <Button size="sm" variant="secondary" onClick={() => setSnapVersion((v) => v + 1)}>
           <RotateCcw className="size-4" /> Refresh snapshot
@@ -224,10 +250,13 @@ export function ZoneEditor({ cameras }: { cameras: Camera[] }) {
         </div>
         <div className="flex flex-col gap-1.5">
           <Label>Kind</Label>
-          <Select value={kindOpt} onValueChange={(v) => { setKindOpt(String(v)); setPoints([]); }}>
+          <Select value={kindOpt} onValueChange={(v) => { setKindOpt(String(v)); setPoints([]); setClosed(false); }}>
             <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
             <SelectContent>{KIND_OPTIONS.map((k) => <SelectItem key={k.value} value={k.value}>{k.label}</SelectItem>)}</SelectContent>
           </Select>
+          <p className="text-xs text-muted">
+            Direction-aware wrong-way detection is not implemented; line crossing counts both directions.
+          </p>
         </div>
         {opt.params === "dwell" && (
           <div className="flex flex-col gap-1.5">
@@ -244,6 +273,7 @@ export function ZoneEditor({ cameras }: { cameras: Camera[] }) {
             Save zone
           </Button>
         </Gate>
+        {!isAdmin && <p className="text-xs text-muted">Sign in as admin to edit zones</p>}
 
         {selectedZone && (
           <div className="flex flex-col gap-2 rounded-card border border-border p-3">

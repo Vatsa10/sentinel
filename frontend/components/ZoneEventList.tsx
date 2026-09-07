@@ -4,9 +4,24 @@ import { useQuery } from "@tanstack/react-query";
 import { ShieldAlert } from "lucide-react";
 import { api, apiUrl } from "@/lib/api";
 import { useLive } from "@/lib/live";
+import { ago } from "@/lib/time";
 import type { ZoneEvent } from "@/lib/types";
-import { TimeBadge } from "@/components/TimeBadge";
 import { EmptyState } from "@/components/EmptyState";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+
+/** Zone events carry a wall-clock ingest time (netra/pipeline.py `ZoneEventRow.at`),
+ * not a scene/stream time from a detection — render it plainly rather than borrowing
+ * TimeBadge's scene-time semantics. */
+function RecordedAt({ at }: { at: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger render={<span tabIndex={0} className="mono text-xs text-muted" />}>
+        {ago(at)}
+      </TooltipTrigger>
+      <TooltipContent>Recorded {new Date(at).toLocaleString("en-IN", { hour12: false })}</TooltipContent>
+    </Tooltip>
+  );
+}
 
 export function ZoneEventList() {
   const { alerts: liveAlerts } = useLive();
@@ -64,7 +79,7 @@ export function ZoneEventList() {
             </div>
             <div className="text-xs text-muted">{e.rule}{e.object_class ? ` · ${e.object_class}` : ""}{e.direction ? ` · ${e.direction}` : ""}{e.detail ? ` · ${e.detail}` : ""}</div>
           </div>
-          <TimeBadge det={{ pts_ms: 0, scene_time: e.at, scene_time_corroborated: true }} />
+          <RecordedAt at={e.at} />
         </div>
       ))}
     </div>
