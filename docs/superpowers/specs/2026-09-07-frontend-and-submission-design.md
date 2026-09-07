@@ -7,7 +7,7 @@ Date: 2026-09-07. Deadline: submission 15 Sept 2026, event 22–23 Sept 2026.
 | Topic | Decision |
 |---|---|
 | Frontend | Full rewrite in Next.js 15 (App Router, static export), Tailwind, shadcn/ui, TanStack Query, react-leaflet, hls.js, lucide icons. Lives in `frontend/` of the same repo. Deployed on Vercel (root dir `frontend`). |
-| Backend | Unchanged FastAPI + GPU pipeline on the laptop (RTX 5050), exposed via Cloudflare Tunnel (`cloudflared tunnel --url http://localhost:5050`); ngrok as fallback. |
+| Backend | Unchanged FastAPI + GPU pipeline on the laptop (RTX 5050), exposed via Cloudflare Tunnel (`cloudflared tunnel --url http://localhost:8080`); ngrok as fallback. |
 | Access | Console opens as **viewer with no login**. Top-right Sign in accepts an API key, role badge becomes operator/admin, unlocks mutations. `data/api_keys.json` shipped with operator + admin keys; viewer requests need no key. Screening committee receives the operator key. |
 | Live video | Default tile = MJPEG from backend with detection boxes drawn (≤6 fps). Per-tile "Smooth" toggle = HLS relay via on-demand ffmpeg, max 4 concurrent, idle-kill 60 s. |
 | Branding | Gujarat Police palette: navy `#0a1628` / near-black base, saffron `#FF6B00` single accent, status green/amber/red for data only. Wordmark "NETRA" with Devanagari `नेत्र` as the logo mark. Headings: Plus Jakarta Sans (matches portal). Data/numbers: JetBrains Mono. |
