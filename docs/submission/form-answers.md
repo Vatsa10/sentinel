@@ -28,8 +28,9 @@ NETRA — Networked Evidence, Tracking & Recognition for Analytics
 NETRA is a unified viewing and analytics platform for Gujarat's CCTV network,
 built on a centralised camera registry (Model 1) and a pluggable
 analytics layer (Model 2). Before designing anything, we profiled all 30
-Government grid cameras: 7 cannot support analytics in their present
-condition, and across 2,691 frames on the three best-positioned cameras,
+Government grid cameras: 8 of 30 cannot support vehicle analytics (6
+degraded, 2 indoor-only), and across 2,691 frames on the three
+best-positioned cameras,
 zero number plates were legible — a measured property of the installed
 infrastructure, not the recognition model. NETRA is built for that reality:
 vehicle detection and appearance-based re-identification carry the platform
@@ -38,7 +39,7 @@ real time, and every timestamp is labelled honestly — corroborated scene
 time where verified, stream time everywhere else. A single console gives
 operators live video, GIS coverage, alerts, vehicle tracing, zone
 intrusion detection and audited role-based access, replacing today's
-disconnected, per-department viewers. (139 words)
+disconnected, per-department viewers. (142 words)
 
 ## Hosted platform URL
 
@@ -90,8 +91,9 @@ Save-as-PDF procedure and the filename convention.
 
 ## Additional notes
 
-The Government grid's measured condition (30 cameras, 20% unable to support
-analytics, zero legible plates across 2,691 sampled frames) is documented in
+The Government grid's measured condition (30 cameras, 20% degraded — cam07,
+08, 09, 11, 21, 22 — plus 2 indoor-only with no vehicle traffic, and zero
+legible plates across 2,691 sampled frames) is documented in
 `docs/high-level-design.md` §2 and `docs/feed-recon-findings.md`, and drove
 the design decision to base matching on vehicle appearance and watchlist
 rules rather than plate text alone. The hosted console and backend tunnel
