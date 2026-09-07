@@ -20,6 +20,7 @@ from fastapi import Depends, Header
 
 from netra import config
 from netra.analytics.live_frames import LIVE_FRAMES
+from netra.api.hls import HLS, HLS_DIR
 from netra.analytics.loop_index import has_embedding
 from netra.analytics.route import build_route
 from netra.core import auth
@@ -48,6 +49,9 @@ app.add_middleware(
 
 WEB_DIR = config.ROOT / "netra" / "web"
 
+HLS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/hls", StaticFiles(directory=str(HLS_DIR)), name="hls")
+
 
 @app.on_event("startup")
 def _startup() -> None:
@@ -59,6 +63,11 @@ def _startup() -> None:
     else:
         log.warning("ACCESS CONTROL DISABLED - every caller is treated as admin. "
                     "Run 'python run.py --make-keys' before any shared deployment.")
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    HLS.stop_all()
 
 
 def _audit(action: str, target: str | None = None, detail: dict | None = None,
@@ -326,6 +335,45 @@ async def camera_live_mjpeg(camera_id: str, request: Request,
                 await asyncio.sleep(interval)
         finally:
             LIVE_FRAMES.unsubscribe(camera_id)
+
+
+# --------------------------------------------------------------- HLS relay --
+def _hls_source(cam: Camera) -> str:
+    """RTSP URL for grid cameras, or the on-disk file for own-feed cameras.
+
+    Own-feed cameras are onboarded with their local file path stored in
+    `cam.rtsp_url` (see /api/cameras/own-feed); a real grid camera's stream is
+    always derived from its id via config.rtsp_url instead of being stored.
+    """
+    stored = cam.rtsp_url or ""
+    if stored and not stored.startswith("rtsp://"):
+        return stored
+    return config.rtsp_url(cam.id)
+
+
+@app.post("/api/cameras/{camera_id}/hls/start")
+def hls_start(camera_id: str, _p=Depends(require("read"))):
+    with SessionLocal() as db:
+        cam = db.get(Camera, camera_id)
+        if not cam:
+            raise HTTPException(404, "camera not found")
+        hevc = (getattr(cam, "codec", "") or "").lower() in ("hevc", "h265")
+        source = _hls_source(cam)
+    st = HLS.start(camera_id, source, hevc)
+    if not st["running"]:
+        raise HTTPException(429, st.get("error", "relay unavailable"))
+    return st
+
+
+@app.post("/api/cameras/{camera_id}/hls/stop")
+def hls_stop(camera_id: str, _p=Depends(require("read"))):
+    return {"stopped": HLS.stop(camera_id)}
+
+
+@app.get("/api/cameras/{camera_id}/hls/status")
+def hls_status(camera_id: str, _p=Depends(require("read"))):
+    HLS.touch(camera_id)          # the player polls this while it plays
+    return HLS.status(camera_id)
 
     return StreamingResponse(
         gen(), media_type="multipart/x-mixed-replace; boundary=netraframe",

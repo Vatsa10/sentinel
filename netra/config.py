@@ -76,6 +76,11 @@ def hls_url(cam_id: str) -> str:
     return f"{CDN_HOST}/{cam_id}/index.m3u8"
 
 
+# --- on-demand HLS relay ------------------------------------------------------
+HLS_MAX_CONCURRENT = int(os.getenv("NETRA_HLS_MAX_CONCURRENT", "4"))
+HLS_IDLE_S = float(os.getenv("NETRA_HLS_IDLE_S", "60"))
+
+
 # --- storage -----------------------------------------------------------------
 # SQLite by default so the stack runs with zero setup; set NETRA_DB to a
 # postgresql+psycopg:// URL to run against PostgreSQL/PostGIS unchanged.

@@ -36,6 +36,9 @@ def check() -> int:
             print(f"  {mod:<10} FAILED: {e}")
             ok = False
 
+    import shutil
+    print(f"  ffmpeg     {'ok' if shutil.which('ffmpeg') else 'MISSING (snapshots, HLS)'}")
+
     try:
         from netra.core.registry import fetch_catalogue
         cams = fetch_catalogue()
