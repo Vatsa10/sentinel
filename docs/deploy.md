@@ -147,6 +147,13 @@ Because of this rough edge, prefer cloudflared for anything demoed live.
 
 Run through this in order, ideally 15–20 minutes before the demo starts:
 
+0. Storage: the pipeline writes one evidence JPEG per detection and nothing
+   prunes them unless asked. Before a long run, and again before the demo,
+   call `POST /api/storage/prune` (admin) or run
+   `python -c "from netra.core import retention; print(retention.prune_evidence(max_bytes=2*1024**3))"`.
+   Set `NETRA_EVIDENCE_MAX_BYTES=2147483648` in the start environment so the
+   endpoint keeps the demo host at 2 GB. A day of unattended running on the
+   grid produced 1.1 million crops (6 GB) and a 6.4 GB SQLite file.
 1. `python run.py --check` shows `cuda=True` and a named GPU.
 2. Pipeline started and running against the 8 Ahmedabad/Junagadh grid cameras
    plus your own test feed (`POST /api/pipeline/start` or the console button).
