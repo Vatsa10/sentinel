@@ -225,7 +225,12 @@ export default function AlertsPage() {
                           <Icon className="size-3.5" />{a.severity}
                         </span>
                       </TableCell>
-                      <TableCell className="mono">{a.plate_observed ?? a.plate_watchlist ?? "—"}</TableCell>
+                      <TableCell className="mono">
+                        <div>{a.plate_watchlist ?? a.plate_observed ?? "—"}</div>
+                        {a.plate_observed && a.plate_watchlist && a.plate_observed !== a.plate_watchlist && (
+                          <div className="text-xs text-muted">read {a.plate_observed} · {(a.score * 100).toFixed(0)}% match</div>
+                        )}
+                      </TableCell>
                       <TableCell className="mono">{a.camera_name ?? a.camera_id}</TableCell>
                       <TableCell><RecordedAt at={a.at} /></TableCell>
                       <TableCell className="mono">{(a.score * 100).toFixed(0)}%</TableCell>
@@ -237,11 +242,11 @@ export default function AlertsPage() {
                               {a.acknowledged ? "Acked" : "Acknowledge"}
                             </Button>
                           </Gate>
-                          <Button size="sm" variant="ghost" render={<Link href={`/console/wall?camera=${a.camera_id}`} />}>
+                          <Button size="sm" variant="ghost" nativeButton={false} render={<Link href={`/console/wall?camera=${a.camera_id}`} />}>
                             <CameraIcon className="size-3.5" /> Camera
                           </Button>
                           {(a.plate_observed ?? a.plate_watchlist) && (
-                            <Button size="sm" variant="ghost" render={<Link href={`/console/vehicles?plate=${a.plate_observed ?? a.plate_watchlist}`} />}>
+                            <Button size="sm" variant="ghost" nativeButton={false} render={<Link href={`/console/vehicles?plate=${a.plate_watchlist ?? a.plate_observed}`} />}>
                               <RouteIcon className="size-3.5" /> Trace
                             </Button>
                           )}
@@ -261,6 +266,9 @@ export default function AlertsPage() {
                               <div><span className="text-muted">Category: </span>{a.category ?? "—"}</div>
                               <div><span className="text-muted">Case ref: </span>{a.case_ref ?? "—"}</div>
                               <div><span className="text-muted">Watchlist plate: </span><span className="mono">{a.plate_watchlist ?? "—"}</span></div>
+                            {a.plate_observed && a.plate_watchlist && a.plate_observed !== a.plate_watchlist && (
+                              <div><span className="text-muted">Raw read: </span><span className="mono text-muted">{a.plate_observed}</span></div>
+                            )}
                             </div>
                             <div className="flex flex-col gap-1 text-sm">
                               <div className="text-muted">Score breakdown</div>

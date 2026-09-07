@@ -26,6 +26,7 @@ interface Row {
   camera_id: string;
   camera_name: string | null;
   plate: string | null;
+  plateRead: string | null;
   score: number | null;
   severity: string;
   evidence: string | null;
@@ -39,7 +40,8 @@ function fromAlert(a: Alert): Row {
     at: a.at,
     camera_id: a.camera_id,
     camera_name: a.camera_name,
-    plate: a.plate_observed ?? a.plate_watchlist,
+    plate: a.plate_watchlist ?? a.plate_observed,
+    plateRead: a.plate_observed,
     score: a.score,
     severity: a.severity,
     evidence: a.evidence,
@@ -68,7 +70,8 @@ export function AlertFeed() {
         at: new Date().toISOString(),
         camera_id: m.camera_id ?? "?",
         camera_name: null,
-        plate: (m.plate as string | undefined) ?? null,
+        plate: (m.plate_watchlist as string | undefined) ?? (m.plate_observed as string | undefined) ?? (m.plate as string | undefined) ?? null,
+        plateRead: (m.plate_observed as string | undefined) ?? null,
         score: m.score ?? null,
         severity: m.severity ?? "medium",
         evidence: m.evidence ?? null,
@@ -135,7 +138,11 @@ export function AlertFeed() {
                 <span className="truncate text-xs text-muted">{r.camera_name ?? r.camera_id}</span>
               </div>
               <div className="mono text-xs text-muted">
-                {r.score != null ? `${(r.score * 100).toFixed(0)}% match` : ""}
+                {r.plateRead && r.plateRead !== r.plate
+                  ? `read ${r.plateRead}${r.score != null ? ` · ${(r.score * 100).toFixed(0)}% match` : ""}`
+                  : r.score != null
+                    ? `${(r.score * 100).toFixed(0)}% match`
+                    : ""}
               </div>
             </div>
             <Tooltip>
@@ -159,6 +166,7 @@ export function AlertFeed() {
                 <Button
                   size="sm"
                   variant="ghost"
+                  nativeButton={false}
                   render={
                     <a
                       href={apiUrl("/evidence/" + r.evidence.replace(/^\/?evidence\//, ""))}
