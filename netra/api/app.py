@@ -24,6 +24,8 @@ from netra.api.hls import HLS, HLS_DIR
 from netra.analytics.loop_index import has_embedding
 from netra.analytics.route import build_route
 from netra.core import auth
+from netra.core import notify as notify_mod
+from netra.core.notify import NOTIFIER
 from netra.core.db import SessionLocal, init_db
 from netra.core.geo import TIME_GROUPS, time_group
 from netra.api.health import camera_health, redact_url
@@ -646,6 +648,18 @@ def acknowledge(alert_id: int, _p=Depends(require("acknowledge"))):
         db.commit()
     _audit("alert.acknowledge", target=str(alert_id))
     return {"acknowledged": alert_id}
+
+
+@app.get("/api/notify/config")
+def notify_config(_p=Depends(require("read"))):
+    return notify_mod.masked(NOTIFIER.cfg)
+
+
+@app.post("/api/notify/test")
+def notify_test(_p=Depends(require("acknowledge"))):
+    result = notify_mod.send_test(NOTIFIER)
+    _audit("notify.test", target="-", detail=result)
+    return result
 
 
 @app.websocket("/ws/alerts")

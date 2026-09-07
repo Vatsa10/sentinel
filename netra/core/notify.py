@@ -23,6 +23,7 @@ import smtplib
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from email.message import EmailMessage
 
 log = logging.getLogger(__name__)
@@ -174,6 +175,44 @@ class Notifier:
 NOTIFIER = Notifier()
 
 
+def masked(cfg: NotifyConfig) -> dict:
+    """Config visible to the operator console: enough to confirm channels are
+    wired up, never enough to leak a credential."""
+    def mask(s: str) -> str:
+        return s if len(s) < 4 else s[:2] + "…" + s[-2:]
+    return {"email": bool(cfg.smtp_host and cfg.mail_to),
+            "webhook": bool(cfg.webhook_url),
+            "smtp_host": cfg.smtp_host,
+            "smtp_user_masked": mask(cfg.smtp_user),
+            "to": cfg.mail_to,
+            "min_severity": cfg.min_severity}
+
+
+def send_test(notifier: "Notifier") -> dict:
+    """Send one synthetic critical alert through every configured channel,
+    synchronously, so an operator can confirm delivery without waiting for a
+    real watchlist hit."""
+    alert = {"plate_watchlist": "GJ01AB1234", "plate_observed": "GJ01AB1234",
+             "severity": "critical", "category": "stolen",
+             "camera_id": "cam13", "camera_name": "Test camera",
+             "match_type": "test", "score": 0.97,
+             "at": datetime.now(timezone.utc).isoformat(),
+             "reasons": {}, "test": True}
+    info = masked(notifier.cfg)
+    out = {}
+    for name, fn, on in (("email", notifier._send_email, info["email"]),
+                          ("webhook", notifier._send_webhook, info["webhook"])):
+        if not on:
+            out[name] = {"sent": False, "error": "not configured"}
+            continue
+        try:
+            fn(alert)
+            out[name] = {"sent": True, "error": None}
+        except Exception as exc:   # report, never raise: this is a diagnostic
+            out[name] = {"sent": False, "error": str(exc)[:200]}
+    return out
+
+
 def _self_check() -> None:
     """Verify severity gating and repeat suppression, the two rules that decide
     whether a duty desk gets a useful channel or an unreadable one."""
@@ -204,6 +243,19 @@ def _self_check() -> None:
     })
     assert "GJ01AB1234" in subject and "CRITICAL" in subject, subject
     assert "8/10 characters agree" in body, body
+
+    m = masked(NotifyConfig(smtp_host="", smtp_user="alice@example.com", mail_to="",
+                             webhook_url=""))
+    assert m["email"] is False and m["webhook"] is False
+    assert m["smtp_user_masked"] == "al…om", m["smtp_user_masked"]
+
+    m2 = masked(NotifyConfig(smtp_host="smtp.example.com", mail_to="duty@example.com",
+                              webhook_url="https://hooks.example.com/x"))
+    assert m2["email"] is True and m2["webhook"] is True
+
+    result = send_test(Notifier(NotifyConfig()))
+    assert result["email"] == {"sent": False, "error": "not configured"}, result["email"]
+    assert result["webhook"] == {"sent": False, "error": "not configured"}, result["webhook"]
 
     print("notify self-check passed")
 
