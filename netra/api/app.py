@@ -26,6 +26,7 @@ from netra.analytics.route import build_route
 from netra.core import auth
 from netra.core.db import SessionLocal, init_db
 from netra.core.geo import TIME_GROUPS, time_group
+from netra.api.health import camera_health, redact_url
 from netra.core.models import (Alert, AuditLog, Camera, Detection,
                                VehicleAttributeRow, WatchlistEntry)
 from netra.pipeline import PIPELINE
@@ -118,9 +119,20 @@ def list_cameras(capability: str | None = None, city: str | None = None):
         "capability_note": c.capability_note,
         "mean_luma": round(c.mean_luma, 1) if c.mean_luma else None,
         "time_group": time_group(c.id),
-        "whep_url": c.whep_url, "hls_url": c.hls_url, "rtsp_url": c.rtsp_url,
+        "whep_url": c.whep_url, "hls_url": c.hls_url,
+        "rtsp_url": redact_url(c.rtsp_url),
         "live": health.get(c.id, {}),
     } for c in cams]
+
+
+@app.get("/api/cameras/health")
+def cameras_health(_p=Depends(require("read"))):
+    """Per-camera health for the console: registry facts + live ingest state.
+
+    Declared before any /api/cameras/{camera_id}/... route so FastAPI does
+    not capture "health" as a camera id.
+    """
+    return camera_health(PIPELINE)
 
 
 @app.post("/api/cameras/onboard")
