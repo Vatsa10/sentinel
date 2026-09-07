@@ -151,3 +151,8 @@ ATTRIBUTE_ESCALATED_INTERVAL_S = float(
 # Bounded and dropping: enrichment must never apply back-pressure to detection.
 # Measured precedent for why - unbounded overlay OCR cost 71% of frames.
 ATTRIBUTE_QUEUE_SIZE = int(os.getenv("NETRA_ATTRIBUTE_QUEUE", "32"))
+
+# Live MJPEG tiles for the console.
+LIVE_MAX_EDGE = int(os.getenv("NETRA_LIVE_MAX_EDGE", "960"))
+LIVE_JPEG_QUALITY = int(os.getenv("NETRA_LIVE_JPEG_QUALITY", "70"))
+LIVE_MJPEG_FPS = float(os.getenv("NETRA_LIVE_MJPEG_FPS", "6"))

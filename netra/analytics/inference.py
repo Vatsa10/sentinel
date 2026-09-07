@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from netra import config
+from netra.analytics.live_frames import LIVE_FRAMES
 
 log = logging.getLogger(__name__)
 
@@ -632,6 +633,11 @@ class InferenceEngine:
 
         for det in detections:
             self.on_detection(det)
+
+        try:
+            LIVE_FRAMES.put(frame.camera_id, img, detections, frame.pts_ms)
+        except Exception:
+            log.exception("live frame encode failed for %s", frame.camera_id)
 
         self.stats["processed"] += 1
         self.stats["infer_ms"] = round((time.time() - t0) * 1000, 1)
