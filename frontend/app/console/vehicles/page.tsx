@@ -6,6 +6,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Crosshair, ExternalLink, Search } from "lucide-react";
 import { cn } from "cn";
 import { api, apiUrl } from "@/lib/api";
+import { useDebouncedValue } from "@/lib/useDebouncedValue";
 import type { Camera, Detection, DetectionPage } from "@/lib/types";
 import { DetectionTable } from "@/components/DetectionTable";
 import { VehicleDetail } from "@/components/VehicleDetail";
@@ -44,6 +45,7 @@ interface RouteResult {
   duration_s: number;
   time_groups: string[];
   hop_count: number;
+  truncated?: boolean;
 }
 
 export default function VehiclesPage() {
@@ -57,13 +59,25 @@ export default function VehiclesPage() {
 function VehiclesPageInner() {
   const search = useSearchParams();
 
-  const [plate, setPlate] = useState("");
-  const [attrText, setAttrText] = useState("");
+  const plateParam = search.get("plate");
+  const detectionParam = search.get("detection");
+  // A `?detection=` value that is itself plate-shaped (assistant.tsx sends
+  // one when the entity it resolved was a plate, not a numeric detection id)
+  // behaves exactly like `?plate=`.
+  const isPlateShaped = (v: string) => /^[A-Z]{2}\s?\d{1,2}\s?[A-Z]{0,3}\s?\d{3,4}$/i.test(v);
+  const initialPlate = plateParam ?? (detectionParam && isPlateShaped(detectionParam) ? detectionParam : "");
+  const initialAttr = detectionParam && !isPlateShaped(detectionParam) ? detectionParam : "";
+
+  const [plate, setPlate] = useState(initialPlate);
+  const [attrText, setAttrText] = useState(initialAttr);
   const [cameraId, setCameraId] = useState(search.get("camera") ?? "");
   const [sinceMinutes, setSinceMinutes] = useState<string>("");
   const [classes, setClasses] = useState<string[]>([]);
-  const [routeQuery, setRouteQuery] = useState<string | null>(null);
+  const [routeQuery, setRouteQuery] = useState<string | null>(initialPlate ? initialPlate.toUpperCase() : null);
   const [selected, setSelected] = useState<Detection | null>(null);
+
+  const debouncedPlate = useDebouncedValue(plate, 300);
+  const debouncedAttrText = useDebouncedValue(attrText, 300);
 
   const { data: cameras } = useQuery({
     queryKey: ["cameras"],
@@ -72,13 +86,13 @@ function VehiclesPageInner() {
 
   const params = useMemo(() => {
     const p = new URLSearchParams();
-    if (plate.trim()) p.set("plate", plate.trim().toUpperCase());
+    if (debouncedPlate.trim()) p.set("plate", debouncedPlate.trim().toUpperCase());
     if (cameraId) p.set("camera_id", cameraId);
     if (sinceMinutes) p.set("since_minutes", sinceMinutes);
     if (classes.length === 1) p.set("vehicle_class", classes[0]);
     p.set("limit", "100");
     return p.toString();
-  }, [plate, cameraId, sinceMinutes, classes]);
+  }, [debouncedPlate, cameraId, sinceMinutes, classes]);
 
   const { data: page, isFetching } = useQuery({
     queryKey: ["detections", params],
@@ -91,7 +105,7 @@ function VehiclesPageInner() {
   const filtered = useMemo(() => {
     let items = page?.items ?? [];
     if (classes.length > 1) items = items.filter((d) => d.vehicle_class && classes.includes(d.vehicle_class));
-    const q = attrText.trim().toLowerCase();
+    const q = debouncedAttrText.trim().toLowerCase();
     if (q) {
       items = items.filter((d) => {
         const desc = (d.attributes as { description?: string } | null)?.description ?? "";
@@ -103,7 +117,7 @@ function VehiclesPageInner() {
       });
     }
     return items;
-  }, [page, classes, attrText]);
+  }, [page, classes, debouncedAttrText]);
 
   const { data: route, isFetching: routeLoading } = useQuery({
     queryKey: ["route", routeQuery],
@@ -205,6 +219,9 @@ function VehiclesPageInner() {
                   ? `${route.hop_count} sighting${route.hop_count === 1 ? "" : "s"} on ${routeCameraCount} camera${routeCameraCount === 1 ? "" : "s"}`
                   : "No sightings of this number in the indexed period."}
               </p>
+              {route.truncated && (
+                <p className="text-[11px] text-muted">Results capped to the last 72 h / N rows.</p>
+              )}
               {route.hop_count > 0 && (
                 <>
                   <RouteMap points={route.hops.map((h) => ({ camera_id: h.camera_id, camera_name: h.camera_name, lat: h.lat, lon: h.lon, at: h.at }))} />

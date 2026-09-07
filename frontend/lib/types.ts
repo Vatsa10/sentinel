@@ -253,6 +253,7 @@ export interface ClonedPlatesResponse {
   count: number;
   min_confidence: number;
   note: string;
+  truncated?: boolean;
 }
 
 /** One hop of a mined journey (netra/analytics/loop_index.py `JourneyHop`). */

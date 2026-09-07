@@ -81,11 +81,16 @@ export default function IntelligencePage() {
           ) : !clones || clones.findings.length === 0 ? (
             <EmptyState icon={Copy} title="No cloned plates found" body={clones?.note ?? "No pairs pass the plausibility check."} />
           ) : (
-            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-              {clones.findings.map((f, i) => (
-                <ClonePairCard key={i} finding={f} />
-              ))}
-            </div>
+            <>
+              {clones.truncated && (
+                <p className="text-[11px] text-muted">Results capped to the last 72 h / N rows.</p>
+              )}
+              <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
+                {clones.findings.map((f, i) => (
+                  <ClonePairCard key={i} finding={f} />
+                ))}
+              </div>
+            </>
           )}
         </TabsContent>
 

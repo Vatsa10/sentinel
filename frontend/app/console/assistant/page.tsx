@@ -9,18 +9,67 @@ import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "cn";
 
+interface AssistantAction {
+  label: string;
+  view: string;
+  query?: string;
+}
+
 interface AssistantResponse {
   answer: string;
   data: Record<string, unknown>;
-  actions: { label: string; href?: string }[];
+  actions: AssistantAction[];
 }
 
 interface Turn {
   who: "user" | "netra";
   text: string;
   data?: Record<string, unknown>;
-  actions?: { label: string; href?: string }[];
+  actions?: AssistantAction[];
   intent?: string;
+}
+
+// A loose check for "looks like an Indian registration number" — good enough
+// to decide whether an entity id is a plate for routing purposes; the actual
+// parsing/validation of plates happens server-side.
+const PLATE_RE = /^[A-Z]{2}\s?\d{1,2}\s?[A-Z]{0,3}\s?\d{3,4}$/i;
+
+/**
+ * Maps a backend `view` (netra/api/assistant.py) to a console route. Every
+ * `view` value emitted by assistant.py must be covered here; an unrecognised
+ * one falls through to a plain, unlinked label rather than a dead or wrong
+ * link (F2).
+ */
+function actionHref(a: AssistantAction): string | null {
+  const q = a.query ? encodeURIComponent(a.query) : "";
+  switch (a.view) {
+    case "registry":
+    case "map":
+      return "/console/map/";
+    case "zones":
+      return "/console/zones/";
+    case "detections":
+      return a.query && PLATE_RE.test(a.query)
+        ? `/console/vehicles/?plate=${q}`
+        : a.query
+        ? `/console/vehicles/?detection=${q}`
+        : "/console/vehicles/";
+    case "route":
+      return a.query ? `/console/vehicles/?plate=${q}` : "/console/vehicles/";
+    case "alerts":
+      return "/console/alerts/";
+    case "traffic":
+      return "/console/traffic/";
+    case "watchlist":
+      return "/console/watchlist/";
+    case "wall":
+    case "cameras":
+      return "/console/wall/";
+    case "overview":
+      return "/console/";
+    default:
+      return null;
+  }
 }
 
 const CHIPS = [
@@ -143,7 +192,7 @@ export default function AssistantPage() {
   );
 }
 
-function SourcesDisclosure({ data, actions }: { data: Record<string, unknown>; actions: { label: string; href?: string }[] }) {
+function SourcesDisclosure({ data, actions }: { data: Record<string, unknown>; actions: AssistantAction[] }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="w-full text-xs">
@@ -158,11 +207,14 @@ function SourcesDisclosure({ data, actions }: { data: Record<string, unknown>; a
           </pre>
           {actions.length > 0 && (
             <div className="flex flex-wrap gap-2">
-              {actions.map((a, i) => a.href ? (
-                <Link key={i} href={a.href} className="text-accent hover:underline">{a.label}</Link>
-              ) : (
-                <span key={i} className="text-muted">{a.label}</span>
-              ))}
+              {actions.map((a, i) => {
+                const href = actionHref(a);
+                return href ? (
+                  <Link key={i} href={href} className="text-accent hover:underline">{a.label}</Link>
+                ) : (
+                  <span key={i} className="text-muted">{a.label} <span className="italic">(no link)</span></span>
+                );
+              })}
             </div>
           )}
         </div>
