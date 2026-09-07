@@ -122,6 +122,18 @@ def enabled() -> bool:
     return bool(load_keys())
 
 
+def keys_unreadable() -> bool:
+    """True when data/api_keys.json exists but could not be parsed.
+
+    Callers (startup logging, --check) use this to tell "open mode" apart
+    from "broken keys file, every caller refused" - two states load_keys()
+    both surfaces as an empty dict on purpose, since resolve() must not
+    treat them differently by accident.
+    """
+    load_keys()
+    return KEYS_PATH.exists() and _cache_keys is _UNREADABLE
+
+
 def resolve(api_key: str | None) -> Principal | None:
     """Identify the caller. None means the caller must be refused (401).
 

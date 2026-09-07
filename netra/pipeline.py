@@ -188,12 +188,13 @@ class Pipeline:
         callback returns.
         """
         try:
-            self._write_queue.put_nowait(("zone", event, frame.image.copy()))
+            self._write_queue.put_nowait(
+                ("zone", event, frame.image.copy(), frame.wall_time))
         except queue.Full:
             with self._stats_lock:
                 self.stats["write_dropped"] += 1
 
-    def _persist_zone_event(self, event, image) -> None:
+    def _persist_zone_event(self, event, image, wall_time: float) -> None:
         """The actual zone-event work: evidence write, DB row, broadcast,
         notify. Runs on the writer thread only.
 
@@ -202,7 +203,7 @@ class Pipeline:
         """
         evidence_path = None
         try:
-            fname = (f"zone_{event.camera_id}_{int(time.time() * 1000)}"
+            fname = (f"zone_{event.camera_id}_{int(wall_time * 1000)}"
                      f"_{event.track_id}.jpg")
             cv2.imwrite(str(config.EVIDENCE / fname), image)
             evidence_path = f"/evidence/{fname}"
@@ -361,16 +362,16 @@ class Pipeline:
 
     def _flush(self, batch: list) -> None:
         # The write queue carries two kinds of item: a plain detection, and a
-        # ("zone", event, image) tuple enqueued by _handle_zone_event. Both
-        # are drained by the same writer thread so a zone event never
-        # competes with inference for disk/DB time, but they are persisted
-        # through different paths.
+        # ("zone", event, image, wall_time) tuple enqueued by
+        # _handle_zone_event. Both are drained by the same writer thread so a
+        # zone event never competes with inference for disk/DB time, but they
+        # are persisted through different paths.
         rows, dets = [], []
         for det in batch:
             if isinstance(det, tuple) and det and det[0] == "zone":
-                _, event, image = det
+                _, event, image, wall_time = det
                 try:
-                    self._persist_zone_event(event, image)
+                    self._persist_zone_event(event, image, wall_time)
                 except Exception:
                     log.exception("failed to persist a zone event for %s",
                                   event.camera_id)

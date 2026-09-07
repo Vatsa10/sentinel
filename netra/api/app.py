@@ -63,6 +63,9 @@ def _startup() -> None:
     if auth.enabled():
         log.info("access control ENABLED (%d keys configured)",
                  len(auth.load_keys()))
+    elif auth.keys_unreadable():
+        log.error("API keys file unreadable: refusing all keyed access "
+                  "until data/api_keys.json is fixed or regenerated.")
     else:
         log.warning("ACCESS CONTROL DISABLED - every caller is treated as admin. "
                     "Run 'python run.py --make-keys' before any shared deployment.")

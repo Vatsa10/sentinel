@@ -634,7 +634,7 @@ class InferenceEngine:
             try:
                 h, w = img.shape[:2]
                 events = self.zone_engine.evaluate(
-                    frame.camera_id, list(tracker.tracks.values()), (w, h))
+                    frame.camera_id, tracker.snapshot_tracks(), (w, h))
                 if events and self.on_zone_event:
                     for event in events:
                         self.on_zone_event(event, frame)
@@ -733,7 +733,7 @@ class InferenceEngine:
 
         # The tracker expires stale tracks internally; without this the voter
         # would hold reads for vehicles that left the frame long ago.
-        voter.retain(tracker.tracks.keys())
+        voter.retain([t.track_id for t in tracker.snapshot_tracks()])
 
     def _read_plate(self, img, det: VehicleDetection) -> None:
         """Localise and read the plate on one vehicle."""

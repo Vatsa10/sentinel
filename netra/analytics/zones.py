@@ -118,7 +118,8 @@ class ZoneEngine:
         self._lock = threading.Lock()
 
     def set_zones(self, camera_id: str, zones: list[Zone]) -> None:
-        self.zones[camera_id] = [z for z in zones if z.active]
+        with self._lock:
+            self.zones[camera_id] = [z for z in zones if z.active]
 
     def reset_camera(self, camera_id: str) -> None:
         """Forget per-track state after a loop cut; track ids restart."""
@@ -133,18 +134,19 @@ class ZoneEngine:
 
     def evaluate(self, camera_id: str, tracks: list, frame_size) -> list[ZoneEvent]:
         """Check every active track on this camera against its zones."""
-        zones = self.zones.get(camera_id)
-        if not zones or not tracks:
+        if not tracks:
             return []
 
         width, height = frame_size
-        events: list[ZoneEvent] = []
         now = datetime.now(timezone.utc)
 
         with self._lock:
+            zones = self.zones.get(camera_id)
+            if not zones:
+                return []
             events = self._evaluate_locked(camera_id, zones, tracks, width,
                                            height, now)
-        self.events_raised += len(events)
+            self.events_raised += len(events)
         return events
 
     def _evaluate_locked(self, camera_id, zones, tracks, width, height,

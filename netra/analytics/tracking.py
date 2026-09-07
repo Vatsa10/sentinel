@@ -231,6 +231,20 @@ class CameraTracker:
                 del self.tracks[tid]
             self.dropped_tracks += excess
 
+    def snapshot_tracks(self) -> list[Track]:
+        """A point-in-time copy of the live tracks, safe to iterate outside
+        the lock.
+
+        Every caller outside this module (zone evaluation, plate-vote
+        retention) must go through this rather than reading `self.tracks`
+        directly: `update()`/`reset()` can run concurrently on another
+        thread, and iterating the live dict while it mutates is exactly the
+        "set/dict changed size during iteration" class of bug the per-camera
+        lock exists to prevent.
+        """
+        with self._lock:
+            return list(self.tracks.values())
+
     def stats(self) -> dict:
         with self._lock:
             active = list(self.tracks.values())
@@ -410,6 +424,8 @@ def _self_check() -> None:
             try:
                 stress.stats()
                 stress.reset()
+                for t in stress.snapshot_tracks():
+                    t.track_id   # touch each entry; must never be a stale ref
             except Exception as e:
                 errors.append(e)
                 break
