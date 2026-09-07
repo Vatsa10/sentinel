@@ -21,9 +21,10 @@ HLS_DIR = config.DATA / "hls"
 
 
 class _Relay:
-    def __init__(self, camera_id: str, proc: subprocess.Popen):
+    def __init__(self, camera_id: str, proc: subprocess.Popen, log_fh):
         self.camera_id = camera_id
         self.proc = proc
+        self.log_fh = log_fh
         self.started = time.time()
         self.last_touch = time.time()
 
@@ -56,19 +57,22 @@ class HlsManager:
             live = self._relays.get(camera_id)
             if live and live.proc.poll() is None:
                 live.last_touch = time.time()
-                return self.status(camera_id)
-            running = [r for r in self._relays.values() if r.proc.poll() is None]
-            if len(running) >= self.max_concurrent:
-                return {"camera_id": camera_id, "running": False,
-                        "error": f"at most {self.max_concurrent} smooth streams",
-                        "concurrent": len(running)}
-            out_dir = HLS_DIR / camera_id
-            shutil.rmtree(out_dir, ignore_errors=True)
-            out_dir.mkdir(parents=True, exist_ok=True)
-            proc = subprocess.Popen(self.command(source, out_dir, hevc),
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.PIPE)
-            self._relays[camera_id] = _Relay(camera_id, proc)
+                already_running = True
+            else:
+                already_running = False
+                running = [r for r in self._relays.values() if r.proc.poll() is None]
+                if len(running) >= self.max_concurrent:
+                    return {"camera_id": camera_id, "running": False,
+                            "error": f"at most {self.max_concurrent} smooth streams",
+                            "concurrent": len(running)}
+                out_dir = HLS_DIR / camera_id
+                shutil.rmtree(out_dir, ignore_errors=True)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                log_fh = open(out_dir / "ffmpeg.log", "wb")
+                proc = subprocess.Popen(self.command(source, out_dir, hevc),
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=log_fh)
+                self._relays[camera_id] = _Relay(camera_id, proc, log_fh)
         return self.status(camera_id)
 
     def stop(self, camera_id: str) -> bool:
@@ -82,23 +86,30 @@ class HlsManager:
                 r.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 r.proc.kill()
+        try:
+            r.log_fh.close()
+        except Exception:
+            pass
         shutil.rmtree(HLS_DIR / camera_id, ignore_errors=True)
         return True
 
     def touch(self, camera_id: str) -> None:
-        r = self._relays.get(camera_id)
-        if r:
-            r.last_touch = time.time()
+        with self._lock:
+            r = self._relays.get(camera_id)
+            if r:
+                r.last_touch = time.time()
 
     def status(self, camera_id: str) -> dict:
-        r = self._relays.get(camera_id)
+        with self._lock:
+            relays = dict(self._relays)
+        r = relays.get(camera_id)
         running = bool(r and r.proc.poll() is None)
         playlist = HLS_DIR / camera_id / "index.m3u8"
         return {"camera_id": camera_id, "running": running,
                 "ready": running and playlist.exists(),
                 "url": f"/hls/{camera_id}/index.m3u8",
                 "age_s": round(time.time() - r.started, 1) if r else None,
-                "concurrent": sum(1 for x in self._relays.values()
+                "concurrent": sum(1 for x in relays.values()
                                   if x.proc.poll() is None),
                 "max_concurrent": self.max_concurrent}
 
@@ -116,7 +127,11 @@ class HlsManager:
                 idle = now - r.last_touch > self.idle_s
                 if dead or idle:
                     if dead:
-                        err = (r.proc.stderr.read() or b"").decode(errors="replace")[-300:]
+                        try:
+                            err = (HLS_DIR / cid / "ffmpeg.log").read_bytes()[-300:]
+                            err = err.decode(errors="replace")
+                        except OSError:
+                            err = ""
                         log.warning("hls relay %s exited: %s", cid, err.strip())
                     self.stop(cid)
 
