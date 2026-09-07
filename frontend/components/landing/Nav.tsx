@@ -9,7 +9,7 @@ export function Nav() {
           <Brand />
         </Link>
         <Link
-          href="/console"
+          href="/console/"
           className="rounded-ctl bg-accent px-4 py-2 text-sm font-semibold text-accent-fg transition-colors duration-200 hover:brightness-110"
         >
           Open Console

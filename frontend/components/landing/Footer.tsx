@@ -9,10 +9,15 @@ export function Footer() {
           Vatsa Joshi
         </p>
         <nav aria-label="Footer" className="flex items-center gap-4">
-          <Link href="https://github.com" className="hover:text-text" target="_blank" rel="noopener noreferrer">
+          <Link href="https://github.com/Vatsa10/sentinel" className="hover:text-text" target="_blank" rel="noopener noreferrer">
             Repo
           </Link>
-          <Link href="/docs/high-level-design.md" className="hover:text-text">
+          <Link
+            href="https://github.com/Vatsa10/sentinel/blob/main/docs/high-level-design.md"
+            className="hover:text-text"
+            target="_blank"
+            rel="noopener"
+          >
             HLD
           </Link>
           <a href="mailto:vatsajoshi2@gmail.com" className="hover:text-text">

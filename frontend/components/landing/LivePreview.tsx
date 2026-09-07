@@ -11,16 +11,16 @@ const MiniMap = dynamic(() => import("@/components/MiniMap"), {
 });
 
 function usePreviewCameras() {
-  const { data } = useQuery({
+  const { data, isError } = useQuery({
     queryKey: ["landing-cameras"],
     queryFn: () => api<Camera[]>("/api/cameras"),
     retry: 0,
   });
-  return data ?? [];
+  return { cameras: data ?? [], offline: isError };
 }
 
 export function LivePreview() {
-  const cameras = usePreviewCameras();
+  const { cameras, offline } = usePreviewCameras();
   const rows = mergeHealth(cameras, null, null);
   const online = rows.find((c) => c.state === "online") ?? rows[0];
 
@@ -39,8 +39,10 @@ export function LivePreview() {
               className="h-full w-full object-cover"
             />
           ) : (
-            <div className="flex h-full w-full items-center justify-center text-sm text-muted">
-              Connecting…
+            <div className="flex h-full w-full items-center justify-center px-4 text-center text-sm text-muted">
+              {offline
+                ? "Backend offline — the live tile appears when the pipeline is up."
+                : "Connecting…"}
             </div>
           )}
         </div>

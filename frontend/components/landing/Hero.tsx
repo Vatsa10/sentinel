@@ -14,13 +14,13 @@ export function Hero() {
       </p>
       <div className="animate-fade-up mt-9 flex flex-wrap items-center justify-center gap-4">
         <Link
-          href="/console"
+          href="/console/"
           className="rounded-ctl bg-accent px-6 py-3 text-base font-semibold text-accent-fg transition-colors duration-200 hover:brightness-110"
         >
           Open Console
         </Link>
         <Link
-          href="/console/wall"
+          href="/console/wall/"
           className="rounded-ctl border border-border bg-surface px-6 py-3 text-base font-semibold text-text transition-colors duration-200 hover:border-accent"
         >
           Watch the demo

@@ -23,7 +23,12 @@ export function Scale() {
         ))}
       </div>
       <div className="mt-8 text-center">
-        <Link href="/docs/high-level-design.md" className="text-sm font-medium text-accent underline underline-offset-4">
+        <Link
+          href="https://github.com/Vatsa10/sentinel/blob/main/docs/high-level-design.md"
+          className="text-sm font-medium text-accent underline underline-offset-4"
+          target="_blank"
+          rel="noopener"
+        >
           Read the HLD
         </Link>
       </div>
