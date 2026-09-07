@@ -740,11 +740,12 @@ Judge          Console (Vercel)      Tunnel        Backend (GPU host)
  |                    |<----------------------------------- 200, audit row written
 ```
 
-**Production path.** The named-tunnel arrangement above and the on-premise
+**Production path.** The quick-tunnel arrangement above and the on-premise
 reverse-proxy arrangement in §15 run identical backend and frontend code —
-only the network path between them differs. A district or state rollout
-would use the on-premise proxy (or a district-issued domain terminating TLS
-at the edge node) and drop the tunnel entirely; nothing in the console or the
+only the network path between them differs. A production rollout would
+either name the tunnel and pin it to a fixed domain, or use the on-premise
+proxy (or a district-issued domain terminating TLS at the edge node) and
+drop the tunnel entirely; nothing in the console or the
 API needs to change to make that switch.
 
 ---
