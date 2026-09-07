@@ -315,6 +315,11 @@ Hardware: NVIDIA RTX 5050 Laptop GPU, 8 GB, CUDA 12.8.
 | Frames dropped | **0%** |
 | Inference queue depth | 0–5 |
 | Registry onboarding | 30 cameras probed and profiled in ~35 seconds |
+| Own-feed validation (data/own_feed_test.mp4, 1080p) | 329 vehicles, 44 plates read, 5 watchlist alerts at ≥ 0.95 |
+
+The own-feed validation run uses participant-supplied footage with plates large
+and legible enough for OCR — unlike the wide-area grid cameras profiled above,
+where plate recognition does not resolve (§2).
 
 **Two capacity figures, answering different questions.** The ~6 ms per frame
 cited in §8 is *tier-1 scanning capacity*: a 640 px detection pass answering

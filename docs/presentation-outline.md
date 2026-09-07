@@ -145,7 +145,7 @@ Hardware: single RTX 5050 laptop GPU, 8 GB.
 |---|---|
 | Inference latency | **~6 ms** per 1080p frame |
 | Throughput | **~52 fps** |
-| Live run | 6/6 cameras, **5,846 vehicles** detected and embedded in 2 minutes |
+| Live run | 8/8 cameras, **4,893 vehicles** detected and embedded in ~2 minutes |
 | Frames dropped | **0** |
 | Registry onboarding | 30 cameras probed and profiled in ~35 s |
 
@@ -180,8 +180,8 @@ Full plate recognition where plate geometry permits it:
 4. **Real-time alert at 0.95 confidence** with full reasoning and evidence image
 5. Route reconstruction with timestamped movement history
 
-Measured on the validation run: 329 vehicles, 44 plates, 5 alerts, correct
-severity and case reference on every one.
+Measured on the own-feed validation run: 329 vehicles, 44 plates, 5 alerts,
+correct severity and case reference on every one.
 
 ---
 
@@ -257,8 +257,8 @@ investigating officer.
 
 **What NETRA delivers today, measured on your grid:**
 
-30 cameras onboarded and profiled · 5,846 vehicles detected in 2 minutes ·
-0 frames dropped · 7 faulty cameras identified automatically ·
+30 cameras onboarded and profiled · 4,893 vehicles detected in ~2 minutes ·
+0 frames dropped · 6 degraded cameras flagged automatically, 2 indoor-only ·
 end-to-end ANPR to alert verified · cross-camera tracing without plates
 
 **Built by a solo student researcher.**
