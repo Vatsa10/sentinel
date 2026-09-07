@@ -52,6 +52,25 @@ class HlsManager:
                 "-hls_flags", "delete_segments+omit_endlist",
                 str(out_dir / "index.m3u8")]
 
+    @staticmethod
+    def _close(relay: "_Relay") -> None:
+        """Terminate the process, close its log handle, remove its output
+        directory. The one place any of that happens, so every path that
+        retires a relay - a clean stop, a restart replacing a dead one, or
+        a failed Popen - releases the same handles the same way.
+        """
+        if relay.proc.poll() is None:
+            relay.proc.terminate()
+            try:
+                relay.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                relay.proc.kill()
+        try:
+            relay.log_fh.close()
+        except Exception:
+            pass
+        shutil.rmtree(HLS_DIR / relay.camera_id, ignore_errors=True)
+
     def start(self, camera_id: str, source: str, hevc: bool) -> dict:
         with self._lock:
             live = self._relays.get(camera_id)
@@ -60,6 +79,14 @@ class HlsManager:
                 already_running = True
             else:
                 already_running = False
+                if live is not None:
+                    # The previous relay for this camera exited on its own
+                    # (crash, source drop) without anyone calling stop(): its
+                    # log handle is still open and its directory still on
+                    # disk. Release both before starting the replacement, or
+                    # every restart leaks one file handle and directory.
+                    self._close(live)
+                    self._relays.pop(camera_id, None)
                 running = [r for r in self._relays.values() if r.proc.poll() is None]
                 if len(running) >= self.max_concurrent:
                     return {"camera_id": camera_id, "running": False,
@@ -69,9 +96,20 @@ class HlsManager:
                 shutil.rmtree(out_dir, ignore_errors=True)
                 out_dir.mkdir(parents=True, exist_ok=True)
                 log_fh = open(out_dir / "ffmpeg.log", "wb")
-                proc = subprocess.Popen(self.command(source, out_dir, hevc),
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=log_fh)
+                try:
+                    proc = subprocess.Popen(self.command(source, out_dir, hevc),
+                                            stdout=subprocess.DEVNULL,
+                                            stderr=log_fh)
+                except Exception:
+                    # Popen itself failed (e.g. ffmpeg missing/unresolvable
+                    # path): the handle we just opened and the directory we
+                    # just created must not be left behind.
+                    try:
+                        log_fh.close()
+                    except Exception:
+                        pass
+                    shutil.rmtree(out_dir, ignore_errors=True)
+                    raise
                 self._relays[camera_id] = _Relay(camera_id, proc, log_fh)
         return self.status(camera_id)
 
@@ -80,17 +118,7 @@ class HlsManager:
             r = self._relays.pop(camera_id, None)
         if not r:
             return False
-        if r.proc.poll() is None:
-            r.proc.terminate()
-            try:
-                r.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                r.proc.kill()
-        try:
-            r.log_fh.close()
-        except Exception:
-            pass
-        shutil.rmtree(HLS_DIR / camera_id, ignore_errors=True)
+        self._close(r)
         return True
 
     def touch(self, camera_id: str) -> None:
@@ -161,6 +189,30 @@ def _self_check() -> None:
     time.sleep(10)          # idle > 4 s: reaper must have stopped it
     assert not m.status("selfcheck")["running"], "reaper did not stop idle relay"
     assert not (HLS_DIR / "selfcheck").exists()
+
+    # A Popen that raises (bogus ffmpeg path) must leave no handle or
+    # directory behind - the leak this self-check exists to catch.
+    import netra.api.hls as hls_mod
+    m2 = HlsManager(max_concurrent=1, idle_s=4)
+    real_popen = subprocess.Popen
+
+    def _bad_popen(*a, **kw):
+        raise FileNotFoundError("bogus ffmpeg path for this self-check")
+
+    subprocess.Popen = _bad_popen
+    try:
+        raised = False
+        try:
+            m2.start("badpath", str(src), hevc=False)
+        except FileNotFoundError:
+            raised = True
+    finally:
+        subprocess.Popen = real_popen
+    assert raised, "Popen failure should propagate, not be swallowed"
+    assert "badpath" not in m2._relays, "no relay should be registered"
+    assert not (HLS_DIR / "badpath").exists(), \
+        "output directory must be cleaned up after a failed Popen"
+
     print("hls self-check ok")
 
 

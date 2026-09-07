@@ -348,6 +348,19 @@ class InferenceEngine:
 
         The recording restarted, so the previous scene-time anchor no longer
         describes this stream and must be read again.
+
+        This clears state keyed by camera_id, not `self.queue` itself: frames
+        from before the cut that were already queued when the discontinuity
+        was detected are still processed afterwards (the ingest thread pushes
+        frames faster than inference drains them, and dropping them here
+        would need a queue scan this method deliberately avoids). One or two
+        such frames can therefore run through `_process` after this reset and
+        seed a fresh clock anchor or track from stale (pre-cut) pixel data.
+        This self-corrects rather than needing to be prevented: a wrong clock
+        anchor is superseded by CLOCK_REANCHOR_AFTER_S or a second
+        corroborating read (see `_anchor_clock`), and a track seeded from one
+        stale frame either matches the next (post-cut) sighting or times out
+        via TRACK_TIMEOUT_S like any other track that stops being confirmed.
         """
         self._clocks.pop(camera_id, None)
         self._clock_attempts.pop(camera_id, None)
