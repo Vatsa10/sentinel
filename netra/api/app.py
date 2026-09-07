@@ -350,6 +350,10 @@ async def camera_live_mjpeg(camera_id: str, request: Request,
         finally:
             LIVE_FRAMES.unsubscribe(camera_id)
 
+    return StreamingResponse(
+        gen(), media_type="multipart/x-mixed-replace; boundary=netraframe",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
 
 # --------------------------------------------------------------- HLS relay --
 def _hls_source(cam: Camera) -> str:

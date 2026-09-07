@@ -33,13 +33,24 @@ CHECKS = [  # (method, path, role, expected)
     ("POST", "/api/pipeline/stop", "operator", 403),
     ("POST", "/api/notify/test", "operator", 200),
     ("POST", "/api/storage/prune?dry_run=true", "admin", 200),
+    ("MJPEG", "/api/cameras/cam13/live.mjpg", None, 200),
 ]
 
 
 def call(base, method, path, key):
-    req = urllib.request.Request(base + path, method=method)
+    req = urllib.request.Request(base + path, method="GET" if method == "MJPEG" else method)
     if key:
         req.add_header("X-API-Key", key)
+    if method == "MJPEG":
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                ctype = r.headers.get("Content-Type", "")
+                body = r.read(4096)
+                if r.status == 200 and ctype.startswith("multipart/x-mixed-replace") and b"--netraframe" in body:
+                    return 200
+                return 599
+        except urllib.error.HTTPError:
+            return 599
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return r.status
