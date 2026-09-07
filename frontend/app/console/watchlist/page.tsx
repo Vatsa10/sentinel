@@ -58,15 +58,17 @@ export default function WatchlistPage() {
       setDeleteTarget(null);
       if (!entry) return;
       let undone = false;
-      toast(`Deleted ${entry.plate}`, {
+      const toastId = toast(`Deleted ${entry.plate}`, {
         action: {
           label: "Undo",
           onClick: async () => {
             // Guard against a double-click firing this twice before the button
             // disables (sonner doesn't remove the action on click): check-and-set
-            // synchronously before the first await.
+            // synchronously before the first await, and dismiss the toast
+            // immediately so the Undo button is visibly gone, not just inert.
             if (undone) return;
             undone = true;
+            toast.dismiss(toastId);
             try {
               // Also guard against a duplicate that might already exist server-side
               // (e.g. another tab restored it, or a prior click of this same

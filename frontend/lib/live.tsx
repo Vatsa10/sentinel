@@ -12,7 +12,12 @@ import { connect } from "./ws";
  */
 export interface AlertEvent {
   kind?: string;
-  alert_id?: number;
+  /** Normalised in LiveProvider below: the wire payload from `_raise_alert`
+   * carries the alert's id as "id", not "alert_id" — every consumer reads
+   * `alert_id`, so it is filled in from `id` once here rather than in each
+   * consumer. Zone events (`kind: "zone"`) also carry their row id as "id"
+   * but are conventionally read via that field directly, not `alert_id`. */
+  alert_id: number;
   detection_id?: number;
   plate?: string;
   camera_id?: string;
@@ -61,8 +66,16 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           setDescriptions(descriptionsRef.current);
           return;
         }
+        // `_raise_alert` (netra/pipeline.py ~539) puts the alert's id under
+        // "id", not "alert_id" — every consumer of this list reads
+        // `alert_id`, so normalise it here once rather than in each
+        // consumer. Zone events carry their own row id under "id" too but
+        // are read by `id` directly (ZoneEventList), not `alert_id`, so
+        // leave those alone.
+        const kind = (m as { kind?: string }).kind;
+        const ev = kind === "zone" ? (m as AlertEvent) : { ...m, alert_id: (m as Record<string, unknown>).alert_id ?? (m as Record<string, unknown>).id } as AlertEvent;
         setAlerts((prev) => {
-          const next = [...prev, m as AlertEvent];
+          const next = [...prev, ev];
           return next.length > MAX_MESSAGES ? next.slice(next.length - MAX_MESSAGES) : next;
         });
       },
