@@ -19,6 +19,7 @@ from sqlalchemy.orm import joinedload
 from fastapi import Depends, Header
 
 from netra import config
+from netra.analytics.live_frames import LIVE_FRAMES
 from netra.analytics.loop_index import has_embedding
 from netra.analytics.route import build_route
 from netra.core import auth
@@ -273,6 +274,62 @@ def camera_snapshot(camera_id: str, refresh: bool = False,
 
     return Response(content=data, media_type="image/jpeg",
                     headers={"Cache-Control": "no-store"})
+
+
+def _snapshot_sync(camera_id: str) -> bytes | None:
+    try:
+        with _snapshot_lock(camera_id):
+            return _cached_snapshot(camera_id) or _grab_snapshot(camera_id)
+    except HTTPException:
+        return None
+
+
+_MJPEG_BOUNDARY = b"--netraframe"
+
+
+def _mjpeg_part(jpeg: bytes) -> bytes:
+    return (_MJPEG_BOUNDARY + b"\r\nContent-Type: image/jpeg\r\nContent-Length: "
+            + str(len(jpeg)).encode() + b"\r\n\r\n" + jpeg + b"\r\n")
+
+
+@app.get("/api/cameras/{camera_id}/live.mjpg")
+async def camera_live_mjpeg(camera_id: str, request: Request,
+                            _p=Depends(require("read"))):
+    """Latest annotated frames as a motion-JPEG stream, at most LIVE_MJPEG_FPS.
+
+    While the pipeline is processing this camera the frames carry detection
+    boxes. Otherwise the cached snapshot is re-sent every two seconds so the
+    tile still shows the scene. A frame is re-sent every two seconds even when
+    unchanged so browsers and the tunnel never see an idle connection.
+    """
+    with SessionLocal() as db:
+        if not db.get(Camera, camera_id):
+            raise HTTPException(404, "camera not found")
+
+    async def gen():
+        import time as _time
+        LIVE_FRAMES.subscribe(camera_id)
+        last_pts, last_sent, interval = None, 0.0, 1.0 / config.LIVE_MJPEG_FPS
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                now = _time.time()
+                item = LIVE_FRAMES.get(camera_id)
+                if item and item[0] != last_pts:
+                    last_pts = item[0]
+                    yield _mjpeg_part(item[1]); last_sent = now
+                elif now - last_sent >= 2.0:
+                    jpeg = item[1] if item else await asyncio.to_thread(_snapshot_sync, camera_id)
+                    if jpeg:
+                        yield _mjpeg_part(jpeg); last_sent = now
+                await asyncio.sleep(interval)
+        finally:
+            LIVE_FRAMES.unsubscribe(camera_id)
+
+    return StreamingResponse(
+        gen(), media_type="multipart/x-mixed-replace; boundary=netraframe",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
 
 
 # -------------------------------------------------------------- detections --
