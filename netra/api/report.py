@@ -61,8 +61,20 @@ img.ev { height: 40px; border: 1px solid #cbd5e1; border-radius: 3px; }
 .why { font-size: 10.5px; color: #64748b; line-height: 1.5; }
 footer { margin-top: 30px; padding-top: 10px; border-top: 1px solid #e2e8f0;
          font-size: 10.5px; color: #94a3b8; }
-@media print { body { padding: 12px; } h2 { page-break-after: avoid; }
+.time-badge { font-size: 9px; text-transform: uppercase; letter-spacing: .04em;
+              padding: 0 4px; border-radius: 2px; margin-right: 4px; }
+.time-badge.scene { background: #dcfce7; color: #166534; }
+.time-badge.stream { background: #e0e7ff; color: #3730a3; }
+.print-btn { position: fixed; top: 14px; right: 18px; background: #0b2d4f;
+             color: #fff; border: none; border-radius: 6px; padding: 8px 16px;
+             font-size: 12px; font-weight: 600; cursor: pointer; }
+.print-btn:hover { background: #0b5c8f; }
+@media print { body { padding: 12px; background: #fff; color: #000; }
+               .no-print { display: none; }
+               h2 { page-break-after: avoid; }
+               table { page-break-inside: auto; }
                tr { page-break-inside: avoid; } }
+@page { size: A4; margin: 14mm; }
 """
 
 
@@ -74,8 +86,29 @@ def _card(n, label) -> str:
     return f'<div class="card"><div class="n">{_e(n)}</div><div class="l">{_e(label)}</div></div>'
 
 
-def build_report(hours: int = 24, base_url: str = "") -> str:
-    """Render the operational report as a standalone HTML document."""
+def _time_cell(d: Detection) -> str:
+    """A timestamp cell that never presents wall time as scene time.
+
+    `scene_time` (the overlay clock burnt into the recording) is only shown
+    when `scene_time_corroborated` is True. Otherwise this shows the stream's
+    own PTS-relative elapsed time, labelled as such - never the wall clock.
+    """
+    if d.scene_time_corroborated and d.scene_time is not None:
+        return (f'<span class="time-badge scene">scene</span>'
+                f'<span class="mono">{d.scene_time:%Y-%m-%d %H:%M:%S}</span>')
+    pts_s = (d.pts_ms or 0) / 1000.0
+    return (f'<span class="time-badge stream">stream</span>'
+            f'<span class="mono">T+{pts_s:.1f}s</span>')
+
+
+def build_report(hours: int = 24, base_url: str = "",
+                 plate: str | None = None,
+                 cameras: list[str] | None = None) -> str:
+    """Render the operational report as a standalone HTML document.
+
+    `cameras` (a list of camera IDs) filters the plate-reads table only.
+    """
+    camera_filter = cameras
     since = datetime.now(timezone.utc) - timedelta(hours=hours)
     generated = datetime.now(timezone.utc)
 
@@ -93,10 +126,14 @@ def build_report(hours: int = 24, base_url: str = "") -> str:
                      .group_by(Detection.camera_id)
                      .order_by(func.count(Detection.id).desc()).all())
 
-        plate_rows = (db.query(Detection).options(joinedload(Detection.camera))
-                      .filter(Detection.wall_time >= since,
-                              Detection.plate_text.isnot(None))
-                      .order_by(Detection.wall_time.desc()).limit(200).all())
+        plate_q = (db.query(Detection).options(joinedload(Detection.camera))
+                   .filter(Detection.wall_time >= since,
+                           Detection.plate_text.isnot(None)))
+        if plate:
+            plate_q = plate_q.filter(Detection.plate_text.ilike(f"%{plate}%"))
+        if camera_filter:
+            plate_q = plate_q.filter(Detection.camera_id.in_(camera_filter))
+        plate_rows = plate_q.order_by(Detection.wall_time.desc()).limit(200).all()
 
         alerts = (db.query(Alert).filter(Alert.created_at >= since)
                   .order_by(Alert.created_at.desc()).limit(100).all())
@@ -116,13 +153,22 @@ def build_report(hours: int = 24, base_url: str = "") -> str:
         cam_names = {c.id: c.name for c in cameras}
         degraded = [c for c in cameras if c.capability == "degraded"]
 
+    filter_bits = []
+    if plate:
+        filter_bits.append(f"plate contains &ldquo;{_e(plate)}&rdquo;")
+    if camera_filter:
+        filter_bits.append(f"cameras: {_e(', '.join(camera_filter))}")
+    filter_note = (f' &middot; filtered by {" and ".join(filter_bits)}'
+                   if filter_bits else "")
+
     parts: list[str] = [f"""<!doctype html><html><head><meta charset="utf-8">
 <title>NETRA Output Report</title><style>{CSS}</style></head><body>
+<button class="no-print print-btn" onclick="window.print()">Save as PDF</button>
 <h1>NETRA &mdash; Video Analytics Output Report</h1>
 <div class="sub">Networked Evidence, Tracking &amp; Recognition for Analytics</div>
 <div class="sub">Gujarat Police Innovation Challenge 2026 &middot; Sentinel CCTV Grid</div>
 <div class="sub">Reporting period: last {hours} hours &middot;
- generated {generated:%Y-%m-%d %H:%M:%S} UTC</div>
+ generated {generated:%Y-%m-%d %H:%M:%S} UTC{filter_note}</div>
 
 <h2>1. Summary</h2>
 <div class="cards">
@@ -141,7 +187,7 @@ def build_report(hours: int = 24, base_url: str = "") -> str:
     # -- 2. plate reads -------------------------------------------------------
     parts.append("<h2>2. Number plate detections with timestamps</h2>")
     if plate_rows:
-        parts.append('<table><tr><th>Timestamp (UTC)</th><th>Scene time</th>'
+        parts.append('<table><tr><th>Time</th><th>Recorded (UTC)</th>'
                      '<th>Camera</th><th>Location</th><th>Plate</th>'
                      '<th>Confidence</th><th>Vehicle</th><th>Evidence</th></tr>')
         for d in plate_rows:
@@ -149,9 +195,8 @@ def build_report(hours: int = 24, base_url: str = "") -> str:
             ev = (f'<img class="ev" src="{base_url}{_e(d.evidence_path)}">'
                   if d.evidence_path else "&mdash;")
             parts.append(
-                f'<tr><td class="mono">{d.wall_time:%Y-%m-%d %H:%M:%S}</td>'
-                f'<td class="mono">'
-                f'{d.scene_time.strftime("%Y-%m-%d %H:%M:%S") if d.scene_time else "&mdash;"}</td>'
+                f'<tr><td>{_time_cell(d)}</td>'
+                f'<td class="mono">{d.wall_time:%Y-%m-%d %H:%M:%S}</td>'
                 f'<td class="mono">{_e(d.camera_id)}</td>'
                 f'<td>{_e(cam.name if cam else "")}</td>'
                 f'<td class="plate">{_e(d.plate_text)}</td>'
@@ -249,10 +294,12 @@ def build_report(hours: int = 24, base_url: str = "") -> str:
         parts.append('<div class="note">All cameras are delivering usable video.</div>')
 
     parts.append(f"""<footer>
-Generated by NETRA on {generated:%Y-%m-%d %H:%M:%S} UTC.
-All timestamps are UTC. Confidence scores are advisory and intended to support
-an operator decision, not replace it. Detections are retained as structured
-metadata with evidence crops; no continuous video is recorded by this platform.
+Generated by NETRA at {generated:%Y-%m-%d %H:%M:%S} UTC. Times labelled
+&ldquo;scene&rdquo; are corroborated overlay clocks; &ldquo;stream&rdquo; times
+are PTS-relative. All other timestamps are UTC. Confidence scores are advisory
+and intended to support an operator decision, not replace it. Detections are
+retained as structured metadata with evidence crops; no continuous video is
+recorded by this platform.
 </footer></body></html>""")
 
     return "".join(parts)

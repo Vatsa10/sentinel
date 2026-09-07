@@ -1399,13 +1399,19 @@ def mined_journeys(group: str = Query(..., min_length=3, max_length=64),
 
 
 @app.get("/api/report", response_class=HTMLResponse)
-def output_report(hours: int = Query(24, ge=1, le=720)):
+def output_report(hours: int = Query(24, ge=1, le=720),
+                  plate: str | None = Query(None),
+                  cameras: str | None = Query(None)):
     """Operational output report, printable to PDF from the browser.
 
     This is the output report the submission asks for: detected vehicles and
     plates with timestamps, watchlist matches with their reasoning, zone
     events, per-camera activity, and the cameras measured as unable to deliver.
+
+    `plate` filters plate reads by substring; `cameras` is a comma-separated
+    list of camera IDs to restrict the plate table to.
     """
     from netra.api.report import build_report
-    _audit("report.generate", detail={"hours": hours})
-    return HTMLResponse(build_report(hours=hours))
+    cam_list = [c.strip() for c in cameras.split(",") if c.strip()] if cameras else None
+    _audit("report.generate", detail={"hours": hours, "plate": plate, "cameras": cam_list})
+    return HTMLResponse(build_report(hours=hours, plate=plate, cameras=cam_list))
