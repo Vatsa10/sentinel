@@ -11,6 +11,22 @@ class Base(DeclarativeBase):
 
 _connect_args = {"check_same_thread": False} if DB_URL.startswith("sqlite") else {}
 engine = create_engine(DB_URL, connect_args=_connect_args, pool_pre_ping=True)
+
+
+if DB_URL.startswith("sqlite"):
+    from sqlalchemy import event
+
+    @event.listens_for(engine, "connect")
+    def _sqlite_pragmas(dbapi_conn, _record):
+        # WAL lets the console read while the writer thread commits detection
+        # batches; the default rollback journal makes every reader wait for the
+        # writer and surfaces as "database is locked" 500s under load. The busy
+        # timeout covers the short exclusive window a WAL checkpoint still needs.
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA busy_timeout=5000")
+        cur.close()
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
